@@ -1,25 +1,30 @@
-name: Looker Studio Scrapers
+name: Looker Studio Scraper Suite
 
 on:
+  workflow_dispatch: {}
   schedule:
-    # London 08:10, 08:15, 11:10, 11:15, 14:10, 14:15, 17:10, 17:15, 20:10, 20:15 (cron is UTC)
-    - cron: "10 7,10,13,16,19 * * *"
-    - cron: "15 7,10,13,16,19 * * *"
-  workflow_dispatch:
+    # Runs at 08:05, 11:05, 14:05, 17:05, 20:05 London time (UTC+0 in cron)
+    - cron: "5 7,10,13,16,19 * * *"
+
+concurrency:
+  group: looker-scrape
+  cancel-in-progress: false
 
 jobs:
   scrape:
-    name: Run NPS + Complaints + Daily
     runs-on: ubuntu-latest
     timeout-minutes: 40
-    concurrency:
-      group: scraper-state
-      cancel-in-progress: false
 
     steps:
-      - name: Checkout repo
+      # ────────────────────────────────
+      # Checkout
+      # ────────────────────────────────
+      - name: Checkout
         uses: actions/checkout@v4
 
+      # ────────────────────────────────
+      # Setup Python + Playwright
+      # ────────────────────────────────
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
@@ -27,11 +32,19 @@ jobs:
 
       - name: Install dependencies
         run: |
-          python -m pip install --upgrade pip
-          pip install playwright schedule requests configparser pytz
+          python -m pip install -U pip
+          pip install playwright requests schedule pytz
           python -m playwright install --with-deps chromium
 
-      # ========= RESTORE STATE (unique primary key, prefix restore) =========
+      # ────────────────────────────────
+      # Export TODAY for date-based caching
+      # ────────────────────────────────
+      - name: Export TODAY
+        run: echo "TODAY=$(date -u +%Y%m%d)" >> $GITHUB_ENV
+
+      # ────────────────────────────────
+      # Restore state from cache
+      # ────────────────────────────────
       - name: Restore scraper state (auth + logs)
         id: cache-restore
         uses: actions/cache/restore@v4
@@ -41,24 +54,29 @@ jobs:
             comments_log.csv
             complaints_log.csv
             daily_report_log.csv
-          key: scraper-state-${{ runner.os }}-v1-${{ github.run_id }}
+          key: scraper-state-${{ runner.os }}-v1-${{ github.ref_name }}-${{ env.TODAY }}
           restore-keys: |
+            scraper-state-${{ runner.os }}-v1-${{ github.ref_name }}-
             scraper-state-${{ runner.os }}-v1-
-            scraper-state-${{ runner.os }}-
-            scraper-state-
 
-      # ========= OPTIONAL AUTH FALLBACK (secret) =========
-      - name: Decode AUTH_STATE_B64 (if provided)
+      # ────────────────────────────────
+      # Optional fallback (first cold start)
+      # ────────────────────────────────
+      - name: Fallback restore auth_state.json from secret
         run: |
-          if [ -n "${{ secrets.AUTH_STATE_B64 }}" ]; then
-            echo "${{ secrets.AUTH_STATE_B64 }}" | base64 --decode > auth_state.json
+          if [ -n "${AUTH_STATE_B64}" ]; then
+            echo "${AUTH_STATE_B64}" | base64 --decode > auth_state.json
             echo "Decoded auth_state.json from AUTH_STATE_B64."
           else
             echo "No AUTH_STATE_B64 secret provided — continuing without."
           fi
+        env:
+          AUTH_STATE_B64: ${{ secrets.AUTH_STATE_B64 }}
 
-      # ========= CONFIG =========
-      - name: Create config.ini from secrets
+      # ────────────────────────────────
+      # Create config.ini dynamically from secrets
+      # ────────────────────────────────
+      - name: Create/Update config.ini from secrets
         run: |
           {
             echo "[DEFAULT]"
@@ -67,27 +85,25 @@ jobs:
             echo "MAIN_WEBHOOK=${{ secrets.MAIN_WEBHOOK }}"
             echo "ALERT_WEBHOOK=${{ secrets.ALERT_WEBHOOK }}"
             echo "COMPLAINTS_WEBHOOK=${{ secrets.COMPLAINTS_WEBHOOK }}"
+            echo "DAILY_WEBHOOK=${{ secrets.DAILY_WEBHOOK }}"
           } > config.ini
 
-      # ========= RUN SCRAPERS =========
+      # ────────────────────────────────
+      # Run all scrapers (NPS → Complaints → Daily)
+      # ────────────────────────────────
       - name: Run NPS scraper
-        env:
-          CI_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: xvfb-run -a python scrape.py now || true
 
       - name: Run Complaints scraper
-        env:
-          CI_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: xvfb-run -a python scrape_complaints.py now || true
 
-      - name: Run Daily Dashboard scraper
-        env:
-          CI_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-        run: xvfb-run -a python scrape_daily_report.py || true
+      - name: Run Daily Report scraper
+        run: xvfb-run -a python scrape_daily.py now || true
 
-      # ========= STATE SUMMARY =========
-      - name: Display state summary
-        if: always()
+      # ────────────────────────────────
+      # Show file states for debugging
+      # ────────────────────────────────
+      - name: Show state files
         run: |
           echo "::group::State files"
           for f in auth_state.json comments_log.csv complaints_log.csv daily_report_log.csv scrape.log scrape_complaints.log scrape_daily.log; do
@@ -98,15 +114,19 @@ jobs:
             fi
           done
           echo "::endgroup::"
+
           echo "::group::daily_report_log.csv (last 5)"
           if [ -f daily_report_log.csv ]; then tail -n 5 daily_report_log.csv || true; else echo "daily_report_log.csv not found"; fi
           echo "::endgroup::"
+
           echo "::group::screens/ listing"
           ls -lah screens || echo "no screens/"
           echo "::endgroup::"
 
-      # ========= ARTIFACTS =========
-      - name: Upload artifacts (logs + state)
+      # ────────────────────────────────
+      # Upload artifacts for inspection
+      # ────────────────────────────────
+      - name: Upload logs and state as artifact
         if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -121,11 +141,11 @@ jobs:
             scrape_daily.log
             screens/
           if-no-files-found: ignore
-          retention-days: 7
 
-      # ========= SAVE UPDATED STATE (unique key per run) =========
+      # ────────────────────────────────
+      # Save updated cache snapshot
+      # ────────────────────────────────
       - name: Save updated scraper state to cache
-        if: ${{ steps.cache-restore.outputs.cache-hit != 'true' }}
         uses: actions/cache/save@v4
         with:
           path: |
