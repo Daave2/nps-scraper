@@ -1,0 +1,99 @@
+name: Looker Studio Scraper
+
+on:
+  workflow_dispatch: {}
+  schedule:
+    # 08:05, 11:05, 14:05, 17:05, 20:05 London (cron is UTC)
+    - cron: "5 7,10,13,16,19 * * *"
+
+concurrency:
+  group: looker-scrape
+  cancel-in-progress: false
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install deps
+        run: |
+          python -m pip install -U pip
+          pip install playwright requests schedule
+          python -m playwright install --with-deps chromium
+
+      # ========= RESTORE STATE (CACHE FIRST) =========
+      - name: Restore scraper state (auth_state.json + comments_log.csv) from cache
+        id: cache-restore
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            auth_state.json
+            comments_log.csv
+          key: scraper-state-${{ github.run_id }}
+          restore-keys: |
+            scraper-state-
+
+      # Optional fallback: if cache didn’t have auth_state.json, use the secret
+      - name: Fallback restore auth_state.json from secret
+        if: ${{ !hashFiles('auth_state.json') && secrets.AUTH_STATE_B64 != '' }}
+        run: |
+          echo "${AUTH_STATE_B64}" | base64 -d > auth_state.json
+        env:
+          AUTH_STATE_B64: ${{ secrets.AUTH_STATE_B64 }}
+
+      # ========= CONFIG =========
+      - name: Create/Update config.ini from secrets
+        run: |
+          {
+            echo "[DEFAULT]"
+            echo "GOOGLE_EMAIL=${{ secrets.GOOGLE_EMAIL }}"
+            echo "GOOGLE_PASSWORD=${{ secrets.GOOGLE_PASSWORD }}"
+            echo "MAIN_WEBHOOK=${{ secrets.MAIN_WEBHOOK }}"
+            echo "ALERT_WEBHOOK=${{ secrets.ALERT_WEBHOOK }}"
+          } > config.ini
+
+      # ========= RUN =========
+      # Use a virtual display so Playwright can open a headed window if needed.
+      # You approve the phone prompt; cookies update and will be saved back to cache.
+      - name: Run scraper (headed via Xvfb, phone 2FA supported)
+        run: |
+          xvfb-run -a python scrape.py now
+
+      # ========= SAVE UPDATED STATE (CACHE) =========
+      - name: Save updated scraper state to cache
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            auth_state.json
+            comments_log.csv
+          key: scraper-state-${{ github.run_id }}
+
+      # ========= OPTIONAL: ARTIFACTS FOR INSPECTION =========
+      - name: Upload current state as artifact (optional)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: scraper-state
+          path: |
+            auth_state.json
+            comments_log.csv
+          if-no-files-found: ignore
+
+      - name: Upload logs & screenshots (optional)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs-and-screens
+          path: |
+            scrape.log
+            screens/*
+          if-no-files-found: ignore
