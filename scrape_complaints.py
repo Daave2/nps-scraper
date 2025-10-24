@@ -28,9 +28,9 @@ except ImportError:
 # PATHS & LOGGING
 # ──────────────────────────────────────────────────────────────────────────────
 BASE_DIR = Path(__file__).resolve().parent
-
-AUTH_STATE_PATH = BASE_DIR / "auth_state.json"   # shared with NPS scraper
+AUTH_STATE_PATH = BASE_DIR / "auth_state.json"       # shared with NPS scraper
 COMPLAINTS_LOG_PATH = BASE_DIR / "complaints_log.csv"
+
 COMPLAINT_CSV_HEADERS = [
     "case_number", "opened_date", "store", "dashboard_business_area",
     "case_type", "case_category", "case_reason", "detailed_case_reason",
@@ -48,33 +48,46 @@ logging.basicConfig(
 logger = logging.getLogger("complaints")
 
 # ──────────────────────────────────────────────────────────────────────────────
-# CONFIG
+# CONFIG (file + env fallbacks)
 # ──────────────────────────────────────────────────────────────────────────────
 config = configparser.ConfigParser()
 cfg_path = BASE_DIR / "config.ini"
-if not cfg_path.exists():
-    logger.critical("CRITICAL: config.ini not found. Please create it.")
-    sys.exit(1)
-try:
-    config.read(cfg_path, encoding='utf-8')
-except configparser.Error as e:
-    logger.critical(f"CRITICAL: Error reading config.ini: {e}")
-    sys.exit(1)
+if cfg_path.exists():
+    try:
+        config.read(cfg_path, encoding='utf-8')
+    except configparser.Error as e:
+        logger.critical(f"CRITICAL: Error reading config.ini: {e}")
+        sys.exit(1)
+else:
+    logger.warning("config.ini not found — will rely on environment variables.")
 
-GOOGLE_EMAIL      = config["DEFAULT"].get("GOOGLE_EMAIL", "")
-GOOGLE_PASSWORD   = config["DEFAULT"].get("GOOGLE_PASSWORD", "")
-MAIN_WEBHOOK      = config["DEFAULT"].get("MAIN_WEBHOOK", "")
-ALERT_WEBHOOK     = config["DEFAULT"].get("ALERT_WEBHOOK", "")
-COMPLAINTS_WEBHOOK = config["DEFAULT"].get("COMPLAINTS_WEBHOOK", MAIN_WEBHOOK)
+GOOGLE_EMAIL       = config["DEFAULT"].get("GOOGLE_EMAIL", os.getenv("GOOGLE_EMAIL", ""))
+GOOGLE_PASSWORD    = config["DEFAULT"].get("GOOGLE_PASSWORD", os.getenv("GOOGLE_PASSWORD", ""))
+MAIN_WEBHOOK       = config["DEFAULT"].get("MAIN_WEBHOOK", os.getenv("MAIN_WEBHOOK", ""))
+ALERT_WEBHOOK      = config["DEFAULT"].get("ALERT_WEBHOOK", os.getenv("ALERT_WEBHOOK", ""))
+COMPLAINTS_WEBHOOK = (
+    config["DEFAULT"].get("COMPLAINTS_WEBHOOK", os.getenv("COMPLAINTS_WEBHOOK", "")) or MAIN_WEBHOOK
+)
+
+def _redact(url: str) -> str:
+    if not url:
+        return ""
+    try:
+        from urllib.parse import urlparse
+        p = urlparse(url)
+        tail = url[-6:]
+        return f"{p.netloc}…{tail}"
+    except Exception:
+        return url[:3] + "…"
+
+logger.info(f"Complaints webhook in use: {_redact(COMPLAINTS_WEBHOOK) or '[MISSING]'}")
+logger.info(f"Main webhook in use: {_redact(MAIN_WEBHOOK) or '[MISSING]'}")
 
 if not COMPLAINTS_WEBHOOK:
     logger.critical("No COMPLAINTS_WEBHOOK or MAIN_WEBHOOK configured — cannot post complaints.")
     sys.exit(1)
 
-if not ALERT_WEBHOOK:
-    logger.warning("ALERT_WEBHOOK missing — login failure alerts will not be sent.")
-
-# Complaints report URL (adjust to your report/page)
+# Complaints report URL (adjust if needed)
 LOOKER_STUDIO_URL = "https://lookerstudio.google.com/embed/reporting/d93a03c7-25dc-439d-abaa-dd2f3780daa5/page/p_qwk7izlsld"
 
 # Timeouts (ms)
@@ -202,7 +215,6 @@ def copy_looker_studio_text(page, target_url: str) -> Optional[List[str]]:
             logger.warning(f"Main body text not available ({e}); trying frames.")
             page_text = ""
 
-        # Bail if login prompt found
         if any(x in page_text for x in ("Please sign in", "Can't access report", "You need permission")):
             logger.warning("Login/permission prompt detected in body.")
             return None
@@ -248,7 +260,6 @@ def copy_looker_studio_text(page, target_url: str) -> Optional[List[str]]:
 
         lines = best.splitlines()
         logger.info(f"Final extracted text lines: {len(lines)}")
-        # Optional: dump raw extract for debugging
         try:
             (BASE_DIR / "screens").mkdir(exist_ok=True)
             (BASE_DIR / "screens" / f"{int(time.time())}_complaints_text.txt").write_text(best, encoding="utf-8")
@@ -547,18 +558,8 @@ def perform_scrape_workflow():
 # ──────────────────────────────────────────────────────────────────────────────
 def schedule_complaint_scrapes():
     times = ["08:15", "11:15", "14:15", "17:15", "20:15"]  # offset from NPS
-    if pytz:
-        try:
-            # schedule supports a timezone string param in some builds; else fall back
-            for t in times:
-                schedule.every().day.at(t).do(perform_scrape_workflow)
-        except Exception:
-            for t in times:
-                schedule.every().day.at(t).do(perform_scrape_workflow)
-    else:
-        for t in times:
-            schedule.every().day.at(t).do(perform_scrape_workflow)
-
+    for t in times:
+        schedule.every().day.at(t).do(perform_scrape_workflow)
     logger.info(f"Complaint scheduler configured for: {', '.join(times)}")
     while True:
         try:
