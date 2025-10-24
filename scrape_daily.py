@@ -3,8 +3,14 @@
 
 """
 Retail Performance Dashboard → Daily Summary → Google Chat
-Block-scoped parsing + tile-aware extraction to avoid picking up “Target” values.
-Keeps CSV schema and Chat card from your previous version.
+
+Now with OCR fallback for the community visualisation gauges (canvas/SVG).
+Order of extraction for each tile:
+  1) Parse from page/frame inner text (block-scoped)
+  2) DOM/ARIA sniff around the label inside each frame
+  3) OCR on a screenshot of the tile container (nearest ancestor) inside that frame
+
+Keeps same CSV schema and sends a single compact cardsV2 message.
 """
 
 import os
@@ -18,6 +24,14 @@ from typing import Dict, List, Optional, Tuple
 
 import requests
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
+
+# Optional OCR deps
+try:
+    from PIL import Image
+    import pytesseract
+    OCR_AVAILABLE = True
+except Exception:
+    OCR_AVAILABLE = False
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Paths / constants
@@ -62,11 +76,11 @@ def _post_with_backoff(url: str, payload: dict) -> bool:
     backoff, max_backoff = 2.0, 30.0
     while True:
         try:
-            r = requests.post(url, json=payload, timeout=20)
+            r = requests.post(url, json=payload, timeout=25)
             if r.status_code == 200:
                 return True
             if r.status_code == 429:
-                delay = min(float(r.headers.get("Retry-After", backoff) or backoff), max_backoff)
+                delay = min(float(r.headers.get("Retry-After") or backoff), max_backoff)
                 logger.error(f"429 from webhook — sleeping {delay:.1f}s")
                 time.sleep(delay); backoff = min(backoff * 1.7, max_backoff)
                 continue
@@ -110,6 +124,7 @@ def fetch_text_from_dashboard(page, url: str) -> Optional[str]:
         logger.warning("Redirected to login — auth state missing/invalid.")
         return None
 
+    # Let dynamic/iframes render a bit
     logger.info("Waiting 15s for dynamic content…")
     page.wait_for_timeout(15_000)
 
@@ -119,7 +134,6 @@ def fetch_text_from_dashboard(page, url: str) -> Optional[str]:
     except Exception:
         pass
 
-    # Dive into frames for the longest text if body is short
     if not text or len(text) < 400:
         best = text; best_len = len(best) if best else 0
         for fr in page.frames:
@@ -145,10 +159,9 @@ def fetch_text_from_dashboard(page, url: str) -> Optional[str]:
     return text
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Parsing utilities (block-scoped + tile-aware)
+# Parsing utilities
 # ──────────────────────────────────────────────────────────────────────────────
 def _block(text: str, start: str, ends: List[str]) -> str:
-    """Slice text from first occurrence of `start` to the earliest next end marker."""
     s = text.find(start)
     if s == -1:
         return ""
@@ -167,38 +180,159 @@ def _search_first(patterns: List[str], text: str, flags=0, group: int = 1, defau
                 return m.group(0).strip()
     return default
 
-def _tile_value(page_text: str, label: str) -> str:
-    """
-    From the first occurrence of `label`, look ahead a small window and return the
-    first token that looks like a number or '—' BEFORE we hit 'Target:' or another tile.
-    """
+def _tile_value_from_text(page_text: str, label: str) -> str:
     idx = page_text.find(label)
     if idx == -1:
         return "—"
-    window = page_text[idx: idx + 400]  # small local window
-    # Prefer a number or '—' that is followed by a line containing 'NPS' (the dial caption),
-    # and make sure 'Target' is not between label and the value we pick.
+    window = page_text[idx: idx + 400]
     lines = window.splitlines()
     seen_label = False
-    for i, line in enumerate(lines[:20]):
+    for i, line in enumerate(lines[:25]):
         if not seen_label:
             if label in line:
                 seen_label = True
             continue
-        # stop if we run into 'Target'
         if "Target" in line:
             break
         token = line.strip()
-        if token in ("—", "-", "–"):
-            return "—"
+        # very defensive
+        if token in ("—", "-", "–", "NPS", "NEW") or not token:
+            continue
         if re.fullmatch(r"-?\d{1,3}", token):
-            # ensure next few lines include 'NPS' (the dial caption), which confirms it's the tile value
             tail = "\n".join(lines[i:i+5])
             if "NPS" in tail:
                 return token
     return "—"
 
-def parse_metrics(text: str) -> Dict[str, str]:
+def _dom_find_tile_value_in_frame(frame, label: str) -> Optional[str]:
+    """
+    From the element that displays `label`, walk its container subtree to find a plausible integer in text/aria/attrs.
+    """
+    script = """
+    (label) => {
+      const intRe = /-?\\d{1,3}\\b/;
+      const isInt = (s) => s && /^-?\\d{1,3}$/.test(s.trim());
+
+      const labelEls = Array.from(document.querySelectorAll('*'))
+        .filter(el => (el.textContent||'').trim() === label);
+      if (labelEls.length === 0) return null;
+
+      const start = labelEls[0];
+      let root = start.closest('[role="region"], section, article, .viz-container, .widget, .card, .tile, div');
+      if (!root) root = start.parentElement || start;
+
+      const q = [root];
+      const seen = new Set();
+      let steps = 0;
+
+      while (q.length && steps < 200) {
+        const node = q.shift(); steps++;
+        if (!node || seen.has(node)) continue;
+        seen.add(node);
+
+        const txt = (node.textContent || '').trim();
+        if (isInt(txt)) return txt;
+
+        const aria = node.getAttribute && (node.getAttribute('aria-label') || node.getAttribute('title'));
+        if (aria) {
+          const m = aria.match(intRe);
+          if (m) return m[0];
+        }
+        if (node.attributes) {
+          for (const a of Array.from(node.attributes)) {
+            const m = String(a.value).match(intRe);
+            if (m) return m[0];
+          }
+        }
+        if (node.children && node.children.length) {
+          q.push(...Array.from(node.children));
+        }
+      }
+      return null;
+    }
+    """
+    try:
+        return frame.evaluate(script, label)
+    except Exception:
+        return None
+
+def _dom_tile_value(page, label: str) -> str:
+    for fr in page.frames:
+        try:
+            if fr.locator(f"text={label}").first.count():
+                v = _dom_find_tile_value_in_frame(fr, label)
+                if v is not None:
+                    return v
+        except Exception:
+            continue
+    try:
+        if page.locator(f"text={label}").first.count():
+            v = _dom_find_tile_value_in_frame(page, label)
+            if v is not None:
+                return v
+    except Exception:
+        pass
+    return "—"
+
+# ───────────── OCR fallback (element screenshot inside the right frame) ───────
+def _ocr_tile_value(page, label: str) -> str:
+    if not OCR_AVAILABLE:
+        logger.debug("OCR not available (pytesseract/PIL missing).")
+        return "—"
+
+    # Try each frame that contains the label
+    for fr in page.frames:
+        try:
+            lab = fr.get_by_text(label, exact=True).first
+            if lab.count() == 0:
+                continue
+
+            # Prefer nearest "container" ancestor; otherwise screenshot the label with padding
+            container = lab.locator(
+                "xpath=ancestor::*[contains(@class,'viz') or contains(@class,'widget') or contains(@class,'card') or self::section or self::article or self::div][1]"
+            )
+            target = container if container.count() else lab
+
+            # Take element screenshot bytes from within the frame (Playwright handles frames automatically)
+            img_bytes = target.screenshot(type="png", timeout=10000)
+            # OCR with digit whitelist & single-line mode
+            image = Image.open(BytesIO(img_bytes)) if False else Image.open(Path(SCREENS_DIR / "tmp.png"))  # placeholder to satisfy type checkers
+        except Exception:
+            # fallback brute-force: try to screenshot the label element itself
+            try:
+                img_bytes = lab.screenshot(type="png", timeout=8000)
+            except Exception:
+                continue
+
+        try:
+            from io import BytesIO
+            img = Image.open(BytesIO(img_bytes))
+            # Increase contrast/scale a bit to help OCR
+            try:
+                img = img.convert("L")
+                w, h = img.size
+                if max(w, h) < 220:
+                    img = img.resize((int(w*1.8), int(h*1.8)))
+            except Exception:
+                pass
+
+            txt = pytesseract.image_to_string(
+                img, config="--psm 7 -c tessedit_char_whitelist=-0123456789"
+            )
+            if not txt:
+                continue
+            m = re.search(r"-?\d{1,3}", txt)
+            if m:
+                return m.group(0)
+        except Exception:
+            continue
+
+    return "—"
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Parse metrics (text first, then DOM then OCR for gauges)
+# ──────────────────────────────────────────────────────────────────────────────
+def parse_metrics_from_text(text: str) -> Dict[str, str]:
     out: Dict[str, str] = {}
 
     # Global context
@@ -209,7 +343,7 @@ def parse_metrics(text: str) -> Dict[str, str]:
         text, flags=re.S, group=0
     )
 
-    # ── Sales block
+    # Sales block
     sales_b = _block(text, "Sales", ["Waste & Markdowns", "Colleague Happiness", "Payroll"])
     if sales_b:
         m = re.search(
@@ -223,19 +357,18 @@ def parse_metrics(text: str) -> Dict[str, str]:
     else:
         out["sales_total"] = out["sales_lfl"] = out["sales_vs_target"] = "—"
 
-    # ── NPS / tiles (tile-aware so we don’t pick “Target”)
-    out["supermarket_nps"]   = _tile_value(text, "Supermarket NPS")
-    out["colleague_happiness"]= _tile_value(text, "Colleague Happiness")
-    out["home_delivery_nps"] = _tile_value(text, "Home Delivery NPS")
-    out["cafe_nps"]          = _tile_value(text, "Cafe NPS")
-    out["click_collect_nps"] = _tile_value(text, "Click & Collect NPS")
-    out["customer_toilet_nps"]= _tile_value(text, "Customer Toilet NPS")
+    # Tile numbers from text (may fail on community viz)
+    out["supermarket_nps"]    = _tile_value_from_text(text, "Supermarket NPS")
+    out["colleague_happiness"]= _tile_value_from_text(text, "Colleague Happiness")
+    out["home_delivery_nps"]  = _tile_value_from_text(text, "Home Delivery NPS")
+    out["cafe_nps"]           = _tile_value_from_text(text, "Cafe NPS")
+    out["click_collect_nps"]  = _tile_value_from_text(text, "Click & Collect NPS")
+    out["customer_toilet_nps"]= _tile_value_from_text(text, "Customer Toilet NPS")
 
-    # ── Front End Service block
+    # Front End Service
     fes_b = _block(text, "Front End Service", ["Production Planning", "More Card Engagement", "Stock Record NPS", "Privacy"])
     out["sco_utilisation"] = _search_first([r"Sco Utilisation\s*\n\s*([0-9]+%)"], fes_b, flags=re.I)
     out["efficiency"]      = _search_first([r"Efficiency\s*\n\s*([0-9]+%)"], fes_b, flags=re.I)
-    # metric + vs Target
     m = re.search(r"Scan Rate\s*\n\s*([0-9]+)\s*\n\s*vs Target\s*\n\s*([+-]?[0-9.]+)", fes_b, flags=re.I)
     out["scan_rate"], out["scan_vs_target"] = (m.group(1).strip(), m.group(2).strip()) if m else ("—", "—")
     m = re.search(r"Interventions\s*\n\s*([0-9]+)\s*\n\s*vs Target\s*\n\s*([+-]?[0-9.]+)", fes_b, flags=re.I)
@@ -243,14 +376,14 @@ def parse_metrics(text: str) -> Dict[str, str]:
     m = re.search(r"Mainbank Closed\s*\n\s*([0-9]+)\s*\n\s*vs Target\s*\n\s*([+-]?[0-9.]+)", fes_b, flags=re.I)
     out["mainbank_closed"], out["mainbank_vs_target"] = (m.group(1).strip(), m.group(2).strip()) if m else ("—", "—")
 
-    # ── Online block
+    # Online
     online_b = _block(text, "Online", ["Front End Service", "Production Planning", "Privacy"])
     out["availability_pct"]  = _search_first([r"Availability\s*\n\s*([0-9]+%)"], online_b, flags=re.I)
     out["despatched_on_time"]= _search_first([r"Despatched on Time\s*\n\s*([0-9]+%|No data)"], online_b, flags=re.I)
     out["delivered_on_time"] = _search_first([r"Delivered on Time\s*\n\s*([0-9]+%|No data)"], online_b, flags=re.I)
     out["cc_avg_wait"]       = _search_first([r"Click\s*&\s*Collect average wait\s*\n\s*([0-9]{2}:[0-9]{2})"], online_b, flags=re.I)
 
-    # ── Waste & Markdowns block
+    # Waste & Markdowns
     wm_b = _block(text, "Waste & Markdowns", ["My Reports", "Clean & Rotate", "Payroll", "Online"])
     m = re.search(
         r"Total\s*\n\s*([£]?[0-9.,]+[KMB]?)\s*\n\s*([£]?[0-9.,]+[KMB]?)\s*\n\s*([£]?[0-9.,]+[KMB]?)\s*\n\s*([+-]?[£]?[0-9.,]+[KMB]?)\s*\n\s*([+-]?\d+\.?\d*%)",
@@ -262,7 +395,7 @@ def parse_metrics(text: str) -> Dict[str, str]:
     else:
         out.update({k: "—" for k in ["waste_total", "markdowns_total", "wm_total", "wm_delta", "wm_delta_pct"]})
 
-    # ── Payroll block
+    # Payroll
     pay_b = _block(text, "Payroll", ["More Card Engagement", "Stock Record NPS", "Online", "Privacy"])
     out["payroll_outturn"]   = _search_first([r"Payroll Outturn\s*\n\s*([+-]?[£]?[0-9.,]+[KMB]?)"], pay_b, flags=re.I)
     out["absence_outturn"]   = _search_first([r"Absence Outturn\s*\n\s*([+-]?[£]?[0-9.,]+[KMB]?)"], pay_b, flags=re.I)
@@ -270,44 +403,61 @@ def parse_metrics(text: str) -> Dict[str, str]:
     out["holiday_outturn"]   = _search_first([r"Holiday Outturn\s*\n\s*([+-]?[£]?[0-9.,]+[KMB]?)"], pay_b, flags=re.I)
     out["current_base_cost"] = _search_first([r"Current Base Cost\s*\n\s*([£]?[0-9.,]+[KMB]?)"], pay_b, flags=re.I)
 
-    # ── Shrink block
+    # Shrink
     shr_b = _block(text, "Shrink", ["Online", "Production Planning", "Privacy"])
     out["moa"]                 = _search_first([r"Morrisons Order Adjustments\s*\n\s*([£]?-?[0-9.,]+[KMB]?)"], shr_b, flags=re.I)
     out["waste_validation"]    = _search_first([r"Waste Validation\s*\n\s*([0-9]+%)"], shr_b, flags=re.I)
     out["unrecorded_waste_pct"]= _search_first([r"Unrecorded Waste %\s*\n\s*([+-]?\d+\.?\d*%)"], shr_b, flags=re.I)
     out["shrink_vs_budget_pct"]= _search_first([r"Shrink vs Budget %\s*\n\s*([+-]?\d+\.?\d*%)"], shr_b, flags=re.I)
 
-    # ── Card Engagement block
+    # Card Engagement
     ce_b = _block(text, "More Card Engagement", ["Stock Record NPS", "Production Planning", "Privacy"])
     out["swipe_rate"]   = _search_first([r"Swipe Rate\s*\n\s*([0-9]+%)"], ce_b, flags=re.I)
     out["swipes_wow_pct"]= _search_first([r"Swipes WOW %\s*\n\s*([+-]?\d+%)"], ce_b, flags=re.I)
-    out["new_customers"]= _search_first([r"New Customers\s*\n\s*([0-9]+)"], ce_b, flags=re.I)
+    out["new_customers"]= _search_first([r"New Customers\s*\n\s*([0-9,]+)"], ce_b, flags=re.I)
     out["swipes_yoy_pct"]= _search_first([r"Swipes YOY %\s*\n\s*([+-]?\d+%)"], ce_b, flags=re.I)
 
-    # ── Production Planning (Data Provided / Trusted Data)
+    # Production Planning
     pp_b = _block(text, "Production Planning", ["Shrink", "Online", "Privacy"])
     out["data_provided"] = _search_first([r"Data Provided\s*\n\s*([0-9]+%)"], pp_b, flags=re.I)
     out["trusted_data"]  = _search_first([r"Trusted Data\s*\n\s*([0-9]+%)"], pp_b, flags=re.I)
 
-    # ── Misc
+    # Misc
     out["complaints_key"] = _search_first([r"Key Customer Complaints\s*\n\s*([0-9]+)"], text, flags=re.I)
     out["my_reports"]     = _search_first([r"My Reports\s*\n\s*([0-9]+)"], text, flags=re.I)
     out["weekly_activity"]= _search_first([r"Weekly Activity %\s*\n\s*([0-9]+%|No data)"], text, flags=re.I)
 
     return out
 
+def fill_missing_gauges(page, metrics: Dict[str, str]) -> Dict[str, str]:
+    labels = [
+        ("supermarket_nps", "Supermarket NPS"),
+        ("colleague_happiness", "Colleague Happiness"),
+        ("home_delivery_nps", "Home Delivery NPS"),
+        ("cafe_nps", "Cafe NPS"),
+        ("click_collect_nps", "Click & Collect NPS"),
+        ("customer_toilet_nps", "Customer Toilet NPS"),
+    ]
+    for key, label in labels:
+        if metrics.get(key) and metrics[key] != "—":
+            continue
+        # 1) DOM sniff
+        v = _dom_tile_value(page, label)
+        if v and re.fullmatch(r"-?\d{1,3}", v):
+            metrics[key] = v
+            continue
+        # 2) OCR fallback
+        v = _ocr_tile_value(page, label)
+        if v and re.fullmatch(r"-?\d{1,3}", v):
+            metrics[key] = v
+    return metrics
+
 # ──────────────────────────────────────────────────────────────────────────────
-# Card builder + sender (Cards V2 valid)
+# Card builder + sender (cardsV2 — no section headers objects)
 # ──────────────────────────────────────────────────────────────────────────────
 def build_chat_card(metrics: Dict[str, str]) -> dict:
-    card_header = {
-        "title": "📊 Retail Daily Summary",
-        "subtitle": (metrics.get("store_line") or "").replace("\n", "  "),
-    }
-
     def title_widget(text: str) -> dict:
         return {"textParagraph": {"text": f"<b>{text}</b>"}}
-
     def kv(label: str, val: str) -> dict:
         return {"decoratedText": {"topLabel": label, "text": (val or "—")}}
 
@@ -331,16 +481,16 @@ def build_chat_card(metrics: Dict[str, str]) -> dict:
                      kv("Interventions",   f"{metrics.get('interventions','—')} (vs {metrics.get('interventions_vs_target','—')})"),
                      kv("Mainbank Closed", f"{metrics.get('mainbank_closed','—')} (vs {metrics.get('mainbank_vs_target','—')})")]},
         {"widgets": [title_widget("Online"),
-                     kv("Availability",          metrics.get("availability_pct", "—")),
-                     kv("Despatched on Time",    metrics.get("despatched_on_time", "—")),
-                     kv("Delivered on Time",     metrics.get("delivered_on_time", "—")),
+                     kv("Availability",         metrics.get("availability_pct", "—")),
+                     kv("Despatched on Time",   metrics.get("despatched_on_time", "—")),
+                     kv("Delivered on Time",    metrics.get("delivered_on_time", "—")),
                      kv("Click & Collect Avg Wait", metrics.get("cc_avg_wait", "—"))]},
         {"widgets": [title_widget("Waste & Markdowns (Total)"),
-                     kv("Waste",      metrics.get("waste_total", "—")),
-                     kv("Markdowns",  metrics.get("markdowns_total", "—")),
-                     kv("Total",      metrics.get("wm_total", "—")),
-                     kv("+/−",        metrics.get("wm_delta", "—")),
-                     kv("+/− %",      metrics.get("wm_delta_pct", "—"))]},
+                     kv("Waste",     metrics.get("waste_total", "—")),
+                     kv("Markdowns", metrics.get("markdowns_total", "—")),
+                     kv("Total",     metrics.get("wm_total", "—")),
+                     kv("+/−",       metrics.get("wm_delta", "—")),
+                     kv("+/− %",     metrics.get("wm_delta_pct", "—"))]},
         {"widgets": [title_widget("Payroll"),
                      kv("Payroll Outturn",   metrics.get("payroll_outturn", "—")),
                      kv("Absence Outturn",   metrics.get("absence_outturn", "—")),
@@ -361,10 +511,15 @@ def build_chat_card(metrics: Dict[str, str]) -> dict:
                      kv("Data Provided",   metrics.get("data_provided", "—")),
                      kv("Trusted Data",    metrics.get("trusted_data", "—")),
                      kv("My Reports",      metrics.get("my_reports", "—")),
-                     kv("Weekly Activity %",metrics.get("weekly_activity", "—"))]}
+                     kv("Weekly Activity %",metrics.get("weekly_activity", "—"))]},
     ]
 
-    return {"cardsV2": [{"cardId": f"daily_{int(time.time())}", "card": {"header": card_header, "sections": sections}}]}
+    header = {
+        "title": "📊 Retail Daily Summary",
+        "subtitle": (metrics.get("store_line") or "").replace("\n", "  "),
+    }
+
+    return {"cardsV2": [{"cardId": f"daily_{int(time.time())}", "card": {"header": header, "sections": sections}}]}
 
 def send_daily_card(metrics: Dict[str, str]) -> bool:
     if not MAIN_WEBHOOK or "chat.googleapis.com" not in MAIN_WEBHOOK:
@@ -389,6 +544,14 @@ def run_daily_scrape():
             context = browser.new_context(storage_state=str(AUTH_STATE_PATH))
             page = context.new_page()
             text = fetch_text_from_dashboard(page, DASHBOARD_URL)
+            if text is None:
+                alert(["⚠️ Daily scrape blocked by login — please re-login (the NPS scraper will prompt you)."])
+                return
+            if not text:
+                logger.error("No text extracted — skipping.")
+                return
+            metrics = parse_metrics_from_text(text)
+            metrics = fill_missing_gauges(page, metrics)
         finally:
             try:
                 if context: context.close()
@@ -399,17 +562,10 @@ def run_daily_scrape():
             except Exception:
                 pass
 
-    if text is None:
-        alert(["⚠️ Daily scrape blocked by login — please re-login (the NPS scraper will prompt you)."])
-        return
-    if not text:
-        logger.error("No text extracted — skipping.")
-        return
-
-    metrics = parse_metrics(text)
     ok = send_daily_card(metrics)
     logger.info("Daily card send → %s", "OK" if ok else "FAIL")
 
+    # CSV logging
     headers = [
         "page_timestamp","period_range","store_line",
         "sales_total","sales_lfl","sales_vs_target",
