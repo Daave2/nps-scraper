@@ -4,16 +4,15 @@
 """
 Retail Performance Dashboard → Daily Summary (OCR-first) → Google Chat
 
-Changes in this version:
-- Loads external ROI map from roi_map.json (or ROI_MAP_FILE env var) and merges with defaults.
-- External entries override defaults; unknown keys are accepted as-is.
-- Saves an overlay PNG showing the *merged* ROI boxes that were used.
-- Keeps: OCR-first full-page → label proximity → fixed-ROI OCR fallback, "This Week" & "PROCEED" clicks,
-  debug dumps, and CSV logging.
-
-Requires:
-  pip install playwright requests pillow pytesseract
-  python -m playwright install --with-deps chromium
+What's new in this build:
+- No pandas dependency for OCR (uses pytesseract Output.DICT).
+- ROI map loader accepts many formats: [x,y,w,h], {"rect":[...]}, or {"x":..,"y":..,"w":..,"h":..}.
+- Very explicit ROI debug:
+    • Logs how many overrides loaded and lists the keys.
+    • Saves EACH ROI crop to screens/<ts>_<key>_crop.png
+    • Logs OCR result for each crop and warns if the crop looks all-black / empty.
+- Always draws a merged ROI overlay on the full screenshot.
+- Still clicks "This Week" + "PROCEED" and does OCR-first with ROI fallback.
 """
 
 import os
@@ -31,7 +30,7 @@ from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeo
 
 # Optional OCR deps
 try:
-    from PIL import Image, ImageDraw
+    from PIL import Image, ImageDraw, ImageStat
     from io import BytesIO
     import pytesseract
     OCR_AVAILABLE = True
@@ -54,7 +53,7 @@ DASHBOARD_URL = (
     "?params=%7B%22f20f0n9kld%22:%22include%25EE%2580%25803%25EE%2580%2580T%22%7D"
 )
 
-# Fixed viewport → stable ROI coordinates
+# Stable viewport
 VIEWPORT = {"width": 1600, "height": 900}
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -79,7 +78,7 @@ ALERT_WEBHOOK  = config["DEFAULT"].get("ALERT_WEBHOOK",  os.getenv("ALERT_WEBHOO
 CI_RUN_URL     = os.getenv("CI_RUN_URL", "")
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Helpers: Chat post + debug files
+# Helpers
 # ──────────────────────────────────────────────────────────────────────────────
 def _post_with_backoff(url: str, payload: dict) -> bool:
     backoff, max_backoff = 2.0, 30.0
@@ -91,8 +90,7 @@ def _post_with_backoff(url: str, payload: dict) -> bool:
             if r.status_code == 429:
                 delay = min(float(r.headers.get("Retry-After") or backoff), max_backoff)
                 log.error(f"429 from webhook — sleeping {delay:.1f}s")
-                time.sleep(delay); backoff = min(backoff * 1.7, max_backoff)
-                continue
+                time.sleep(delay); backoff = min(backoff * 1.7, max_backoff); continue
             log.error(f"Webhook error {r.status_code}: {r.text[:300]}")
             return False
         except Exception as e:
@@ -127,7 +125,6 @@ def save_text(path: Path, text: str):
 # Browser automation
 # ──────────────────────────────────────────────────────────────────────────────
 def click_this_week(page):
-    # Try multiple strategies to hit "This Week"
     candidates = [
         ("role", ("button", "This Week")),
         ("text", "This Week"),
@@ -140,8 +137,8 @@ def click_this_week(page):
             else:
                 btn = page.get_by_text(value)
             if btn.count():
-                btn.first.click(timeout=2000)
-                page.wait_for_timeout(800)
+                btn.first.click(timeout=2500)
+                page.wait_for_timeout(900)
                 return True
         except Exception:
             continue
@@ -155,16 +152,16 @@ def click_proceed_overlays(page) -> int:
             n = btn.count()
             for i in range(n):
                 try:
-                    btn.nth(i).click(timeout=1200)
+                    btn.nth(i).click(timeout=1500)
                     clicked += 1
-                    fr.wait_for_timeout(300)
+                    fr.wait_for_timeout(350)
                 except Exception:
                     continue
         except Exception:
             continue
     if clicked:
         log.info(f"Clicked {clicked} 'PROCEED' overlay(s). Waiting for render…")
-        page.wait_for_timeout(1200)
+        page.wait_for_timeout(1500)
     return clicked
 
 def open_and_prepare(page) -> bool:
@@ -185,28 +182,26 @@ def open_and_prepare(page) -> bool:
     click_this_week(page)
     click_proceed_overlays(page)
 
-    # Detect community viz placeholder; retry once
-    body_text = ""
+    # If the placeholder text still appears, retry once and wait longer
     try:
         body_text = page.inner_text("body")
     except Exception:
-        pass
+        body_text = ""
     if "You are about to interact with a community visualisation" in body_text:
         log.info("Community visualisation placeholders detected — retrying PROCEED and waiting longer.")
         click_proceed_overlays(page)
-        page.wait_for_timeout(1500)
+        page.wait_for_timeout(2000)
 
     return True
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Full-page screenshot + OCR
+# Full-page screenshot + OCR (no pandas required)
 # ──────────────────────────────────────────────────────────────────────────────
 def screenshot_full_page(page) -> Optional[Image.Image]:
     try:
         img_bytes = page.screenshot(full_page=True, type="png")
         ts = int(time.time())
-        png_path = SCREENS_DIR / f"{ts}_fullpage.png"
-        save_bytes(png_path, img_bytes)
+        save_bytes(SCREENS_DIR / f"{ts}_fullpage.png", img_bytes)
         return Image.open(BytesIO(img_bytes))
     except Exception as e:
         log.error(f"Full-page screenshot failed: {e}")
@@ -214,45 +209,38 @@ def screenshot_full_page(page) -> Optional[Image.Image]:
 
 def ocr_fullpage(img: Image.Image) -> Tuple[Optional[Image.Image], List[dict]]:
     """
-    Returns (image, words) where words is a list of dicts with:
+    Returns (image, words) where words is a list of dicts:
       {text, left, top, width, height, conf}
-    Also dumps TSV/text to screens/ for debugging.
+    Saves a plaintext dump for quick eyeballing.
     """
     if not OCR_AVAILABLE or img is None:
         return img, []
 
     try:
-        # Upscale a bit to help OCR on tiny UI numbers
         W,H = img.size
         if max(W,H) < 1400:
             scale = 1400 / max(W,H)
             img = img.resize((int(W*scale), int(H*scale)))
 
         ts = int(time.time())
-        df = pytesseract.image_to_data(img, output_type=pytesseract.Output.DATAFRAME)
-        df = df.fillna("")
-
-        # Save TSV-like CSV and a flattened plaintext stream for reference
-        try:
-            save_text(SCREENS_DIR / f"{ts}_ocr.tsv", df.to_csv(index=False))
-            flat = " ".join(str(t).strip() for t in df["text"] if str(t).strip())
-            save_text(SCREENS_DIR / f"{ts}_daily_text.txt", flat)
-        except Exception:
-            pass
-
-        words = []
-        for _, row in df.iterrows():
-            t = str(row.get("text", "")).strip()
+        data = pytesseract.image_to_data(img, output_type=pytesseract.Output.DICT)
+        n = len(data.get("text", []))
+        words: List[dict] = []
+        parts = []
+        for i in range(n):
+            t = (data["text"][i] or "").strip()
             if not t:
                 continue
             words.append({
                 "text": t,
-                "left": int(row.get("left", 0)),
-                "top": int(row.get("top", 0)),
-                "width": int(row.get("width", 0)),
-                "height": int(row.get("height", 0)),
-                "conf": float(row.get("conf", -1)),
+                "left": int(data.get("left", [0]*n)[i]),
+                "top": int(data.get("top", [0]*n)[i]),
+                "width": int(data.get("width", [0]*n)[i]),
+                "height": int(data.get("height", [0]*n)[i]),
+                "conf": float(data.get("conf", [-1]*n)[i]),
             })
+            parts.append(t)
+        save_text(SCREENS_DIR / f"{ts}_daily_text.txt", " ".join(parts))
         return img, words
     except Exception as e:
         log.error(f"OCR failed: {e}")
@@ -266,11 +254,10 @@ NumPat = re.compile(r"[£]?-?\d+(?:\.\d+)?(?:[KMB]|%)?|\b\d{2}:\d{2}\b", re.I)
 def nearest_number(words: List[dict], label: str, window: int = 180) -> str:
     labs = [w for w in words if w["text"].lower() == label.lower()]
     if not labs:
-        # fuzzy: allow contains
         labs = [w for w in words if label.lower() in w["text"].lower()]
     if not labs:
         return "—"
-    lx = labs[0]["left"]; ly = labs[0]["top"]
+    lx, ly = labs[0]["left"], labs[0]["top"]
     best = None; bestd = 1e9
     for w in words:
         if w is labs[0]:
@@ -287,16 +274,16 @@ def nearest_number(words: List[dict], label: str, window: int = 180) -> str:
 def build_metrics_from_ocr_labels(words: List[dict]) -> Dict[str, str]:
     m: Dict[str,str] = {}
 
-    # Context (will be refined from DOM body below)
+    # Context placeholders (we fill page_timestamp/period from DOM text later)
     m["page_timestamp"] = "—"
     m["period_range"]   = "—"
 
-    # Sales (typically best with ROI; leave as — here)
+    # Sales (better via ROI table)
     m["sales_total"]     = "—"
     m["sales_lfl"]       = "—"
     m["sales_vs_target"] = "—"
 
-    # NPS gauges (numbers inside dials; often not in raw text)
+    # NPS gauges
     m["supermarket_nps"]     = nearest_number(words, "Supermarket")
     m["colleague_happiness"] = nearest_number(words, "Colleague")
     m["home_delivery_nps"]   = nearest_number(words, "Home")
@@ -305,22 +292,22 @@ def build_metrics_from_ocr_labels(words: List[dict]) -> Dict[str, str]:
     m["customer_toilet_nps"] = nearest_number(words, "Toilet")
 
     # Front End Service
-    m["sco_utilisation"]     = nearest_number(words, "Utilisation")
-    m["efficiency"]          = nearest_number(words, "Efficiency")
-    m["scan_rate"]           = nearest_number(words, "Scan")
-    m["scan_vs_target"]      = "—"
-    m["interventions"]       = nearest_number(words, "Interventions")
-    m["interventions_vs_target"] = "—"
-    m["mainbank_closed"]     = nearest_number(words, "Mainbank")
-    m["mainbank_vs_target"]  = "—"
+    m["sco_utilisation"]          = nearest_number(words, "Utilisation")
+    m["efficiency"]               = nearest_number(words, "Efficiency")
+    m["scan_rate"]                = nearest_number(words, "Scan")
+    m["scan_vs_target"]           = "—"
+    m["interventions"]            = nearest_number(words, "Interventions")
+    m["interventions_vs_target"]  = "—"
+    m["mainbank_closed"]          = nearest_number(words, "Mainbank")
+    m["mainbank_vs_target"]       = "—"
 
     # Online
-    m["availability_pct"]    = nearest_number(words, "Availability")
-    m["despatched_on_time"]  = nearest_number(words, "Despatched")
-    m["delivered_on_time"]   = nearest_number(words, "Delivered")
-    m["cc_avg_wait"]         = nearest_number(words, "wait")
+    m["availability_pct"]   = nearest_number(words, "Availability")
+    m["despatched_on_time"] = nearest_number(words, "Despatched")
+    m["delivered_on_time"]  = nearest_number(words, "Delivered")
+    m["cc_avg_wait"]        = nearest_number(words, "wait")
 
-    # Waste & Markdowns (Total row) → ROI later
+    # Waste & Markdowns → ROI later
     m["waste_total"]   = "—"
     m["markdowns_total"]= "—"
     m["wm_total"]      = "—"
@@ -340,27 +327,24 @@ def build_metrics_from_ocr_labels(words: List[dict]) -> Dict[str, str]:
     m["unrecorded_waste_pct"] = nearest_number(words, "Unrecorded")
     m["shrink_vs_budget_pct"] = nearest_number(words, "Budget")
 
-    # Card Engagement
+    # Card Engagement & Misc
     m["swipe_rate"]     = nearest_number(words, "Swipe")
     m["swipes_wow_pct"] = nearest_number(words, "WOW")
     m["new_customers"]  = nearest_number(words, "Customers")
     m["swipes_yoy_pct"] = nearest_number(words, "YOY")
-
-    # Production Planning + misc
-    m["data_provided"]   = nearest_number(words, "Provided")
-    m["trusted_data"]    = nearest_number(words, "Trusted")
-    m["complaints_key"]  = nearest_number(words, "Complaints")
-    m["my_reports"]      = nearest_number(words, "Reports")
-    m["weekly_activity"] = nearest_number(words, "Activity")
+    m["data_provided"]  = nearest_number(words, "Provided")
+    m["trusted_data"]   = nearest_number(words, "Trusted")
+    m["complaints_key"] = nearest_number(words, "Complaints")
+    m["my_reports"]     = nearest_number(words, "Reports")
+    m["weekly_activity"]= nearest_number(words, "Activity")
 
     return m
 
 # ──────────────────────────────────────────────────────────────────────────────
 # ROI map (defaults) + external merge
 # ──────────────────────────────────────────────────────────────────────────────
-# Each ROI is (x, y, w, h) in normalized 0..1 relative to full-page screenshot.
 DEFAULT_ROI_MAP: Dict[str, Tuple[float,float,float,float]] = {
-    # Gauges (row of dials)
+    # Gauges (row of dials) — tweak these with your own file
     "colleague_happiness": (0.23, 0.20, 0.09, 0.12),
     "supermarket_nps":     (0.38, 0.20, 0.09, 0.12),
     "cafe_nps":            (0.53, 0.20, 0.09, 0.12),
@@ -376,87 +360,92 @@ DEFAULT_ROI_MAP: Dict[str, Tuple[float,float,float,float]] = {
     "wm_delta_pct":    (0.38, 0.42, 0.06, 0.03),
 
     # Front End Service
-    "sco_utilisation":     (0.68, 0.59, 0.06, 0.05),
-    "efficiency":          (0.95, 0.60, 0.07, 0.10),
-    "scan_rate":           (0.68, 0.65, 0.06, 0.04),
-    "interventions":       (0.81, 0.59, 0.06, 0.05),
-    "mainbank_closed":     (0.81, 0.65, 0.06, 0.04),
+    "sco_utilisation": (0.68, 0.59, 0.06, 0.05),
+    "efficiency":      (0.95, 0.60, 0.07, 0.10),
+    "scan_rate":       (0.68, 0.65, 0.06, 0.04),
+    "interventions":   (0.81, 0.59, 0.06, 0.05),
+    "mainbank_closed": (0.81, 0.65, 0.06, 0.04),
 
     # Online
-    "availability_pct":    (0.45, 0.59, 0.06, 0.07),
-    "despatched_on_time":  (0.52, 0.59, 0.08, 0.05),
-    "delivered_on_time":   (0.59, 0.59, 0.08, 0.05),
-    "cc_avg_wait":         (0.62, 0.65, 0.06, 0.07),
+    "availability_pct":   (0.45, 0.59, 0.06, 0.07),
+    "despatched_on_time": (0.52, 0.59, 0.08, 0.05),
+    "delivered_on_time":  (0.59, 0.59, 0.08, 0.05),
+    "cc_avg_wait":        (0.62, 0.65, 0.06, 0.07),
 
     # Payroll
-    "payroll_outturn":     (0.53, 0.46, 0.08, 0.10),
-    "absence_outturn":     (0.64, 0.45, 0.05, 0.04),
-    "productive_outturn":  (0.64, 0.50, 0.05, 0.04),
-    "holiday_outturn":     (0.73, 0.45, 0.05, 0.04),
-    "current_base_cost":   (0.73, 0.50, 0.05, 0.04),
+    "payroll_outturn":    (0.53, 0.46, 0.08, 0.10),
+    "absence_outturn":    (0.64, 0.45, 0.05, 0.04),
+    "productive_outturn": (0.64, 0.50, 0.05, 0.04),
+    "holiday_outturn":    (0.73, 0.45, 0.05, 0.04),
+    "current_base_cost":  (0.73, 0.50, 0.05, 0.04),
 
     # Card Engagement
-    "swipe_rate":          (0.83, 0.45, 0.05, 0.04),
-    "swipes_wow_pct":      (0.90, 0.45, 0.05, 0.04),
-    "new_customers":       (0.83, 0.50, 0.05, 0.04),
-    "swipes_yoy_pct":      (0.90, 0.50, 0.05, 0.04),
+    "swipe_rate":     (0.83, 0.45, 0.05, 0.04),
+    "swipes_wow_pct": (0.90, 0.45, 0.05, 0.04),
+    "new_customers":  (0.83, 0.50, 0.05, 0.04),
+    "swipes_yoy_pct": (0.90, 0.50, 0.05, 0.04),
 
     # Production Planning
-    "data_provided":       (0.07, 0.60, 0.06, 0.06),
-    "trusted_data":        (0.07, 0.66, 0.06, 0.06),
+    "data_provided":  (0.07, 0.60, 0.06, 0.06),
+    "trusted_data":   (0.07, 0.66, 0.06, 0.06),
 
     # Misc
-    "my_reports":          (0.34, 0.46, 0.05, 0.06),
-    "weekly_activity":     (0.44, 0.48, 0.06, 0.06),
-    "complaints_key":      (0.96, 0.27, 0.05, 0.06),
+    "my_reports":     (0.34, 0.46, 0.05, 0.06),
+    "weekly_activity":(0.44, 0.48, 0.06, 0.06),
+    "complaints_key": (0.96, 0.27, 0.05, 0.06),
 }
 
 def _normalize_rect(value: Union[list, tuple, dict]) -> Optional[Tuple[float,float,float,float]]:
     """
     Accepts:
-      - [x, y, w, h] or (x, y, w, h) in normalized coords (0..1)
-      - {"rect":[x,y,w,h]} (optionally with extra fields we ignore)
-    Returns a validated (x,y,w,h) tuple or None if invalid.
+      - [x, y, w, h] or (x, y, w, h)
+      - {"rect":[x,y,w,h]}
+      - {"x":..,"y":..,"w":..,"h":..}  (or left/top/width/height)
+    Values must be normalized 0..1.
     """
     rect = None
     if isinstance(value, (list, tuple)) and len(value) == 4:
         rect = tuple(float(v) for v in value)
-    elif isinstance(value, dict) and "rect" in value and isinstance(value["rect"], (list, tuple)) and len(value["rect"]) == 4:
-        rect = tuple(float(v) for v in value["rect"])
+    elif isinstance(value, dict):
+        if "rect" in value and isinstance(value["rect"], (list, tuple)) and len(value["rect"]) == 4:
+            rect = tuple(float(v) for v in value["rect"])
+        else:
+            # support x/y/w/h or left/top/width/height
+            keys1 = ("x","y","w","h")
+            keys2 = ("left","top","width","height")
+            if all(k in value for k in keys1):
+                rect = (float(value["x"]), float(value["y"]), float(value["w"]), float(value["h"]))
+            elif all(k in value for k in keys2):
+                rect = (float(value["left"]), float(value["top"]), float(value["width"]), float(value["height"]))
     if rect is None:
         return None
     x,y,w,h = rect
-    # basic sanity clamp
     if not (0 <= x <= 1 and 0 <= y <= 1 and 0 <= w <= 1 and 0 <= h <= 1):
         return None
     return (x,y,w,h)
 
 def load_roi_map() -> Dict[str, Tuple[float,float,float,float]]:
-    """
-    Merge DEFAULT_ROI_MAP with external overrides from roi_map.json (if present).
-    The external file can be minimal (e.g. only a few keys); unknown keys are allowed.
-    """
     merged = dict(DEFAULT_ROI_MAP)
     if not ROI_MAP_PATH.exists():
         log.info("No roi_map.json found — using default ROI map.")
         return merged
-
     try:
         data = json.loads(ROI_MAP_PATH.read_text(encoding="utf-8"))
         overrides = 0
+        applied_keys = []
         for k, v in data.items():
             rect = _normalize_rect(v)
             if rect is None:
-                log.warning(f"ROI '{k}' invalid format — expected [x,y,w,h] or {{'rect':[x,y,w,h]}}. Skipping.")
+                log.warning(f"ROI '{k}' invalid format — expected [x,y,w,h] / {{'rect':[x,y,w,h]}} / {{x,y,w,h}}. Skipping.")
                 continue
             merged[k] = rect
             overrides += 1
-        log.info(f"Loaded ROI overrides from {ROI_MAP_PATH.name}: {overrides} entrie(s).")
+            applied_keys.append(k)
+        log.info(f"Loaded ROI overrides from {ROI_MAP_PATH.name}: {overrides} entrie(s). Keys: {', '.join(applied_keys) if applied_keys else '—'}")
     except Exception as e:
         log.error(f"Failed to read {ROI_MAP_PATH.name}: {e}. Using defaults.")
     return merged
 
-# Active ROI map (merged)
 ROI_MAP = load_roi_map()
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -468,6 +457,20 @@ def _crop_roi(img: Image.Image, roi: Tuple[float,float,float,float]) -> Image.Im
     box = (int(x*W), int(y*H), int((x+w)*W), int((y+h)*H))
     return img.crop(box)
 
+def _looks_black(img: Image.Image) -> bool:
+    try:
+        if img.mode != "L":
+            g = img.convert("L")
+        else:
+            g = img
+        stat = ImageStat.Stat(g)
+        mean = stat.mean[0]
+        # also check variance to catch flat areas
+        var = stat.var[0]
+        return mean < 3 and var < 5
+    except Exception:
+        return False
+
 def _ocr_from_image(img: Image.Image, want_time=False, allow_percent=True) -> str:
     if not OCR_AVAILABLE:
         return "—"
@@ -475,8 +478,8 @@ def _ocr_from_image(img: Image.Image, want_time=False, allow_percent=True) -> st
         w,h = img.size
         if max(w,h) < 240:
             img = img.resize((int(w*2.0), int(h*2.0)))
-        img = img.convert("L")
-        txt = pytesseract.image_to_string(img, config="--psm 7")
+        g = img.convert("L")
+        txt = pytesseract.image_to_string(g, config="--psm 7")
         if want_time:
             m = re.search(r"\b\d{2}:\d{2}\b", txt)
             if m: return m.group(0)
@@ -493,7 +496,7 @@ def _ocr_from_image(img: Image.Image, want_time=False, allow_percent=True) -> st
 
 def draw_roi_overlay(img: Image.Image, outfile: Path, roi_map: Dict[str, Tuple[float,float,float,float]]):
     try:
-        dbg = img.copy()
+        dbg = img.copy().convert("RGB")
         draw = ImageDraw.Draw(dbg)
         W,H = dbg.size
         for key, (x,y,w,h) in roi_map.items():
@@ -508,21 +511,36 @@ def draw_roi_overlay(img: Image.Image, outfile: Path, roi_map: Dict[str, Tuple[f
 def fill_from_roi(metrics: Dict[str,str], img: Optional[Image.Image], roi_map: Dict[str, Tuple[float,float,float,float]]):
     if img is None:
         return
-    changed = False
+    ts = int(time.time())
+    any_filled = False
     for key, roi in roi_map.items():
         if metrics.get(key) and metrics[key] != "—":
             continue
-        want_time = (key == "cc_avg_wait")
-        allow_percent = not key.endswith("_nps")
-        val = _ocr_from_image(_crop_roi(img, roi), want_time=want_time, allow_percent=allow_percent)
+        crop = _crop_roi(img, roi)
+        # Save crop for inspection
+        crop_path = SCREENS_DIR / f"{ts}_{key}_crop.png"
+        try:
+            crop.save(crop_path)
+        except Exception:
+            pass
+
+        black_flag = _looks_black(crop)
+        val = _ocr_from_image(crop, want_time=(key=="cc_avg_wait"), allow_percent=not key.endswith("_nps"))
+        log.info(f"ROI {key}: rect={roi} black={black_flag} -> OCR='{val}'")
         if val and val != "—":
             metrics[key] = val
-            changed = True
-    # Always drop an overlay so we can see boxes used (helps map tuning)
-    ts = int(time.time())
-    draw_roi_overlay(img, SCREENS_DIR / f"{ts}_roi_overlay.png", roi_map)
-    if changed:
+            any_filled = True
+
+    # Always drop an overlay so we can see boxes used
+    try:
+        draw_roi_overlay(img, SCREENS_DIR / f"{ts}_roi_overlay.png", roi_map)
+    except Exception:
+        pass
+
+    if any_filled:
         log.info("Filled some missing values from ROI OCR.")
+    else:
+        log.warning("ROI OCR did not fill any values (check crops/overlay & mapping).")
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Build + send Chat card
@@ -596,8 +614,7 @@ def send_daily_card(metrics: Dict[str, str]) -> bool:
     if not MAIN_WEBHOOK or "chat.googleapis.com" not in MAIN_WEBHOOK:
         log.error("MAIN_WEBHOOK/DAILY_WEBHOOK missing or invalid — cannot send daily report.")
         return False
-    payload = build_chat_card(metrics)
-    return _post_with_backoff(MAIN_WEBHOOK, payload)
+    return _post_with_backoff(MAIN_WEBHOOK, build_chat_card(metrics))
 
 # ──────────────────────────────────────────────────────────────────────────────
 # CSV logging
@@ -626,7 +643,7 @@ def write_csv_row(metrics: Dict[str,str]):
     log.info(f"Appended daily metrics row to {DAILY_LOG_CSV.name}")
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Run
+# Main
 # ──────────────────────────────────────────────────────────────────────────────
 def run_daily_scrape():
     if not AUTH_STATE_PATH.exists():
@@ -650,14 +667,12 @@ def run_daily_scrape():
                 alert(["⚠️ Daily scrape blocked by login or load failure — please re-login."])
                 return
 
-            # Full-page OCR
             img = screenshot_full_page(page)
             img, words = ocr_fullpage(img)
 
-            # Build metrics from OCR labels
             metrics = build_metrics_from_ocr_labels(words)
 
-            # Basic context from DOM text (safer for long strings)
+            # Context from DOM text (long strings)
             try:
                 body = page.inner_text("body")
             except Exception:
@@ -670,7 +685,7 @@ def run_daily_scrape():
                           body, flags=re.S)
             metrics["store_line"] = m.group(0).strip() if m else ""
 
-            # ROI safety net — uses merged ROI_MAP (external overrides applied)
+            # ROI fallback using merged map — with per-key crops and logs
             fill_from_roi(metrics, img, ROI_MAP)
 
         finally:
@@ -685,7 +700,6 @@ def run_daily_scrape():
 
     ok = send_daily_card(metrics)
     log.info("Daily card send → %s", "OK" if ok else "FAIL")
-
     write_csv_row(metrics)
 
 if __name__ == "__main__":
