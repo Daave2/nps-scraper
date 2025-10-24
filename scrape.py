@@ -1,13 +1,17 @@
+````python
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 """
-Looker Studio → NPS comments → Google Chat (batched).
-Extras:
-- Google login with 2FA "Match the number" detection + alert to Chat.
-- Dedupe via comments_log.csv.
-- Locking with stale-lock cleanup.
-- One-pass retry after re-login (no recursion).
+Looker Studio → NPS comments → Google Chat (batched)
+
+Features:
+- Google login with 2FA "Match the number" detection and alert to Chat
+  (waits longer, prefers numbers near 'tap/verify/number', ignores device model digits like '14T',
+   and falls back to sending a text snippet if needed).
+- Dedupe via comments_log.csv
+- Locking with stale-lock cleanup
+- One-pass retry after re-login (no recursion)
 """
 
 import os
@@ -21,7 +25,7 @@ import schedule
 import configparser
 import unicodedata
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import List, Tuple, Optional
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -35,8 +39,10 @@ SCREENS_DIR = BASE_DIR / "screens"
 LOCK_FILE = BASE_DIR / "scrape.lock"
 STALE_LOCK_MAX_AGE_S = 20 * 60  # 20 minutes
 
+# Replace with your report URL (embed or normal)
 LOOKER_STUDIO_URL = "https://lookerstudio.google.com/embed/u/0/reporting/d93a03c7-25dc-439d-abaa-dd2f3780daa5/page/p_9x4lp9ksld"
 
+# Webhook batching / rate limiting
 BATCH_SIZE = 10
 MAX_COMMENTS_PER_RUN = 30
 BASE_BACKOFF = 2.0
@@ -63,6 +69,7 @@ GOOGLE_PASSWORD = config["DEFAULT"].get("GOOGLE_PASSWORD", os.getenv("GOOGLE_PAS
 MAIN_WEBHOOK = config["DEFAULT"].get("MAIN_WEBHOOK", os.getenv("MAIN_WEBHOOK", ""))
 ALERT_WEBHOOK = config["DEFAULT"].get("ALERT_WEBHOOK", os.getenv("ALERT_WEBHOOK", ""))
 
+# Optional CI run link injected by the workflow
 CI_RUN_URL = os.getenv("CI_RUN_URL", "")
 
 if not GOOGLE_EMAIL or not GOOGLE_PASSWORD:
@@ -137,51 +144,97 @@ def _extract_numbers_from_buttons(page) -> List[str]:
         pass
     return nums
 
-def _extract_number_from_body(page) -> Optional[str]:
+def _extract_number_from_body(page) -> str:
+    """
+    Prefer numbers near 'tap/number/verify', and ignore model strings like '14T' or '13 Pro'.
+    """
     try:
         body = page.inner_text("body")
     except Exception:
         body = ""
     if not body:
-        return None
-    nums = RE_TWO_OR_THREE.findall(body)
+        return ""
+
+    # Remove model-like tokens such as "14T", "13 Pro", "12S Ultra"
+    cleaned = re.sub(r"\b\d{1,3}[A-Za-z]+\b", "", body)                 # 14T, 12S
+    cleaned = re.sub(r"\b\d{1,3}\s+(?:Pro|Pro\s?Max|Ultra|Plus)\b", "", cleaned, flags=re.I)
+
+    # Prefer numbers that appear near guidance words
+    m = re.search(r"(?:tap|number|verify)[^\d]{0,20}(\d{1,3})", cleaned, re.IGNORECASE)
+    if m:
+        return m.group(1)
+
+    # Fallback: any standalone 2–3 digit number
+    nums = re.findall(r"(?<!\d)(\d{2,3})(?!\d)", cleaned)
     for n in nums:
         if len(n) == 2:
             return n
-    return nums[0] if nums else None
+    return nums[0] if nums else ""
 
-def wait_for_2fa_and_alert(page, max_wait_s: int = 120) -> None:
-    first_alert = False
+def wait_for_2fa_and_alert(page, max_wait_s: int = 180) -> None:
+    """
+    Detects Google 'verify it’s you / match the number' 2FA screens.
+    Sends alert with the number to tap, visible button options, or a text snippet fallback.
+    """
+    logger.info("Watching for Google 2FA challenge (up to %ss)...", max_wait_s)
     start = time.time()
+    first_alert_sent = False
+
+    # Let the UI render before first scan
+    time.sleep(5)
+
     while time.time() - start < max_wait_s:
-        txt = ""
         try:
-            txt = page.inner_text("body")
+            body_text = page.inner_text("body")
         except Exception:
-            pass
-        lower = (txt or "").lower()
-        challenge = any(x in lower for x in [
-            "match the number","tap the number shown","verify it’s you","verify it's you","check your phone"
+            body_text = ""
+        lower = body_text.lower()
+
+        challenge = any(trigger in lower for trigger in [
+            "match the number", "tap the number shown",
+            "verify it’s you", "verify it's you", "check your phone"
         ])
+
         if challenge:
-            if not first_alert:
+            if not first_alert_sent:
                 dump_debug(page, "2fa_detected")
-                alert(["⚠️ Google login needs approval.", "• 2FA screen detected — parsing the code now…"])
-                first_alert = True
+                alert([
+                    "⚠️ Google login needs approval.",
+                    "• 2FA screen detected — attempting to read the displayed number..."
+                ])
+                first_alert_sent = True
+
             btn_nums = _extract_numbers_from_buttons(page)
-            code_hint = btn_nums[0] if btn_nums else None
-            if not code_hint:
-                code_hint = _extract_number_from_body(page)
+            code_hint = btn_nums[0] if btn_nums else _extract_number_from_body(page)
+
+            snippet = ""
+            if not code_hint and body_text:
+                # Compact visible text for human fallback
+                lines = [ln.strip() for ln in body_text.splitlines() if ln.strip()]
+                snippet = " ".join(lines)[:300]
+
+            msg = []
             if code_hint:
-                msg = [f"🔐 2FA code to tap on your phone: **{code_hint}**"]
-                if btn_nums:
-                    msg.append(f"• Options on screen: {', '.join(btn_nums)}")
-                alert(msg)
-                return
-        time.sleep(1.0)
+                msg.append(f"🔐 Tap this number on your phone: **{code_hint}**")
+            else:
+                msg.append("⚠️ Couldn’t clearly extract a number — showing on-screen text instead:")
+                if snippet:
+                    msg.append(f"```{snippet}```")
+            if btn_nums:
+                msg.append(f"• Buttons visible: {', '.join(btn_nums)}")
+
+            alert(msg)
+            logger.info("2FA alert sent with code or snippet.")
+            return
+
+        time.sleep(2.0)
+
     dump_debug(page, "2fa_timeout")
-    alert(["⏳ 2FA challenge likely, but I couldn't parse the code in time.",
-           "• Please approve on your phone; tap the matching number."])
+    alert([
+        "⏳ Timed out waiting for 2FA approval.",
+        "• If prompted on your phone, tap the matching number to continue."
+    ])
+    logger.warning("2FA prompt timeout after %.1fs", time.time() - start)
 
 # ──────────────────────────────────────────────────────────────────────────────
 # LOOKER FETCH
@@ -305,7 +358,7 @@ def parse_comments_from_lines(lines: List[str]) -> List[dict]:
     return out
 
 # ──────────────────────────────────────────────────────────────────────────────
-# COMMENT LOG
+# COMMENT LOG + SENDERS
 # ──────────────────────────────────────────────────────────────────────────────
 def read_existing_comments():
     seen = set()
@@ -323,9 +376,6 @@ def append_new_comments(new_comments):
         for c in new_comments:
             w.writerow([c["store"], c["timestamp"], c["comment"], c["score"]])
 
-# ──────────────────────────────────────────────────────────────────────────────
-# SEND TO CHAT
-# ──────────────────────────────────────────────────────────────────────────────
 def _score_to_label(score_str: str) -> Tuple[str, str]:
     try:
         v = int(score_str)
@@ -396,7 +446,7 @@ def _release_lock():
         pass
 
 # ──────────────────────────────────────────────────────────────────────────────
-# LOGIN & MAIN
+# LOGIN + MAIN SCRAPE
 # ──────────────────────────────────────────────────────────────────────────────
 def login_and_save_state(page) -> bool:
     import re as _re
@@ -415,8 +465,8 @@ def login_and_save_state(page) -> bool:
         logger.error("Password input not found."); return False
     page.fill("input[type='password']", GOOGLE_PASSWORD); page.keyboard.press("Enter")
 
-    # Watch for 2FA + alert with code/options
-    wait_for_2fa_and_alert(page, max_wait_s=120)
+    # Watch for 2FA UI and alert with number/snippet
+    wait_for_2fa_and_alert(page, max_wait_s=180)
 
     logger.info("If 2FA is enabled, approve the prompt on your phone...")
     try:
@@ -462,16 +512,6 @@ def run_scrape():
         logger.warning("Another scrape already running — skipping this run.")
         return
     try:
-        # Housekeeping
-        if SCREENS_DIR.exists():
-            cutoff = time.time() - 14 * 86400
-            for f in SCREENS_DIR.glob("*"):
-                try:
-                    if f.is_file() and f.stat().st_mtime < cutoff:
-                        f.unlink()
-                except Exception:
-                    pass
-
         # Attempt flow: try once; if relogin required, perform headed login then retry once
         for attempt in (1, 2):
             status, comments = _scrape_internal()
@@ -487,8 +527,7 @@ def run_scrape():
                 if not ok:
                     alert(["❌ Manual login failed."])
                     return
-                # continue to attempt 2 (no recursion; lock stays held)
-                continue
+                continue  # retry second attempt in same lock
 
             if status in ("NO_TEXT", "NO_COMMENTS"):
                 logger.warning("Nothing to send this run.")
@@ -512,7 +551,6 @@ def run_scrape():
                 logger.info("✅ Scrape complete.")
                 return
 
-            # If status == "RELOGIN_REQUIRED" and attempt == 2: fall through to alert
         # If we got here, even second attempt asked for login again
         alert(["⚠️ Repeated login failure — human attention required."])
     finally:
@@ -538,3 +576,4 @@ if __name__ == "__main__":
         logger.info("Done.")
     else:
         schedule_scrapes()
+````
