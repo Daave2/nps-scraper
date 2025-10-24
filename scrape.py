@@ -2,13 +2,12 @@
 # -*- coding: utf-8 -*-
 
 """
-Scrapes a Looker Studio report for NPS comments and posts them to Google Chat.
-
-2FA upgrades:
-- Polls up to 120s for Google's "Match the number" screen.
-- Extracts digits from visible buttons (primary) and body text (fallback).
-- Sends immediate alerts with the detected code + all options.
-- Saves screenshots/HTML snapshots when 2FA is detected and on timeout.
+Looker Studio → NPS comments → Google Chat (batched).
+Extras:
+- Google login with 2FA "Match the number" detection + alert to Chat.
+- Dedupe via comments_log.csv.
+- Locking with stale-lock cleanup.
+- One-pass retry after re-login (no recursion).
 """
 
 import os
@@ -25,38 +24,37 @@ from pathlib import Path
 from typing import List, Optional, Tuple
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 
-############################################
+# ──────────────────────────────────────────────────────────────────────────────
 # PATHS & CONSTANTS
-############################################
+# ──────────────────────────────────────────────────────────────────────────────
 BASE_DIR = Path(__file__).resolve().parent
 AUTH_STATE_PATH = BASE_DIR / "auth_state.json"
 COMMENTS_LOG_PATH = BASE_DIR / "comments_log.csv"
 LOG_FILE_PATH = BASE_DIR / "scrape.log"
 SCREENS_DIR = BASE_DIR / "screens"
 LOCK_FILE = BASE_DIR / "scrape.lock"
+STALE_LOCK_MAX_AGE_S = 20 * 60  # 20 minutes
 
-# Use the embed (or normal) URL of your report
 LOOKER_STUDIO_URL = "https://lookerstudio.google.com/embed/u/0/reporting/d93a03c7-25dc-439d-abaa-dd2f3780daa5/page/p_9x4lp9ksld"
 
-# Webhook batching / rate limiting
 BATCH_SIZE = 10
 MAX_COMMENTS_PER_RUN = 30
 BASE_BACKOFF = 2.0
 MAX_BACKOFF = 30.0
 
-############################################
+# ──────────────────────────────────────────────────────────────────────────────
 # LOGGING
-############################################
+# ──────────────────────────────────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s",
-    handlers=[logging.FileHandler(LOG_FILE_PATH), logging.StreamHandler(sys.stdout)]
+    handlers=[logging.FileHandler(LOG_FILE_PATH), logging.StreamHandler(sys.stdout)],
 )
 logger = logging.getLogger(__name__)
 
-############################################
+# ──────────────────────────────────────────────────────────────────────────────
 # CONFIG
-############################################
+# ──────────────────────────────────────────────────────────────────────────────
 config = configparser.ConfigParser()
 config.read(BASE_DIR / "config.ini")
 
@@ -65,7 +63,6 @@ GOOGLE_PASSWORD = config["DEFAULT"].get("GOOGLE_PASSWORD", os.getenv("GOOGLE_PAS
 MAIN_WEBHOOK = config["DEFAULT"].get("MAIN_WEBHOOK", os.getenv("MAIN_WEBHOOK", ""))
 ALERT_WEBHOOK = config["DEFAULT"].get("ALERT_WEBHOOK", os.getenv("ALERT_WEBHOOK", ""))
 
-# Optional CI run link injected by workflow
 CI_RUN_URL = os.getenv("CI_RUN_URL", "")
 
 if not GOOGLE_EMAIL or not GOOGLE_PASSWORD:
@@ -75,9 +72,9 @@ if not MAIN_WEBHOOK:
 if not ALERT_WEBHOOK:
     logger.warning("Alert Chat webhook missing (config.ini or env).")
 
-############################################
+# ──────────────────────────────────────────────────────────────────────────────
 # CHAT HELPERS
-############################################
+# ──────────────────────────────────────────────────────────────────────────────
 def _post_with_backoff(url: str, payload: dict) -> bool:
     backoff = BASE_BACKOFF
     while True:
@@ -98,17 +95,17 @@ def _post_with_backoff(url: str, payload: dict) -> bool:
             time.sleep(backoff)
             backoff = min(backoff * 1.7, MAX_BACKOFF)
 
-def alert(text_lines: List[str]):
+def alert(lines: List[str]):
     if not ALERT_WEBHOOK or "chat.googleapis.com" not in ALERT_WEBHOOK:
         logger.warning("No valid ALERT_WEBHOOK configured.")
         return
     if CI_RUN_URL:
-        text_lines.append(f"• CI run: {CI_RUN_URL}")
-    _post_with_backoff(ALERT_WEBHOOK, {"text": "\n".join(text_lines)})
+        lines.append(f"• CI run: {CI_RUN_URL}")
+    _post_with_backoff(ALERT_WEBHOOK, {"text": "\n".join(lines)})
 
-############################################
+# ──────────────────────────────────────────────────────────────────────────────
 # DEBUG DUMP
-############################################
+# ──────────────────────────────────────────────────────────────────────────────
 def dump_debug(page, tag):
     try:
         ts = int(time.time())
@@ -121,30 +118,24 @@ def dump_debug(page, tag):
     except Exception as e:
         logger.warning(f"Failed to save debug snapshot: {e}")
 
-############################################
+# ──────────────────────────────────────────────────────────────────────────────
 # 2FA EXTRACTION
-############################################
+# ──────────────────────────────────────────────────────────────────────────────
 RE_TWO_OR_THREE = re.compile(r"(?<!\d)(\d{2,3})(?!\d)")
 
 def _extract_numbers_from_buttons(page) -> List[str]:
-    # Gather digits from obvious clickable elements first
-    numbers = []
+    nums = []
     try:
-        # Buttons commonly used for the three choices
-        for locator in [
-            "button",
-            "[role='button']",
-            "div[role='button']",
-            "span[role='button']",
-        ]:
-            for txt in page.locator(locator).all_text_contents():
-                txt = (txt or "").strip()
+        for sel in ["button", "[role='button']", "div[role='button']", "span[role='button']"]:
+            for txt in page.locator(sel).all_text_contents():
+                if not txt:
+                    continue
                 for m in RE_TWO_OR_THREE.findall(txt):
-                    if m not in numbers:
-                        numbers.append(m)
-        return numbers
+                    if m not in nums:
+                        nums.append(m)
     except Exception:
-        return numbers
+        pass
+    return nums
 
 def _extract_number_from_body(page) -> Optional[str]:
     try:
@@ -153,7 +144,6 @@ def _extract_number_from_body(page) -> Optional[str]:
         body = ""
     if not body:
         return None
-    # Prefer two-digit match (most common), fallback to first 3-digit
     nums = RE_TWO_OR_THREE.findall(body)
     for n in nums:
         if len(n) == 2:
@@ -161,62 +151,41 @@ def _extract_number_from_body(page) -> Optional[str]:
     return nums[0] if nums else None
 
 def wait_for_2fa_and_alert(page, max_wait_s: int = 120) -> None:
-    """
-    Polls for the 'Match the number' step and alerts when detected.
-    Sends the first candidate as the code hint and lists all options.
-    """
-    first_alert_sent = False
+    first_alert = False
     start = time.time()
     while time.time() - start < max_wait_s:
-        # Look for trigger text to confirm we're on the challenge screen
         txt = ""
         try:
             txt = page.inner_text("body")
         except Exception:
             pass
         lower = (txt or "").lower()
-
-        challenge = any(
-            p in lower for p in [
-                "match the number",
-                "tap the number shown",
-                "verify it’s you",
-                "verify it's you",
-                "check your phone"
-            ]
-        )
+        challenge = any(x in lower for x in [
+            "match the number","tap the number shown","verify it’s you","verify it's you","check your phone"
+        ])
         if challenge:
-            if not first_alert_sent:
+            if not first_alert:
                 dump_debug(page, "2fa_detected")
-                alert(["⚠️ Google login needs approval.",
-                       "• 2FA screen detected — parsing the code now…"])
-                first_alert_sent = True
-
-            # Primary: harvest button numbers
+                alert(["⚠️ Google login needs approval.", "• 2FA screen detected — parsing the code now…"])
+                first_alert = True
             btn_nums = _extract_numbers_from_buttons(page)
             code_hint = btn_nums[0] if btn_nums else None
-
-            # Fallback: sniff body text
             if not code_hint:
                 code_hint = _extract_number_from_body(page)
-
             if code_hint:
-                options_note = f"• Options on screen: {', '.join(btn_nums)}" if btn_nums else None
-                lines = [f"🔐 2FA code to tap on your phone: **{code_hint}**"]
-                if options_note:
-                    lines.append(options_note)
-                alert(lines)
+                msg = [f"🔐 2FA code to tap on your phone: **{code_hint}**"]
+                if btn_nums:
+                    msg.append(f"• Options on screen: {', '.join(btn_nums)}")
+                alert(msg)
                 return
         time.sleep(1.0)
-
-    # Timeout — couldn’t parse the number
     dump_debug(page, "2fa_timeout")
     alert(["⏳ 2FA challenge likely, but I couldn't parse the code in time.",
-           "• Please approve on your phone; if you see 3 numbers, tap the one that matches on screen."])
+           "• Please approve on your phone; tap the matching number."])
 
-############################################
+# ──────────────────────────────────────────────────────────────────────────────
 # LOOKER FETCH
-############################################
+# ──────────────────────────────────────────────────────────────────────────────
 def fetch_looker_text(page, url, tag):
     logger.info("Navigating to Looker Studio (hybrid mode)...")
     try:
@@ -260,17 +229,15 @@ def fetch_looker_text(page, url, tag):
 
     try:
         SCREENS_DIR.mkdir(parents=True, exist_ok=True)
-        dump_file = SCREENS_DIR / f"{int(time.time())}_{tag}_text.txt"
-        dump_file.write_text(inner_text, encoding="utf-8")
-        logger.info(f"Full text saved to {dump_file.name}")
+        (SCREENS_DIR / f"{int(time.time())}_{tag}_text.txt").write_text(inner_text, encoding="utf-8")
     except Exception as e:
         logger.warning(f"Failed to save fetched text: {e}")
 
     return lines
 
-############################################
+# ──────────────────────────────────────────────────────────────────────────────
 # PARSER
-############################################
+# ──────────────────────────────────────────────────────────────────────────────
 DATE_PATTERN  = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 SCORE_PATTERN = re.compile(r"^(10|[0-9])$")
 STORE_PATTERN = re.compile(r"^\d+\s+.+")
@@ -286,8 +253,7 @@ SKIP_PATTERN = re.compile(
 def _norm(s: str) -> str:
     if s is None:
         return ""
-    s = s.replace("\u00A0", " ")
-    s = s.replace("\u200B", "")
+    s = s.replace("\u00A0", " ").replace("\u200B", "")
     s = unicodedata.normalize("NFKC", s)
     return s.strip()
 
@@ -303,7 +269,7 @@ def parse_comments_from_lines(lines: List[str]) -> List[dict]:
         if line.startswith("Submission via:"):
             date_line = ""
             store_line = ""
-            for j in range(max(0, i-8), i):
+            for j in range(max(0, i - 8), i):
                 lj = L[j]
                 if not date_line and DATE_PATTERN.match(lj):
                     date_line = lj
@@ -332,14 +298,15 @@ def parse_comments_from_lines(lines: List[str]) -> List[dict]:
                     "comment": ("\n".join(comment_lines).strip() or "[No text]"),
                     "score": score_line,
                 })
-            i = k; continue
+            i = k
+            continue
         i += 1
     logger.info(f"Parsed {len(out)} comments from text (after noise filtering).")
     return out
 
-############################################
+# ──────────────────────────────────────────────────────────────────────────────
 # COMMENT LOG
-############################################
+# ──────────────────────────────────────────────────────────────────────────────
 def read_existing_comments():
     seen = set()
     if not COMMENTS_LOG_PATH.exists():
@@ -356,9 +323,9 @@ def append_new_comments(new_comments):
         for c in new_comments:
             w.writerow([c["store"], c["timestamp"], c["comment"], c["score"]])
 
-############################################
+# ──────────────────────────────────────────────────────────────────────────────
 # SEND TO CHAT
-############################################
+# ──────────────────────────────────────────────────────────────────────────────
 def _score_to_label(score_str: str) -> Tuple[str, str]:
     try:
         v = int(score_str)
@@ -395,26 +362,42 @@ def send_comments_batched_to_chat(comments: List[dict]) -> None:
         sent += len(batch)
         logger.info(f"✅ Sent batch {start+1}-{start+len(batch)} (total sent: {sent}/{total})")
 
-############################################
-# HOUSEKEEPING
-############################################
-def cleanup_old_screens(days: int = 14):
-    if not SCREENS_DIR.exists():
-        return
-    cutoff = time.time() - days * 86400
-    deleted = 0
-    for f in SCREENS_DIR.glob("*"):
-        try:
-            if f.is_file() and f.stat().st_mtime < cutoff:
-                f.unlink(); deleted += 1
-        except Exception:
-            pass
-    if deleted:
-        logger.info(f"🧹 Cleaned {deleted} old debug files (> {days} days).")
+# ──────────────────────────────────────────────────────────────────────────────
+# LOCKING HELPERS
+# ──────────────────────────────────────────────────────────────────────────────
+def _stale_lock_exists() -> bool:
+    try:
+        if not LOCK_FILE.exists():
+            return False
+        age = time.time() - LOCK_FILE.stat().st_mtime
+        return age > STALE_LOCK_MAX_AGE_S
+    except Exception:
+        return False
 
-############################################
+def _acquire_lock() -> bool:
+    if LOCK_FILE.exists():
+        if _stale_lock_exists():
+            logger.warning("Stale lock detected — removing.")
+            try: LOCK_FILE.unlink()
+            except Exception: pass
+        else:
+            return False
+    try:
+        LOCK_FILE.write_text(str(os.getpid()))
+        return True
+    except Exception:
+        return False
+
+def _release_lock():
+    try:
+        if LOCK_FILE.exists():
+            LOCK_FILE.unlink()
+    except Exception:
+        pass
+
+# ──────────────────────────────────────────────────────────────────────────────
 # LOGIN & MAIN
-############################################
+# ──────────────────────────────────────────────────────────────────────────────
 def login_and_save_state(page) -> bool:
     import re as _re
     logger.info("Starting manual login flow...")
@@ -424,17 +407,15 @@ def login_and_save_state(page) -> bool:
         page.wait_for_selector("input[type='email']", timeout=15000)
     except PlaywrightTimeoutError:
         logger.error("Email input not found."); return False
-
     page.fill("input[type='email']", GOOGLE_EMAIL); page.keyboard.press("Enter")
 
     try:
         page.wait_for_selector("input[type='password']", timeout=30000)
     except PlaywrightTimeoutError:
         logger.error("Password input not found."); return False
-
     page.fill("input[type='password']", GOOGLE_PASSWORD); page.keyboard.press("Enter")
 
-    # Watch for 2FA screen and alert with code/options
+    # Watch for 2FA + alert with code/options
     wait_for_2fa_and_alert(page, max_wait_s=120)
 
     logger.info("If 2FA is enabled, approve the prompt on your phone...")
@@ -449,83 +430,97 @@ def login_and_save_state(page) -> bool:
         alert(["❌ Login timed out after waiting for approval."])
         return False
 
-def run_scrape(retry_on_auth_fail=True):
-    if LOCK_FILE.exists():
+def _scrape_internal() -> Tuple[str, List[dict]]:
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        context = browser.new_context(storage_state=AUTH_STATE_PATH if AUTH_STATE_PATH.exists() else None)
+        page = context.new_page()
+
+        lines = fetch_looker_text(page, LOOKER_STUDIO_URL, "scrape")
+
+        login_wall = (lines is None)
+        if not login_wall and lines:
+            sample = " ".join(lines[:80]).lower()
+            if "sign in" in sample or "can't access report" in sample or "please sign in" in sample:
+                login_wall = True
+
+        if login_wall:
+            context.close(); browser.close()
+            return "RELOGIN_REQUIRED", []
+
+        if not lines:
+            context.close(); browser.close()
+            return "NO_TEXT", []
+
+        comments = parse_comments_from_lines(lines)
+        context.close(); browser.close()
+        return ("OK" if comments else "NO_COMMENTS"), comments
+
+def run_scrape():
+    # Acquire lock (with stale cleanup)
+    if not _acquire_lock():
         logger.warning("Another scrape already running — skipping this run.")
         return
     try:
-        LOCK_FILE.write_text(str(os.getpid()))
-        cleanup_old_screens(days=14)
+        # Housekeeping
+        if SCREENS_DIR.exists():
+            cutoff = time.time() - 14 * 86400
+            for f in SCREENS_DIR.glob("*"):
+                try:
+                    if f.is_file() and f.stat().st_mtime < cutoff:
+                        f.unlink()
+                except Exception:
+                    pass
 
-        def _scrape_internal():
-            with sync_playwright() as p:
-                browser = p.chromium.launch(headless=True)
-                context = browser.new_context(storage_state=AUTH_STATE_PATH if AUTH_STATE_PATH.exists() else None)
-                page = context.new_page()
+        # Attempt flow: try once; if relogin required, perform headed login then retry once
+        for attempt in (1, 2):
+            status, comments = _scrape_internal()
 
-                lines = fetch_looker_text(page, LOOKER_STUDIO_URL, "scrape")
-                login_wall = (lines is None)
-                if not login_wall and lines:
-                    sample = " ".join(lines[:80]).lower()
-                    if "sign in" in sample or "can't access report" in sample or "please sign in" in sample:
-                        login_wall = True
-
-                if login_wall:
+            if status == "RELOGIN_REQUIRED" and attempt == 1:
+                logger.info("Login required — performing headed login then retrying once.")
+                with sync_playwright() as p:
+                    browser = p.chromium.launch(headless=False)  # works under xvfb in CI
+                    context = browser.new_context()
+                    page = context.new_page()
+                    ok = login_and_save_state(page)
                     context.close(); browser.close()
-                    return "RELOGIN_REQUIRED", []
+                if not ok:
+                    alert(["❌ Manual login failed."])
+                    return
+                # continue to attempt 2 (no recursion; lock stays held)
+                continue
 
-                if not lines:
-                    context.close(); browser.close()
-                    return "NO_TEXT", []
+            if status in ("NO_TEXT", "NO_COMMENTS"):
+                logger.warning("Nothing to send this run.")
+                return
 
-                comments = parse_comments_from_lines(lines)
-                context.close(); browser.close()
-                return ("OK" if comments else "NO_COMMENTS"), comments
+            if status == "OK":
+                # Dedupe + cap + send
+                seen = read_existing_comments()
+                new_comments = [c for c in comments if (c["store"], c["timestamp"], c["comment"]) not in seen]
+                if not new_comments:
+                    logger.info("No new comments to send.")
+                    return
+                capped = new_comments[:MAX_COMMENTS_PER_RUN]
+                leftover = max(0, len(new_comments) - len(capped))
+                if leftover > 0:
+                    logger.info(f"Rate safety: sending {len(capped)} now, deferring {leftover} later.")
+                send_comments_batched_to_chat(capped)
+                append_new_comments(capped)
+                if leftover > 0 and MAIN_WEBHOOK and "chat.googleapis.com" in MAIN_WEBHOOK:
+                    _post_with_backoff(MAIN_WEBHOOK, {"text": f"ℹ️ {leftover} additional comments deferred to next runs (rate safety)."})
+                logger.info("✅ Scrape complete.")
+                return
 
-        status, comments = _scrape_internal()
-
-        if status == "RELOGIN_REQUIRED":
-            if not retry_on_auth_fail:
-                alert(["⚠️ Repeated login failure — human attention required."]); return
-            with sync_playwright() as p:
-                browser = p.chromium.launch(headless=False)  # works with xvfb in CI
-                context = browser.new_context()
-                page = context.new_page()
-                ok = login_and_save_state(page)
-                context.close(); browser.close()
-            if not ok:
-                alert(["❌ Manual login failed."]); return
-            logger.info("Re-login successful — retrying scrape once.")
-            run_scrape(retry_on_auth_fail=False); return
-
-        if status in ("NO_TEXT", "NO_COMMENTS"):
-            logger.warning("Nothing to send this run."); return
-
-        # Dedupe + rate safety
-        seen = read_existing_comments()
-        new_comments = [c for c in comments if (c["store"], c["timestamp"], c["comment"]) not in seen]
-        if not new_comments:
-            logger.info("No new comments to send."); return
-        capped = new_comments[:MAX_COMMENTS_PER_RUN]
-        leftover = max(0, len(new_comments) - len(capped))
-        if leftover > 0:
-            logger.info(f"Rate safety: sending {len(capped)} now, deferring {leftover} later.")
-
-        send_comments_batched_to_chat(capped)
-        append_new_comments(capped)
-
-        if leftover > 0 and MAIN_WEBHOOK and "chat.googleapis.com" in MAIN_WEBHOOK:
-            _post_with_backoff(MAIN_WEBHOOK, {"text": f"ℹ️ {leftover} additional comments deferred to next runs (rate safety)."})
-
-        logger.info("✅ Scrape complete.")
+            # If status == "RELOGIN_REQUIRED" and attempt == 2: fall through to alert
+        # If we got here, even second attempt asked for login again
+        alert(["⚠️ Repeated login failure — human attention required."])
     finally:
-        if LOCK_FILE.exists():
-            try: LOCK_FILE.unlink()
-            except Exception: pass
+        _release_lock()
 
-############################################
-# SCHEDULER
-############################################
+# ──────────────────────────────────────────────────────────────────────────────
+# SCHEDULER / ENTRY
+# ──────────────────────────────────────────────────────────────────────────────
 def schedule_scrapes():
     schedule.every().day.at("08:00").do(run_scrape)
     schedule.every().day.at("11:00").do(run_scrape)
@@ -536,9 +531,6 @@ def schedule_scrapes():
     while True:
         schedule.run_pending(); time.sleep(30)
 
-############################################
-# ENTRY
-############################################
 if __name__ == "__main__":
     if len(sys.argv) > 1 and sys.argv[1].lower() in ("now", "once", "manual"):
         logger.info("Manual trigger → running scrape now...")
