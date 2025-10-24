@@ -38,18 +38,24 @@ jobs:
           path: |
             auth_state.json
             comments_log.csv
-          key: scraper-state-${{ github.run_id }}
+          # stable key so we can restore exact versions on future runs
+          key: scraper-state-${{ runner.os }}-${{ hashFiles('scrape.py') }}
           restore-keys: |
+            scraper-state-${{ runner.os }}-
             scraper-state-
 
       # Optional fallback: if cache didn’t have auth_state.json, use the secret
       - name: Fallback restore auth_state.json from secret
-        if: ${{ !hashFiles('auth_state.json') && env.AUTH_STATE_B64 != '' }}
+        if: ${{ !hashFiles('auth_state.json') }}
         env:
-         AUTH_STATE_B64: ${{ secrets.AUTH_STATE_B64 }}
+          AUTH_STATE_B64: ${{ secrets.AUTH_STATE_B64 }}
         run: |
-         echo "$AUTH_STATE_B64" | base64 -d > auth_state.json
-
+          if [ -n "$AUTH_STATE_B64" ]; then
+            echo "$AUTH_STATE_B64" | base64 -d > auth_state.json
+            echo "Restored auth_state.json from AUTH_STATE_B64 secret."
+          else
+            echo "No AUTH_STATE_B64 secret provided — continuing without auth_state.json."
+          fi
 
       # ========= CONFIG =========
       - name: Create/Update config.ini from secrets
@@ -63,20 +69,27 @@ jobs:
           } > config.ini
 
       # ========= RUN =========
-      # Use a virtual display so Playwright can open a headed window if needed.
-      # You approve the phone prompt; cookies update and will be saved back to cache.
       - name: Run scraper (headed via Xvfb, phone 2FA supported)
+        env:
+          CI_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           xvfb-run -a python scrape.py now
 
       # ========= SAVE UPDATED STATE (CACHE) =========
-      - name: Save updated scraper state to cache
+      # Save each file only if it exists to avoid "Path Validation Error"
+      - name: Save auth_state.json to cache (if exists)
+        if: ${{ hashFiles('auth_state.json') != '' }}
         uses: actions/cache/save@v4
         with:
-          path: |
-            auth_state.json
-            comments_log.csv
-          key: scraper-state-${{ github.run_id }}
+          path: auth_state.json
+          key: scraper-state-${{ runner.os }}-${{ hashFiles('scrape.py') }}
+
+      - name: Save comments_log.csv to cache (if exists)
+        if: ${{ hashFiles('comments_log.csv') != '' }}
+        uses: actions/cache/save@v4
+        with:
+          path: comments_log.csv
+          key: scraper-state-${{ runner.os }}-${{ hashFiles('scrape.py') }}
 
       # ========= OPTIONAL: ARTIFACTS FOR INSPECTION =========
       - name: Upload current state as artifact (optional)
