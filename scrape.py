@@ -58,7 +58,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ──────────────────────────────────────────────────────────────────────────────
-# CONFIG
+# CONFIG (file first, env fallback)
 # ──────────────────────────────────────────────────────────────────────────────
 config = configparser.ConfigParser()
 config.read(BASE_DIR / "config.ini")
@@ -68,7 +68,6 @@ GOOGLE_PASSWORD = config["DEFAULT"].get("GOOGLE_PASSWORD", os.getenv("GOOGLE_PAS
 MAIN_WEBHOOK = config["DEFAULT"].get("MAIN_WEBHOOK", os.getenv("MAIN_WEBHOOK", ""))
 ALERT_WEBHOOK = config["DEFAULT"].get("ALERT_WEBHOOK", os.getenv("ALERT_WEBHOOK", ""))
 
-# Optional CI run link injected by the workflow
 CI_RUN_URL = os.getenv("CI_RUN_URL", "")
 
 if not GOOGLE_EMAIL or not GOOGLE_PASSWORD:
@@ -357,7 +356,7 @@ def parse_comments_from_lines(lines: List[str]) -> List[dict]:
     return out
 
 # ──────────────────────────────────────────────────────────────────────────────
-# COMMENT LOG + SENDERS
+# COMMENT LOG + SENDER
 # ──────────────────────────────────────────────────────────────────────────────
 def read_existing_comments():
     seen = set()
@@ -407,9 +406,13 @@ def send_comments_batched_to_chat(comments: List[dict]) -> None:
             "header": {"title": f"NPS Comments ({start+1}-{start+len(batch)} of {total})", "subtitle": "Automated report"},
             "sections": sections
         }]}
-        _post_with_backoff(MAIN_WEBHOOK, payload)
-        sent += len(batch)
-        logger.info(f"✅ Sent batch {start+1}-{start+len(batch)} (total sent: {sent}/{total})")
+        ok = _post_with_backoff(MAIN_WEBHOOK, payload)
+        if ok:
+            sent += len(batch)
+            logger.info(f"✅ Sent batch {start+1}-{start+len(batch)} (total sent: {sent}/{total})")
+        else:
+            logger.error("❌ Webhook rejected NPS batch — stopping further sends.")
+            break
 
 # ──────────────────────────────────────────────────────────────────────────────
 # LOCKING HELPERS
