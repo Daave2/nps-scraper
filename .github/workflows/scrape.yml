@@ -2,14 +2,15 @@ name: Looker Studio Scrapers
 
 on:
   schedule:
-    - cron: "15 8,11,14,17,20 * * *"   # every 3 hours +15 min
+    # London 08:15, 11:15, 14:15, 17:15, 20:15 (cron is UTC)
+    - cron: "15 7,10,13,16,19 * * *"
   workflow_dispatch:
 
 jobs:
   scrape:
     name: Run NPS + Complaints Scrapers
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 40
     concurrency:
       group: scraper-state
       cancel-in-progress: false
@@ -27,8 +28,9 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install playwright schedule requests configparser
-          playwright install chromium
+          python -m playwright install --with-deps chromium
 
+      # ========= RESTORE STATE (unique primary key, prefix restore) =========
       - name: Restore scraper state (auth + logs)
         id: cache-restore
         uses: actions/cache/restore@v4
@@ -37,42 +39,51 @@ jobs:
             auth_state.json
             comments_log.csv
             complaints_log.csv
-          # Include run_id in key to avoid collision, use prefix for restore
           key: scraper-state-${{ runner.os }}-v1-${{ github.run_id }}
           restore-keys: |
             scraper-state-${{ runner.os }}-v1-
             scraper-state-${{ runner.os }}-
             scraper-state-
 
+      # ========= OPTIONAL AUTH FALLBACK (secret) =========
       - name: Decode AUTH_STATE_B64 (if provided)
         run: |
           if [ -n "${{ secrets.AUTH_STATE_B64 }}" ]; then
             echo "${{ secrets.AUTH_STATE_B64 }}" | base64 --decode > auth_state.json
-            echo "Decoded auth_state.json from secret."
+            echo "Decoded auth_state.json from AUTH_STATE_B64."
           else
             echo "No AUTH_STATE_B64 secret provided — continuing without."
           fi
 
+      # ========= CONFIG =========
+      - name: Create config.ini from secrets
+        run: |
+          {
+            echo "[DEFAULT]"
+            echo "GOOGLE_EMAIL=${{ secrets.GOOGLE_EMAIL }}"
+            echo "GOOGLE_PASSWORD=${{ secrets.GOOGLE_PASSWORD }}"
+            echo "MAIN_WEBHOOK=${{ secrets.MAIN_WEBHOOK }}"
+            echo "ALERT_WEBHOOK=${{ secrets.ALERT_WEBHOOK }}"
+            echo "COMPLAINTS_WEBHOOK=${{ secrets.COMPLAINTS_WEBHOOK }}"
+          } > config.ini
+
+      # ========= RUN NPS SCRAPER =========
       - name: Run NPS scraper
         env:
-          GOOGLE_EMAIL: ${{ secrets.GOOGLE_EMAIL }}
-          GOOGLE_PASSWORD: ${{ secrets.GOOGLE_PASSWORD }}
-          MAIN_WEBHOOK: ${{ secrets.MAIN_WEBHOOK }}
-          ALERT_WEBHOOK: ${{ secrets.ALERT_WEBHOOK }}
+          CI_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           xvfb-run -a python scrape.py now || true
 
+      # ========= RUN COMPLAINTS SCRAPER =========
       - name: Run Complaints scraper
         env:
-          GOOGLE_EMAIL: ${{ secrets.GOOGLE_EMAIL }}
-          GOOGLE_PASSWORD: ${{ secrets.GOOGLE_PASSWORD }}
-          MAIN_WEBHOOK: ${{ secrets.MAIN_WEBHOOK }}
-          ALERT_WEBHOOK: ${{ secrets.ALERT_WEBHOOK }}
-          COMPLAINTS_WEBHOOK: ${{ secrets.COMPLAINTS_WEBHOOK }}
+          CI_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           xvfb-run -a python scrape_complaints.py now || true
 
+      # ========= STATE SUMMARY =========
       - name: Display state summary
+        if: always()
         run: |
           echo "::group::State files"
           for f in auth_state.json comments_log.csv complaints_log.csv scrape.log scrape_complaints.log; do
@@ -83,14 +94,19 @@ jobs:
             fi
           done
           echo "::endgroup::"
-          echo "::group::Tail logs"
-          tail -n 20 scrape.log scrape_complaints.log || true
+          echo "::group::comments_log.csv (last 10)"
+          if [ -f comments_log.csv ]; then tail -n 10 comments_log.csv || true; else echo "comments_log.csv not found"; fi
+          echo "::endgroup::"
+          echo "::group::complaints_log.csv (last 10)"
+          if [ -f complaints_log.csv ]; then tail -n 10 complaints_log.csv || true; else echo "complaints_log.csv not found"; fi
           echo "::endgroup::"
           echo "::group::screens/ listing"
           ls -lah screens || echo "no screens/"
           echo "::endgroup::"
 
+      # ========= ARTIFACTS =========
       - name: Upload artifacts (logs + state)
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: scraper-state-${{ github.run_id }}
@@ -104,6 +120,7 @@ jobs:
           if-no-files-found: ignore
           retention-days: 7
 
+      # ========= SAVE UPDATED STATE (unique key per run) =========
       - name: Save updated scraper state to cache
         if: ${{ steps.cache-restore.outputs.cache-hit != 'true' }}
         uses: actions/cache/save@v4
