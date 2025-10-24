@@ -3,7 +3,7 @@ name: Looker Studio Scraper Suite
 on:
   workflow_dispatch: {}
   schedule:
-    # 08:05, 11:05, 14:05, 17:05, 20:05 London (UTC in cron)
+    # Runs at 08:05, 11:05, 14:05, 17:05, 20:05 London-time equivalent in UTC cron
     - cron: "5 7,10,13,16,19 * * *"
 
 concurrency:
@@ -23,15 +23,15 @@ jobs:
         uses: actions/checkout@v4
 
       # ────────────────────────────────
-      # System deps for OCR (pytesseract)
+      # System deps for OCR
       # ────────────────────────────────
-      - name: Install system packages (tesseract)
+      - name: Install Tesseract (for OCR fallback)
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends tesseract-ocr
 
       # ────────────────────────────────
-      # Python + Playwright
+      # Setup Python + Playwright + OCR deps
       # ────────────────────────────────
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -41,23 +41,22 @@ jobs:
       - name: Install Python deps
         run: |
           python -m pip install -U pip
-          pip install playwright requests pillow pytesseract
+          pip install playwright requests schedule pytz pillow pytesseract
           python -m playwright install --with-deps chromium
 
       # ────────────────────────────────
-      # Environment (date-based caching)
+      # Export helpers/env
       # ────────────────────────────────
-      - name: Export TODAY
-        run: echo "TODAY=$(date -u +%Y%m%d)" >> $GITHUB_ENV
+      - name: Export TODAY, CI_RUN_URL and ROI_MAP_FILE
+        run: |
+          echo "TODAY=$(date -u +%Y%m%d)" >> $GITHUB_ENV
+          echo "CI_RUN_URL=${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" >> $GITHUB_ENV
+          echo "ROI_MAP_FILE=${{ github.workspace }}/roi_map.json" >> $GITHUB_ENV
 
-      # Optional: let scraper know where your ROI JSON is
-      - name: Export ROI map path
-        run: echo "ROI_MAP_FILE=${{ github.workspace }}/roi_map.json" >> $GITHUB_ENV
-
       # ────────────────────────────────
-      # Restore state from cache
+      # Restore state from cache (auth + CSV logs + ROI map)
       # ────────────────────────────────
-      - name: Restore scraper state (auth + logs + roi_map)
+      - name: Restore scraper state (auth + logs + ROI)
         id: cache-restore
         uses: actions/cache/restore@v4
         with:
@@ -73,7 +72,7 @@ jobs:
             scraper-state-${{ runner.os }}-v1-
 
       # ────────────────────────────────
-      # Optional fallback (first cold start)
+      # Optional fallback (first-ever run)
       # ────────────────────────────────
       - name: Fallback restore auth_state.json from secret
         run: |
@@ -87,7 +86,7 @@ jobs:
           AUTH_STATE_B64: ${{ secrets.AUTH_STATE_B64 }}
 
       # ────────────────────────────────
-      # Create config.ini dynamically from secrets
+      # Create config.ini from secrets
       # ────────────────────────────────
       - name: Create/Update config.ini from secrets
         run: |
@@ -102,16 +101,21 @@ jobs:
           } > config.ini
 
       # ────────────────────────────────
-      # Run scrapers
+      # Run scrapers (NPS → Complaints → Daily)
       # ────────────────────────────────
       - name: Run NPS scraper
+        env:
+          CI_RUN_URL: ${{ env.CI_RUN_URL }}
         run: xvfb-run -a python scrape.py now || true
 
       - name: Run Complaints scraper
+        env:
+          CI_RUN_URL: ${{ env.CI_RUN_URL }}
         run: xvfb-run -a python scrape_complaints.py now || true
 
-      - name: Run Daily Report scraper (OCR + ROI)
+      - name: Run Daily Report scraper (OCR + ROI mapping)
         env:
+          CI_RUN_URL: ${{ env.CI_RUN_URL }}
           ROI_MAP_FILE: ${{ env.ROI_MAP_FILE }}
         run: xvfb-run -a python scrape_daily.py || true
 
@@ -135,13 +139,13 @@ jobs:
           echo "::endgroup::"
 
           echo "::group::screens/ listing"
-          ls -lah screens || echo "no screens/"
+          if [ -d screens ]; then ls -lah screens || true; else echo "no screens/"; fi
           echo "::endgroup::"
 
       # ────────────────────────────────
-      # Upload artifacts (includes ROI crops & overlay)
+      # Upload artifacts for inspection
       # ────────────────────────────────
-      - name: Upload logs, ROI, and screenshots
+      - name: Upload logs and state as artifact
         if: always()
         uses: actions/upload-artifact@v4
         with:
