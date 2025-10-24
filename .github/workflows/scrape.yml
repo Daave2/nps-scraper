@@ -24,27 +24,26 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Install deps
+      - name: Install dependencies
         run: |
           python -m pip install -U pip
           pip install playwright requests schedule
           python -m playwright install --with-deps chromium
 
-      # ========= RESTORE STATE (CACHE FIRST) =========
-      - name: Restore scraper state (auth_state.json + comments_log.csv) from cache
+      # ========= RESTORE STATE =========
+      - name: Restore scraper state (auth_state.json + comments_log.csv)
         id: cache-restore
         uses: actions/cache/restore@v4
         with:
           path: |
             auth_state.json
             comments_log.csv
-          # stable key so we can restore exact versions on future runs
-          key: scraper-state-${{ runner.os }}-${{ hashFiles('scrape.py') }}
+          key: scraper-state-${{ runner.os }}-v1
           restore-keys: |
             scraper-state-${{ runner.os }}-
             scraper-state-
 
-      # Optional fallback: if cache didn’t have auth_state.json, use the secret
+      # Optional fallback from Base64 secret
       - name: Fallback restore auth_state.json from secret
         if: ${{ !hashFiles('auth_state.json') }}
         env:
@@ -58,7 +57,7 @@ jobs:
           fi
 
       # ========= CONFIG =========
-      - name: Create/Update config.ini from secrets
+      - name: Create config.ini from secrets
         run: |
           {
             echo "[DEFAULT]"
@@ -68,31 +67,53 @@ jobs:
             echo "ALERT_WEBHOOK=${{ secrets.ALERT_WEBHOOK }}"
           } > config.ini
 
-      # ========= RUN =========
+      # ========= RUN SCRAPER =========
       - name: Run scraper (headed via Xvfb, phone 2FA supported)
         env:
           CI_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           xvfb-run -a python scrape.py now
 
-      # ========= SAVE UPDATED STATE (CACHE) =========
-      # Save each file only if it exists to avoid "Path Validation Error"
-      - name: Save auth_state.json to cache (if exists)
-        if: ${{ hashFiles('auth_state.json') != '' }}
+      # ========= STATE SUMMARY =========
+      - name: State summary (files and sizes)
+        if: always()
+        run: |
+          echo "::group::State files"
+          for f in auth_state.json comments_log.csv scrape.log; do
+            if [ -f "$f" ]; then
+              echo "[OK] $f -> $(wc -c < "$f") bytes"
+            else
+              echo "[MISS] $f"
+            fi
+          done
+          echo "::endgroup::"
+          echo "::group::comments_log.csv (last 20 lines)"
+          if [ -f comments_log.csv ]; then
+            tail -n 20 comments_log.csv || true
+          else
+            echo "comments_log.csv not found"
+          fi
+          echo "::endgroup::"
+          echo "::group::screens/ listing"
+          if [ -d screens ]; then
+            ls -lah screens || true
+          else
+            echo "no screens/ dir"
+          fi
+          echo "::endgroup::"
+
+      # ========= SAVE UPDATED STATE =========
+      - name: Save updated scraper state to cache
+        if: ${{ hashFiles('auth_state.json', 'comments_log.csv') != '' }}
         uses: actions/cache/save@v4
         with:
-          path: auth_state.json
-          key: scraper-state-${{ runner.os }}-${{ hashFiles('scrape.py') }}
+          path: |
+            auth_state.json
+            comments_log.csv
+          key: scraper-state-${{ runner.os }}-v1
 
-      - name: Save comments_log.csv to cache (if exists)
-        if: ${{ hashFiles('comments_log.csv') != '' }}
-        uses: actions/cache/save@v4
-        with:
-          path: comments_log.csv
-          key: scraper-state-${{ runner.os }}-${{ hashFiles('scrape.py') }}
-
-      # ========= OPTIONAL: ARTIFACTS FOR INSPECTION =========
-      - name: Upload current state as artifact (optional)
+      # ========= UPLOAD ARTIFACTS =========
+      - name: Upload current state as artifact
         if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -102,7 +123,7 @@ jobs:
             comments_log.csv
           if-no-files-found: ignore
 
-      - name: Upload logs & screenshots (optional)
+      - name: Upload logs & screenshots
         if: always()
         uses: actions/upload-artifact@v4
         with:
