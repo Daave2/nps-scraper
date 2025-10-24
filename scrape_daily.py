@@ -2,14 +2,17 @@
 # -*- coding: utf-8 -*-
 
 """
-Retail Performance Dashboard → Daily Summary → Google Chat
+Retail Performance Dashboard → Daily Summary → Google Chat (Full-Page OCR)
 
-- Detects & clicks Community Visualisation "PROCEED" overlays
-- If placeholder text is still present, retries + waits longer
-- Extracts as much as possible from text/DOM
-- Falls back to OCR (Tesseract) for canvas-rendered gauges
-- Saves debug screenshots to screens/
-- Appends a CSV log row (daily_report_log.csv)
+Flow:
+1) Open dashboard with saved auth_state.json
+2) Click any Community Viz “PROCEED” overlays (with retries)
+3) Take ONE full-page screenshot and OCR it into text
+4) Parse all metrics from OCR text (robust regex windows around labels)
+5) Send Google Chat card + append CSV row
+6) Save screenshot + OCR text into screens/ for debugging
+
+CSV schema is unchanged.
 """
 
 import os
@@ -24,16 +27,12 @@ from typing import Dict, List, Optional
 import requests
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 
-# ── Optional OCR (Pillow + Tesseract) ─────────────────────────────────────────
-try:
-    from PIL import Image
-    from io import BytesIO
-    import pytesseract
-    OCR_AVAILABLE = True
-except Exception:
-    OCR_AVAILABLE = False
+# OCR deps
+from PIL import Image
+from io import BytesIO
+import pytesseract
 
-# ── Paths / constants ─────────────────────────────────────────────────────────
+# ── Constants / Paths ────────────────────────────────────────────────────────
 BASE_DIR = Path(__file__).resolve().parent
 AUTH_STATE_PATH = BASE_DIR / "auth_state.json"
 LOG_FILE_PATH = BASE_DIR / "scrape_daily.log"
@@ -50,16 +49,16 @@ COMMUNITY_VIZ_PLACEHOLDER = (
     "You are about to interact with a community visualisation in this embedded report"
 )
 
-# ── Logging ───────────────────────────────────────────────────────────────────
+# ── Logging ──────────────────────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s",
     handlers=[logging.FileHandler(LOG_FILE_PATH)],
 )
-logger = logging.getLogger("daily")
+logger = logging.getLogger("daily_ocr")
 logger.addHandler(logging.StreamHandler())
 
-# ── Config (file first, env fallback) ─────────────────────────────────────────
+# ── Config (file first, env fallback) ────────────────────────────────────────
 config = configparser.ConfigParser()
 config.read(BASE_DIR / "config.ini")
 
@@ -72,7 +71,7 @@ MAIN_WEBHOOK  = (
 ALERT_WEBHOOK = config["DEFAULT"].get("ALERT_WEBHOOK", os.getenv("ALERT_WEBHOOK", ""))
 CI_RUN_URL    = os.getenv("CI_RUN_URL", "")
 
-# ── Helpers (Chat + debug) ───────────────────────────────────────────────────
+# ── Chat helpers ─────────────────────────────────────────────────────────────
 def _post_with_backoff(url: str, payload: dict) -> bool:
     backoff, max_backoff = 2.0, 30.0
     while True:
@@ -101,14 +100,16 @@ def alert(lines: List[str]):
         lines.append(f"• CI run: {CI_RUN_URL}")
     _post_with_backoff(ALERT_WEBHOOK, {"text": "\n".join(lines)})
 
+# ── Debug helpers ────────────────────────────────────────────────────────────
 def save_screenshot(page, tag: str):
     try:
         ts = int(time.time())
         SCREENS_DIR.mkdir(parents=True, exist_ok=True)
-        (SCREENS_DIR / f"{ts}_{tag}.png").write_bytes(page.screenshot(full_page=True))
-        logger.info(f"Saved screenshot → {ts}_{tag}.png")
+        pth = SCREENS_DIR / f"{ts}_{tag}.png"
+        pth.write_bytes(page.screenshot(full_page=True))
+        logger.info(f"Saved screenshot → {pth.name}")
     except Exception as e:
-        logger.warning(f"Could not save screenshot: {e}")
+        logger.warning(f"Could not save screenshot ({tag}): {e}")
 
 def save_text_dump(text: str, tag: str):
     try:
@@ -119,103 +120,121 @@ def save_text_dump(text: str, tag: str):
     except Exception:
         pass
 
-# ── Community Viz overlays ───────────────────────────────────────────────────
-def click_proceed_overlays(page) -> int:
-    """Click 'PROCEED' buttons inside any frames; return count clicked."""
-    clicked = 0
-    for fr in page.frames:
-        try:
-            btns = fr.get_by_text("PROCEED", exact=True)
-            n = btns.count()
-            for i in range(n):
-                try:
-                    btns.nth(i).click(timeout=1500)
-                    clicked += 1
-                    fr.wait_for_timeout(300)
-                except Exception:
-                    continue
-        except Exception:
-            continue
-    if clicked:
-        logger.info(f"Clicked {clicked} 'PROCEED' overlay(s).")
-    return clicked
+# ── Overlays ─────────────────────────────────────────────────────────────────
+def click_proceed_overlays(page, retries: int = 3, waits: List[int] = [1500, 3000, 5000]) -> int:
+    total_clicked = 0
+    for attempt in range(retries):
+        clicked = 0
+        for fr in page.frames:
+            try:
+                btns = fr.get_by_text(re.compile(r"\bPROCEED\b", re.I))
+                n = btns.count()
+                for i in range(n):
+                    try:
+                        btns.nth(i).click(timeout=2000)
+                        clicked += 1
+                        fr.wait_for_timeout(250)
+                    except Exception:
+                        continue
+            except Exception:
+                continue
+        total_clicked += clicked
+        if clicked == 0:
+            break
+        wait_ms = waits[min(attempt, len(waits)-1)]
+        page.wait_for_timeout(wait_ms)
+    if total_clicked:
+        logger.info(f"Clicked {total_clicked} 'PROCEED' overlay(s) in total.")
+    return total_clicked
 
-# ── Navigation + text capture ────────────────────────────────────────────────
-def fetch_text_from_dashboard(page, url: str) -> Optional[str]:
-    logger.info("Opening Retail Performance Dashboard…")
+# ── Capture → OCR text ───────────────────────────────────────────────────────
+def ocr_full_page(page) -> str:
+    """
+    Takes a single full-page screenshot and OCRs it.
+    Returns OCR text (string). Saves PNG + TXT to screens/.
+    """
+    save_screenshot(page, "fullpage")
+    png = page.screenshot(full_page=True)
+    img = Image.open(BytesIO(png))
+
+    # Light preprocessing – grayscale + mild upscale for crisper digits
     try:
-        page.goto(url, wait_until="domcontentloaded", timeout=120_000)
-    except PlaywrightTimeoutError:
-        logger.error("Timeout loading dashboard.")
-        save_screenshot(page, "dashboard_timeout")
-        return ""
-
-    if "accounts.google.com" in page.url:
-        logger.warning("Redirected to login — auth state missing/invalid.")
-        return None
-
-    # Let dynamic/iframes render
-    logger.info("Waiting 15s for dynamic content…")
-    page.wait_for_timeout(15_000)
-
-    # First pass: click overlays
-    clicked = click_proceed_overlays(page)
-    if clicked:
-        page.wait_for_timeout(1500)
-
-    # Detect community-viz placeholder text in DOM; if present → retry
-    content_html = ""
-    try:
-        content_html = page.content()
-    except Exception:
-        content_html = ""
-
-    if COMMUNITY_VIZ_PLACEHOLDER in (content_html or ""):
-        logger.warning("Community visualisation placeholders detected — retrying PROCEED and waiting longer.")
-        clicked2 = click_proceed_overlays(page)
-        page.wait_for_timeout(5000)  # give canvases time to draw
-        save_screenshot(page, "community_viz_pending_after_retry")
-
-    # Try page body, else pick the longest frame text
-    text = ""
-    try:
-        text = page.inner_text("body")
+        img = img.convert("L")
+        w, h = img.size
+        if max(w, h) < 1600:
+            img = img.resize((int(w*1.5), int(h*1.5)))
     except Exception:
         pass
 
-    if not text or len(text) < 400:
-        best = text
-        best_len = len(best) if best else 0
-        for fr in page.frames:
-            try:
-                fr.wait_for_selector("body", timeout=5_000)
-                t = fr.locator("body").inner_text(timeout=20_000)
-                if t and len(t) > best_len:
-                    best, best_len = t, len(t)
-            except Exception:
-                continue
-        text = best or text
-
-    if not text:
-        logger.error("No text content found at all.")
-        save_screenshot(page, "no_text")
-        return ""
-
-    save_text_dump(text, "daily_text")
+    text = pytesseract.image_to_string(
+        img,
+        # PSM 6: Assume a block of text; no aggressive whitelisting (we need labels)
+        config="--psm 6",
+    )
+    save_text_dump(text, "ocr_text")
     return text
 
-# ── Parsing utils ────────────────────────────────────────────────────────────
-def _block(text: str, start: str, ends: List[str]) -> str:
-    s = text.find(start)
-    if s == -1:
-        return ""
-    e_candidates = [text.find(end, s + len(start)) for end in ends]
-    e_candidates = [e for e in e_candidates if e != -1]
-    e = min(e_candidates) if e_candidates else len(text)
-    return text[s:e]
+# ── Navigation ───────────────────────────────────────────────────────────────
+def get_ocr_text_from_dashboard() -> Optional[str]:
+    if not AUTH_STATE_PATH.exists():
+        alert(["⚠️ Daily dashboard scrape needs login. Run `python scrape.py now` once to save auth_state.json."])
+        logger.error("auth_state.json not found.")
+        return None
 
-def _search_first(patterns: List[str], text: str, flags=0, group: int = 1, default="—") -> str:
-    for pat in patterns:
+    with sync_playwright() as p:
+        browser = context = page = None
+        try:
+            browser = p.chromium.launch(headless=True)
+            context = browser.new_context(
+                storage_state=str(AUTH_STATE_PATH),
+                viewport={"width": 1600, "height": 1200},
+                device_scale_factor=2,                   # sharper
+            )
+            page = context.new_page()
+
+            logger.info("Opening Retail Performance Dashboard…")
+            try:
+                page.goto(DASHBOARD_URL, wait_until="domcontentloaded", timeout=120_000)
+            except PlaywrightTimeoutError:
+                logger.error("Timeout loading dashboard.")
+                save_screenshot(page, "dashboard_timeout")
+                return ""
+
+            if "accounts.google.com" in page.url:
+                logger.warning("Redirected to login — auth state missing/invalid.")
+                return None
+
+            logger.info("Waiting 12s for dynamic content…")
+            page.wait_for_timeout(12_000)
+
+            # Try to clear Community Viz overlays
+            click_proceed_overlays(page)
+            page.wait_for_timeout(1200)
+
+            # If the placeholder text still exists in DOM HTML, wait once more
+            html = page.content()
+            if COMMUNITY_VIZ_PLACEHOLDER in (html or ""):
+                logger.warning("Community Viz placeholder still present — waiting longer.")
+                click_proceed_overlays(page, retries=1, waits=[5000])
+                page.wait_for_timeout(1500)
+
+            # One-shot full OCR
+            text = ocr_full_page(page)
+            return text
+
+        finally:
+            try:
+                if context: context.close()
+            except Exception:
+                pass
+            try:
+                if browser: browser.close()
+            except Exception:
+                pass
+
+# ── Parsing helpers for OCR text ─────────────────────────────────────────────
+def _first(pats: List[str], text: str, flags=0, group=1, default="—") -> str:
+    for pat in pats:
         m = re.search(pat, text, flags)
         if m:
             try:
@@ -224,249 +243,152 @@ def _search_first(patterns: List[str], text: str, flags=0, group: int = 1, defau
                 return m.group(0).strip()
     return default
 
-def _tile_value_from_text(page_text: str, label: str) -> str:
-    idx = page_text.find(label)
-    if idx == -1:
-        return "—"
-    window = page_text[idx: idx + 500]
-    lines = [ln.strip() for ln in window.splitlines() if ln.strip()]
-    seen = False
-    for i, line in enumerate(lines[:30]):
-        if not seen:
-            if label in line:
-                seen = True
-            continue
-        if "Target" in line:
-            break
-        if re.fullmatch(r"-?\d{1,3}", line):
-            tail = "\n".join(lines[i:i+5])
-            if "NPS" in tail:
-                return line
-    return "—"
-
-def _dom_find_tile_value_in_frame(frame, label: str) -> Optional[str]:
-    script = """
-    (label) => {
-      const intRe = /-?\\d{1,3}\\b/;
-      const isInt = (s) => s && /^-?\\d{1,3}$/.test(s.trim());
-      const els = Array.from(document.querySelectorAll('*')).filter(el => (el.textContent||'').trim() === label);
-      if (els.length === 0) return null;
-      let root = els[0].closest('[role="region"], section, article, .viz-container, .widget, .card, .tile, div');
-      if (!root) root = els[0].parentElement || els[0];
-
-      const q = [root]; const seen = new Set(); let steps = 0;
-      while (q.length && steps < 250) {
-        const node = q.shift(); steps++;
-        if (!node || seen.has(node)) continue;
-        seen.add(node);
-
-        const txt = (node.textContent || '').trim();
-        if (isInt(txt)) return txt;
-
-        const aria = node.getAttribute && (node.getAttribute('aria-label') || node.getAttribute('title'));
-        if (aria) {
-          const m = aria.match(intRe);
-          if (m) return m[0];
-        }
-        if (node.attributes) {
-          for (const a of Array.from(node.attributes)) {
-            const m = String(a.value).match(intRe);
-            if (m) return m[0];
-          }
-        }
-        if (node.children && node.children.length) q.push(...Array.from(node.children));
-      }
-      return null;
-    }
+def _near(label: str, text: str, window: int = 120, num_pat: str = r"-?\d{1,3}") -> str:
     """
-    try:
-        return frame.evaluate(script, label)
-    except Exception:
-        return None
-
-def _dom_tile_value(page, label: str) -> str:
-    # Search frames that contain the label first
-    for fr in page.frames:
-        try:
-            if fr.get_by_text(label, exact=True).count():
-                v = _dom_find_tile_value_in_frame(fr, label)
-                if v is not None:
-                    return v
-        except Exception:
-            continue
-    # As a fallback, try top-level
-    try:
-        if page.get_by_text(label, exact=True).count():
-            v = _dom_find_tile_value_in_frame(page, label)
-            if v is not None:
-                return v
-    except Exception:
-        pass
-    return "—"
-
-def _ocr_tile_value(page, label: str) -> str:
-    if not OCR_AVAILABLE:
+    Find the first integer near (after) a label within 'window' chars.
+    Default captures e.g. NPS values (-99..99), but num_pat can be changed.
+    """
+    m = re.search(re.escape(label), text, flags=re.I)
+    if not m:
         return "—"
+    start = m.end()
+    snippet = text[start : start + window]
+    m2 = re.search(num_pat, snippet)
+    return m2.group(0) if m2 else "—"
 
-    for fr in page.frames:
-        try:
-            lab = fr.get_by_text(label, exact=True).first
-            if lab.count() == 0:
-                continue
-            # Closest visual container
-            container = lab.locator(
-                "xpath=ancestor::*[contains(@class,'viz') or contains(@class,'widget') or "
-                "contains(@class,'card') or self::section or self::article or self::div][1]"
-            )
-            target = container if container.count() else lab
-            # Screenshot and OCR
-            img_bytes = target.screenshot(type="png", timeout=10000)
-            img = Image.open(BytesIO(img_bytes))
-            try:
-                img = img.convert("L")
-                w, h = img.size
-                if max(w, h) < 240:
-                    img = img.resize((int(w*1.8), int(h*1.8)))
-            except Exception:
-                pass
-            txt = pytesseract.image_to_string(
-                img, config="--psm 7 -c tessedit_char_whitelist=-0123456789"
-            )
-            if not txt:
-                continue
-            m = re.search(r"-?\d{1,3}", txt)
-            if m:
-                return m.group(0)
-        except Exception:
-            continue
+def _near_pct(label: str, text: str, window: int = 120) -> str:
+    m = re.search(re.escape(label), text, flags=re.I)
+    if not m:
+        return "—"
+    snippet = text[m.end() : m.end() + window]
+    m2 = re.search(r"-?\d{1,3}(?:\.\d+)?%", snippet)
+    return m2.group(0) if m2 else "—"
 
-    return "—"
+def _near_money(label: str, text: str, window: int = 140) -> str:
+    m = re.search(re.escape(label), text, flags=re.I)
+    if not m:
+        return "—"
+    snippet = text[m.end() : m.end() + window]
+    m2 = re.search(r"[£-]?\s?[0-9.,]+[KMB]?", snippet, flags=re.I)
+    return (m2.group(0).replace(" ", "") if m2 else "—")
 
-# ── Parse metrics (text → DOM → OCR for gauges) ──────────────────────────────
-def parse_metrics_from_text(text: str) -> Dict[str, str]:
+def _near_time(label: str, text: str, window: int = 100) -> str:
+    m = re.search(re.escape(label), text, flags=re.I)
+    if not m:
+        return "—"
+    snippet = text[m.end() : m.end() + window]
+    m2 = re.search(r"\b\d{2}:\d{2}\b", snippet)
+    return m2.group(0) if m2 else "—"
+
+# ── Parse all metrics from OCR text ──────────────────────────────────────────
+def parse_metrics(ocr: str) -> Dict[str, str]:
     out: Dict[str, str] = {}
 
-    # Context
-    out["period_range"] = _search_first([r"The data on this report is from:\s*([^\n]+)"], text)
-    out["page_timestamp"] = _search_first([r"\b(\d{1,2}\s+[A-Za-z]{3}\s+\d{4},\s*\d{2}:\d{2}:\d{2})\b"], text)
-    out["store_line"] = _search_first(
-        [r"([A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}).*?(\|\s*.+?\s*\|\s*\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})"],
-        text, flags=re.S, group=0
+    # Context / header
+    out["period_range"] = _first([r"The data on this report is from:\s*([^\n]+)"], ocr)
+    out["page_timestamp"] = _first([r"\b(\d{1,2}\s+[A-Za-z]{3}\s+\d{4},\s*\d{2}:\d{2}:\d{2})\b"], ocr)
+    out["store_line"] = _first(
+        [r"([A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}).*?\|\s*.*?\|\s*\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}"],
+        ocr, flags=re.S, group=0
     )
 
-    # Sales block
-    sales_b = _block(text, "Sales", ["Waste & Markdowns", "Colleague Happiness", "Payroll", "Front End Service", "Online", "Privacy"])
-    if sales_b:
-        m = re.search(
-            r"Total\s*\n\s*([£]?[0-9.,]+[KMB]?)\s*\n\s*([+-]?\d+%?)\s*\n\s*([+-]?[£]?[0-9.,]+[KMB]?)",
-            sales_b, flags=re.I
-        )
-        if m:
-            out["sales_total"], out["sales_lfl"], out["sales_vs_target"] = m.group(1).strip(), m.group(2).strip(), m.group(3).strip()
-        else:
-            out["sales_total"] = out["sales_lfl"] = out["sales_vs_target"] = "—"
+    # Sales (Total row: value, LFL, vs Target)
+    # OCR often collapses whitespace; accept either “Total 46.8M 1.73% -1.3M” or in lines
+    m = re.search(
+        r"Sales.*?Total\s+([£-]?\s?[0-9.,]+[KMB]?)\s+([+-]?\d+(?:\.\d+)?%)\s+([£+-]?\s?[0-9.,]+[KMB]?)",
+        ocr, flags=re.I | re.S
+    )
+    if m:
+        out["sales_total"]    = m.group(1).replace(" ", "")
+        out["sales_lfl"]      = m.group(2)
+        out["sales_vs_target"]= m.group(3).replace(" ", "")
     else:
         out["sales_total"] = out["sales_lfl"] = out["sales_vs_target"] = "—"
 
-    # Gauges often missing from text — try naive text scrape first
-    out["supermarket_nps"]     = _tile_value_from_text(text, "Supermarket NPS")
-    out["colleague_happiness"] = _tile_value_from_text(text, "Colleague Happiness")
-    out["home_delivery_nps"]   = _tile_value_from_text(text, "Home Delivery NPS")
-    out["cafe_nps"]            = _tile_value_from_text(text, "Cafe NPS")
-    out["click_collect_nps"]   = _tile_value_from_text(text, "Click & Collect NPS")
-    out["customer_toilet_nps"] = _tile_value_from_text(text, "Customer Toilet NPS")
+    # NPS gauges (numbers near labels)
+    out["supermarket_nps"]     = _near("Supermarket NPS", ocr)
+    out["colleague_happiness"] = _near("Colleague Happiness", ocr)
+    out["home_delivery_nps"]   = _near("Home Delivery NPS", ocr)
+    out["cafe_nps"]            = _near("Cafe NPS", ocr)
+    out["click_collect_nps"]   = _near("Click & Collect NPS", ocr)
+    out["customer_toilet_nps"] = _near("Customer Toilet NPS", ocr)
 
     # Front End Service
-    fes_b = _block(text, "Front End Service", ["Production Planning", "More Card Engagement", "Stock Record NPS", "Privacy"])
-    out["sco_utilisation"] = _search_first([r"Sco Utilisation\s*\n\s*([0-9]+%)"], fes_b, flags=re.I)
-    out["efficiency"]      = _search_first([r"Efficiency\s*\n\s*([0-9]+%)"], fes_b, flags=re.I)
-    m = re.search(r"Scan Rate\s*\n\s*([0-9]+)\s*\n\s*vs Target\s*\n\s*([+-]?[0-9.]+)", fes_b, flags=re.I)
-    out["scan_rate"], out["scan_vs_target"] = (m.group(1).strip(), m.group(2).strip()) if m else ("—", "—")
-    m = re.search(r"Interventions\s*\n\s*([0-9]+)\s*\n\s*vs Target\s*\n\s*([+-]?[0-9.]+)", fes_b, flags=re.I)
-    out["interventions"], out["interventions_vs_target"] = (m.group(1).strip(), m.group(2).strip()) if m else ("—", "—")
-    m = re.search(r"Mainbank Closed\s*\n\s*([0-9]+)\s*\n\s*vs Target\s*\n\s*([+-]?[0-9.]+)", fes_b, flags=re.I)
-    out["mainbank_closed"], out["mainbank_vs_target"] = (m.group(1).strip(), m.group(2).strip()) if m else ("—", "—")
+    out["sco_utilisation"] = _near_pct("Sco Utilisation", ocr)
+    out["efficiency"]      = _near_pct("Efficiency", ocr)
+    # Scan / Interventions / Mainbank include “vs Target”
+    out["scan_rate"]       = _near("Scan Rate", ocr, num_pat=r"\d{1,4}")
+    out["scan_vs_target"]  = _near_pct("vs Target", ocr, window=40)  # the first vs Target after Scan Rate window
+    # For robustness, find the next explicit “Interventions” block separately:
+    out["interventions"]   = _near("Interventions", ocr, num_pat=r"\d{1,4}")
+    # pick the vs Target that appears closely after “Interventions”
+    inter_pos = ocr.lower().find("interventions")
+    if inter_pos != -1:
+        inter_win = ocr[inter_pos: inter_pos+200]
+        mt = re.search(r"vs Target\s+(-?\d+(?:\.\d+)?)", inter_win, flags=re.I)
+        out["interventions_vs_target"] = mt.group(1) if mt else "—"
+    else:
+        out["interventions_vs_target"] = "—"
+
+    out["mainbank_closed"] = _near("Mainbank Closed", ocr, num_pat=r"\d{1,4}")
+    # vs Target after Mainbank Closed
+    mb_pos = ocr.lower().find("mainbank closed")
+    if mb_pos != -1:
+        mb_win = ocr[mb_pos: mb_pos+200]
+        mt = re.search(r"vs Target\s+(-?\d+(?:\.\d+)?)", mb_win, flags=re.I)
+        out["mainbank_vs_target"] = mt.group(1) if mt else "—"
+    else:
+        out["mainbank_vs_target"] = "—"
 
     # Online
-    online_b = _block(text, "Online", ["Front End Service", "Production Planning", "Privacy"])
-    out["availability_pct"]   = _search_first([r"Availability\s*\n\s*([0-9]+%)"], online_b, flags=re.I)
-    out["despatched_on_time"] = _search_first([r"Despatched on Time\s*\n\s*([0-9]+%|No data)"], online_b, flags=re.I)
-    out["delivered_on_time"]  = _search_first([r"Delivered on Time\s*\n\s*([0-9]+%|No data)"], online_b, flags=re.I)
-    out["cc_avg_wait"]        = _search_first([r"Click\s*&\s*Collect average wait\s*\n\s*([0-9]{2}:[0-9]{2})"], online_b, flags=re.I)
+    out["availability_pct"]   = _near_pct("Availability", ocr)
+    out["despatched_on_time"] = _near_pct("Despatched on Time", ocr)
+    out["delivered_on_time"]  = _near_pct("Delivered on Time", ocr)
+    out["cc_avg_wait"]        = _near_time("Click & Collect", ocr)
 
-    # Waste & Markdowns
-    wm_b = _block(text, "Waste & Markdowns", ["My Reports", "Clean & Rotate", "Payroll", "Online", "Privacy"])
-    m = re.search(
-        r"Total\s*\n\s*([£]?[0-9.,]+[KMB]?)\s*\n\s*([£]?[0-9.,]+[KMB]?)\s*\n\s*([£]?[0-9.,]+[KMB]?)\s*\n\s*([+-]?[£]?[0-9.,]+[KMB]?)\s*\n\s*([+-]?\d+\.?\d*%)",
-        wm_b, flags=re.I
+    # Waste & Markdowns (Total row: Waste, Markdowns, Total, +/- , +/- %)
+    wm = re.search(
+        r"Waste\s*&?\s*Markdowns.*?Total\s+([£-]?\s?[0-9.,]+[KMB]?)\s+([£-]?\s?[0-9.,]+[KMB]?)\s+([£-]?\s?[0-9.,]+[KMB]?)\s+([£+-]?\s?[0-9.,]+[KMB]?)\s+(-?\d+(?:\.\d+)?%)",
+        ocr, flags=re.I | re.S
     )
-    if m:
-        out["waste_total"], out["markdowns_total"], out["wm_total"], out["wm_delta"], out["wm_delta_pct"] = \
-            m.group(1).strip(), m.group(2).strip(), m.group(3).strip(), m.group(4).strip(), m.group(5).strip()
+    if wm:
+        out["waste_total"]  = wm.group(1).replace(" ", "")
+        out["markdowns_total"] = wm.group(2).replace(" ", "")
+        out["wm_total"]     = wm.group(3).replace(" ", "")
+        out["wm_delta"]     = wm.group(4).replace(" ", "")
+        out["wm_delta_pct"] = wm.group(5)
     else:
-        out.update({k: "—" for k in ["waste_total", "markdowns_total", "wm_total", "wm_delta", "wm_delta_pct"]})
+        out.update({k: "—" for k in ["waste_total","markdowns_total","wm_total","wm_delta","wm_delta_pct"]})
 
     # Payroll
-    pay_b = _block(text, "Payroll", ["More Card Engagement", "Stock Record NPS", "Online", "Privacy"])
-    out["payroll_outturn"]    = _search_first([r"Payroll Outturn\s*\n\s*([+-]?[£]?[0-9.,]+[KMB]?)"], pay_b, flags=re.I)
-    out["absence_outturn"]    = _search_first([r"Absence Outturn\s*\n\s*([+-]?[£]?[0-9.,]+[KMB]?)"], pay_b, flags=re.I)
-    out["productive_outturn"] = _search_first([r"Productive Outturn\s*\n\s*([+-]?[£]?[0-9.,]+[KMB]?)"], pay_b, flags=re.I)
-    out["holiday_outturn"]    = _search_first([r"Holiday Outturn\s*\n\s*([+-]?[£]?[0-9.,]+[KMB]?)"], pay_b, flags=re.I)
-    out["current_base_cost"]  = _search_first([r"Current Base Cost\s*\n\s*([£]?[0-9.,]+[KMB]?)"], pay_b, flags=re.I)
+    out["payroll_outturn"]    = _near_money("Payroll Outturn", ocr)
+    out["absence_outturn"]    = _near_money("Absence Outturn", ocr)
+    out["productive_outturn"] = _near_money("Productive Outturn", ocr)
+    out["holiday_outturn"]    = _near_money("Holiday Outturn", ocr)
+    out["current_base_cost"]  = _near_money("Current Base Cost", ocr)
 
     # Shrink
-    shr_b = _block(text, "Shrink", ["Online", "Production Planning", "Privacy"])
-    out["moa"]                  = _search_first([r"Morrisons Order Adjustments\s*\n\s*([£]?-?[0-9.,]+[KMB]?)"], shr_b, flags=re.I)
-    out["waste_validation"]     = _search_first([r"Waste Validation\s*\n\s*([0-9]+%)"], shr_b, flags=re.I)
-    out["unrecorded_waste_pct"] = _search_first([r"Unrecorded Waste %\s*\n\s*([+-]?\d+\.?\d*%)"], shr_b, flags=re.I)
-    out["shrink_vs_budget_pct"] = _search_first([r"Shrink vs Budget %\s*\n\s*([+-]?\d+\.?\d*%)"], shr_b, flags=re.I)
+    out["moa"]                  = _near_money("Morrisons Order Adjustments", ocr)
+    out["waste_validation"]     = _near_pct("Waste Validation", ocr)
+    out["unrecorded_waste_pct"] = _near_pct("Unrecorded Waste %", ocr)
+    out["shrink_vs_budget_pct"] = _near_pct("Shrink vs Budget %", ocr)
 
     # Card Engagement
-    ce_b = _block(text, "More Card Engagement", ["Stock Record NPS", "Production Planning", "Privacy"])
-    out["swipe_rate"]    = _search_first([r"Swipe Rate\s*\n\s*([0-9]+%)"], ce_b, flags=re.I)
-    out["swipes_wow_pct"]= _search_first([r"Swipes WOW %\s*\n\s*([+-]?\d+%)"], ce_b, flags=re.I)
-    out["new_customers"] = _search_first([r"New Customers\s*\n\s*([0-9,]+)"], ce_b, flags=re.I)
-    out["swipes_yoy_pct"]= _search_first([r"Swipes YOY %\s*\n\s*([+-]?\d+%)"], ce_b, flags=re.I)
+    out["swipe_rate"]    = _near_pct("Swipe Rate", ocr)
+    out["swipes_wow_pct"]= _near_pct("Swipes WOW %", ocr)
+    out["new_customers"] = _near("New Customers", ocr, num_pat=r"[0-9,]{1,8}")
+    out["swipes_yoy_pct"]= _near_pct("Swipes YOY %", ocr)
 
     # Production Planning
-    pp_b = _block(text, "Production Planning", ["Shrink", "Online", "Privacy"])
-    out["data_provided"] = _search_first([r"Data Provided\s*\n\s*([0-9]+%)"], pp_b, flags=re.I)
-    out["trusted_data"]  = _search_first([r"Trusted Data\s*\n\s*([0-9]+%)"], pp_b, flags=re.I)
+    out["data_provided"] = _near_pct("Data Provided", ocr)
+    out["trusted_data"]  = _near_pct("Trusted Data", ocr)
 
     # Misc
-    out["complaints_key"] = _search_first([r"Key Customer Complaints\s*\n\s*([0-9]+)"], text, flags=re.I)
-    out["my_reports"]     = _search_first([r"My Reports\s*\n\s*([0-9]+)"], text, flags=re.I)
-    out["weekly_activity"]= _search_first([r"Weekly Activity %\s*\n\s*([0-9]+%|No data)"], text, flags=re.I)
+    out["complaints_key"] = _near("Key Customer Complaints", ocr, num_pat=r"\d{1,5}")
+    out["my_reports"]     = _near("My Reports", ocr, num_pat=r"[0-9,]{1,6}")
+    out["weekly_activity"]= _near_pct("Weekly Activity %", ocr)
 
     return out
-
-def fill_missing_gauges(page, metrics: Dict[str, str]) -> Dict[str, str]:
-    """For gauge tiles: try DOM scan, then OCR if still missing."""
-    labels = [
-        ("supermarket_nps", "Supermarket NPS"),
-        ("colleague_happiness", "Colleague Happiness"),
-        ("home_delivery_nps", "Home Delivery NPS"),
-        ("cafe_nps", "Cafe NPS"),
-        ("click_collect_nps", "Click & Collect NPS"),
-        ("customer_toilet_nps", "Customer Toilet NPS"),
-    ]
-    for key, label in labels:
-        if metrics.get(key) and metrics[key] != "—":
-            continue
-        # 1) DOM
-        v = _dom_tile_value(page, label)
-        if v and re.fullmatch(r"-?\d{1,3}", v):
-            metrics[key] = v
-            logger.info(f"{label}: DOM → {v}")
-            continue
-        # 2) OCR
-        v = _ocr_tile_value(page, label)
-        if v and re.fullmatch(r"-?\d{1,3}", v):
-            metrics[key] = v
-            logger.info(f"{label}: OCR → {v}")
-        else:
-            logger.info(f"{label}: still missing (—)")
-    return metrics
 
 # ── Card builder + sender ────────────────────────────────────────────────────
 def build_chat_card(metrics: Dict[str, str]) -> dict:
@@ -476,7 +398,7 @@ def build_chat_card(metrics: Dict[str, str]) -> dict:
         return {"decoratedText": {"topLabel": label, "text": (val or "—")}}
 
     header = {
-        "title": "📊 Retail Daily Summary",
+        "title": "📊 Retail Daily Summary (OCR)",
         "subtitle": (metrics.get("store_line") or "").replace("\n", "  "),
     }
 
@@ -542,49 +464,21 @@ def send_daily_card(metrics: Dict[str, str]) -> bool:
     payload = build_chat_card(metrics)
     return _post_with_backoff(MAIN_WEBHOOK, payload)
 
-# ── Main flow ────────────────────────────────────────────────────────────────
+# ── Main ─────────────────────────────────────────────────────────────────────
 def run_daily_scrape():
-    if not AUTH_STATE_PATH.exists():
-        alert(["⚠️ Daily dashboard scrape needs login. Run `python scrape.py now` once to save auth_state.json."])
-        logger.error("auth_state.json not found.")
+    text = get_ocr_text_from_dashboard()
+    if text is None:
+        # login missing/expired
+        return
+    if not text:
+        logger.error("OCR returned empty text — skipping.")
         return
 
-    with sync_playwright() as p:
-        browser = context = page = None
-        try:
-            browser = p.chromium.launch(headless=True)
-            context = browser.new_context(storage_state=str(AUTH_STATE_PATH))
-            page = context.new_page()
-
-            text = fetch_text_from_dashboard(page, DASHBOARD_URL)
-            if text is None:
-                alert(["⚠️ Daily scrape blocked by login — please re-login (the NPS scraper will prompt you)."])
-                return
-            if not text:
-                logger.error("No text extracted — skipping.")
-                return
-
-            metrics = parse_metrics_from_text(text)
-
-            # One more overlay pass just before DOM/OCR, then fill missing gauges
-            click_proceed_overlays(page)
-            page.wait_for_timeout(1200)
-            metrics = fill_missing_gauges(page, metrics)
-
-        finally:
-            try:
-                if context: context.close()
-            except Exception:
-                pass
-            try:
-                if browser: browser.close()
-            except Exception:
-                pass
-
+    metrics = parse_metrics(text)
     ok = send_daily_card(metrics)
     logger.info("Daily card send → %s", "OK" if ok else "FAIL")
 
-    # CSV logging
+    # CSV logging (same header order as before)
     headers = [
         "page_timestamp","period_range","store_line",
         "sales_total","sales_lfl","sales_vs_target",
