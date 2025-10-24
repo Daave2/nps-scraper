@@ -3,7 +3,7 @@ name: Looker Studio Scraper Suite
 on:
   workflow_dispatch: {}
   schedule:
-    # Runs at 08:05, 11:05, 14:05, 17:05, 20:05 London-time equivalent in UTC cron
+    # 08:05, 11:05, 14:05, 17:05, 20:05 London (UTC in cron)
     - cron: "5 7,10,13,16,19 * * *"
 
 concurrency:
@@ -23,7 +23,15 @@ jobs:
         uses: actions/checkout@v4
 
       # ────────────────────────────────
-      # Setup Python + Playwright + OCR deps
+      # System deps for OCR (pytesseract)
+      # ────────────────────────────────
+      - name: Install system packages (tesseract)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends tesseract-ocr
+
+      # ────────────────────────────────
+      # Python + Playwright
       # ────────────────────────────────
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -33,26 +41,23 @@ jobs:
       - name: Install Python deps
         run: |
           python -m pip install -U pip
-          pip install playwright requests schedule pytz pillow pytesseract
+          pip install playwright requests pillow pytesseract
           python -m playwright install --with-deps chromium
 
-      - name: Install Tesseract (for OCR fallback)
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y tesseract-ocr
+      # ────────────────────────────────
+      # Environment (date-based caching)
+      # ────────────────────────────────
+      - name: Export TODAY
+        run: echo "TODAY=$(date -u +%Y%m%d)" >> $GITHUB_ENV
+
+      # Optional: let scraper know where your ROI JSON is
+      - name: Export ROI map path
+        run: echo "ROI_MAP_FILE=${{ github.workspace }}/roi_map.json" >> $GITHUB_ENV
 
       # ────────────────────────────────
-      # Export helpers/env
+      # Restore state from cache
       # ────────────────────────────────
-      - name: Export TODAY and CI_RUN_URL
-        run: |
-          echo "TODAY=$(date -u +%Y%m%d)" >> $GITHUB_ENV
-          echo "CI_RUN_URL=${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" >> $GITHUB_ENV
-
-      # ────────────────────────────────
-      # Restore state from cache (auth + CSV logs)
-      # ────────────────────────────────
-      - name: Restore scraper state (auth + logs)
+      - name: Restore scraper state (auth + logs + roi_map)
         id: cache-restore
         uses: actions/cache/restore@v4
         with:
@@ -61,13 +66,14 @@ jobs:
             comments_log.csv
             complaints_log.csv
             daily_report_log.csv
+            roi_map.json
           key: scraper-state-${{ runner.os }}-v1-${{ github.ref_name }}-${{ env.TODAY }}
           restore-keys: |
             scraper-state-${{ runner.os }}-v1-${{ github.ref_name }}-
             scraper-state-${{ runner.os }}-v1-
 
       # ────────────────────────────────
-      # Optional fallback (first-ever run)
+      # Optional fallback (first cold start)
       # ────────────────────────────────
       - name: Fallback restore auth_state.json from secret
         run: |
@@ -81,7 +87,7 @@ jobs:
           AUTH_STATE_B64: ${{ secrets.AUTH_STATE_B64 }}
 
       # ────────────────────────────────
-      # Create config.ini from secrets
+      # Create config.ini dynamically from secrets
       # ────────────────────────────────
       - name: Create/Update config.ini from secrets
         run: |
@@ -96,21 +102,17 @@ jobs:
           } > config.ini
 
       # ────────────────────────────────
-      # Run scrapers (NPS → Complaints → Daily)
+      # Run scrapers
       # ────────────────────────────────
       - name: Run NPS scraper
-        env:
-          CI_RUN_URL: ${{ env.CI_RUN_URL }}
         run: xvfb-run -a python scrape.py now || true
 
       - name: Run Complaints scraper
-        env:
-          CI_RUN_URL: ${{ env.CI_RUN_URL }}
         run: xvfb-run -a python scrape_complaints.py now || true
 
-      - name: Run Daily Report scraper (with OCR fallback)
+      - name: Run Daily Report scraper (OCR + ROI)
         env:
-          CI_RUN_URL: ${{ env.CI_RUN_URL }}
+          ROI_MAP_FILE: ${{ env.ROI_MAP_FILE }}
         run: xvfb-run -a python scrape_daily.py || true
 
       # ────────────────────────────────
@@ -119,7 +121,7 @@ jobs:
       - name: Show state files
         run: |
           echo "::group::State files"
-          for f in auth_state.json comments_log.csv complaints_log.csv daily_report_log.csv scrape.log scrape_complaints.log scrape_daily.log; do
+          for f in auth_state.json comments_log.csv complaints_log.csv daily_report_log.csv roi_map.json scrape.log scrape_complaints.log scrape_daily.log; do
             if [ -f "$f" ]; then
               echo "[OK] $f -> $(wc -c < "$f") bytes"
             else
@@ -133,13 +135,13 @@ jobs:
           echo "::endgroup::"
 
           echo "::group::screens/ listing"
-          if [ -d screens ]; then ls -lah screens || true; else echo "no screens/"; fi
+          ls -lah screens || echo "no screens/"
           echo "::endgroup::"
 
       # ────────────────────────────────
-      # Upload artifacts for inspection
+      # Upload artifacts (includes ROI crops & overlay)
       # ────────────────────────────────
-      - name: Upload logs and state as artifact
+      - name: Upload logs, ROI, and screenshots
         if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -149,6 +151,7 @@ jobs:
             comments_log.csv
             complaints_log.csv
             daily_report_log.csv
+            roi_map.json
             scrape.log
             scrape_complaints.log
             scrape_daily.log
@@ -166,4 +169,5 @@ jobs:
             comments_log.csv
             complaints_log.csv
             daily_report_log.csv
+            roi_map.json
           key: scraper-state-${{ runner.os }}-v1-${{ github.run_id }}
