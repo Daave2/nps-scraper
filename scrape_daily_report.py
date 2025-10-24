@@ -19,7 +19,7 @@ import time
 import logging
 import configparser
 from pathlib import Path
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Optional
 
 import requests
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
@@ -45,7 +45,7 @@ DASHBOARD_URL = (
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s",
-    handlers=[logging.FileHandler(LOG_FILE_PATH),],
+    handlers=[logging.FileHandler(LOG_FILE_PATH)],
 )
 logger = logging.getLogger("daily")
 
@@ -203,7 +203,6 @@ def parse_metrics(text: str) -> Dict[str, str]:
     )
 
     # Sales (Total row)
-    # We try to capture "Total" row: value, LFL, vs Target
     sales_total = _search_first(
         [
             r"Total\s*\n\s*([£]?[0-9.,]+[KMB]?)\s*\n\s*([+-]?\d+%?)\s*\n\s*([+-]?[£]?[0-9.,]+[KMB]?)"
@@ -212,7 +211,6 @@ def parse_metrics(text: str) -> Dict[str, str]:
         flags=re.I,
     )
     if sales_total != "—":
-        # If successful, split components back out
         m = re.search(
             r"Total\s*\n\s*([£]?[0-9.,]+[KMB]?)\s*\n\s*([+-]?\d+%?)\s*\n\s*([+-]?[£]?[0-9.,]+[KMB]?)",
             text,
@@ -223,7 +221,6 @@ def parse_metrics(text: str) -> Dict[str, str]:
             out["sales_lfl"] = _num(m.group(2))
             out["sales_vs_target"] = _num(m.group(3))
     else:
-        # Fallback: find a line that looks like the 465.1K / 5% / -2.7K near "Sales"
         m = re.search(
             r"Sales.*?\b([£]?[0-9.,]+[KMB]?)\b.*?\b([+-]?\d+%)\b.*?\b([+-]?[£]?[0-9.,]+[KMB]?)\b",
             text,
@@ -236,7 +233,7 @@ def parse_metrics(text: str) -> Dict[str, str]:
         else:
             out["sales_total"] = out["sales_lfl"] = out["sales_vs_target"] = "—"
 
-    # NPS tiles (big dials often show a single number)
+    # NPS tiles
     out["supermarket_nps"] = _search_first([r"\bSupermarket NPS\b.*?\b(-?\d+)\b"], text, flags=re.I | re.S)
     out["colleague_happiness"] = _search_first([r"\bColleague Happiness\b.*?\b(-?\d+)\b"], text, flags=re.I | re.S)
     out["home_delivery_nps"] = _search_first([r"\bHome Delivery NPS\b.*?\b(-?\d+)\b"], text, flags=re.I | re.S)
@@ -261,13 +258,6 @@ def parse_metrics(text: str) -> Dict[str, str]:
     out["cc_avg_wait"] = _search_first([r"\bClick\s*&\s*Collect average wait\b\s*([0-9]{2}:[0-9]{2})"], text, flags=re.I)
 
     # Waste & Markdowns (Total row)
-    # Expect:
-    #   Total
-    #   2.9K
-    #   3K
-    #   5.9K
-    #   -1.2K
-    #   -25.69%
     m = re.search(
         r"Waste\s*&\s*Markdowns.*?Total\s*\n\s*([£]?[0-9.,]+[KMB]?)\s*\n\s*([£]?[0-9.,]+[KMB]?)\s*\n\s*([£]?[0-9.,]+[KMB]?)\s*\n\s*([+-]?[£]?[0-9.,]+[KMB]?)\s*\n\s*([+-]?\d+\.?\d*%)",
         text,
@@ -282,7 +272,7 @@ def parse_metrics(text: str) -> Dict[str, str]:
     else:
         out.update({k: "—" for k in ["waste_total", "markdowns_total", "wm_total", "wm_delta", "wm_delta_pct"]})
 
-    # Shrink (circle row of KPIs)
+    # Shrink
     out["moa"] = _search_first([r"\bMorrisons Order Adjustments\b\s*([£]?-?[0-9.,]+[KMB]?)"], text, flags=re.I)
     out["waste_validation"] = _search_first([r"\bWaste Validation\b\s*([0-9]+%)"], text, flags=re.I)
     out["unrecorded_waste_pct"] = _search_first([r"\bUnrecorded Waste %\b\s*([+-]?\d+\.?\d*%)"], text, flags=re.I)
@@ -301,7 +291,7 @@ def parse_metrics(text: str) -> Dict[str, str]:
     out["new_customers"] = _search_first([r"\bNew Customers\b\s*([0-9]+)"], text, flags=re.I)
     out["swipes_yoy_pct"] = _search_first([r"\bSwipes YOY %\b\s*([+-]?\d+%)"], text, flags=re.I)
 
-    # Production Planning
+    # Production Planning / Misc
     out["data_provided"] = _search_first([r"\bData Provided\b\s*([0-9]+%)"], text, flags=re.I)
     out["trusted_data"] = _search_first([r"\bTrusted Data\b\s*([0-9]+%)"], text, flags=re.I)
 
@@ -313,24 +303,33 @@ def parse_metrics(text: str) -> Dict[str, str]:
     return out
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Card builder + sender
+# Card builder + sender  (fixed for Google Chat Cards V2)
 # ──────────────────────────────────────────────────────────────────────────────
 def build_chat_card(metrics: Dict[str, str]) -> dict:
-    title_date = metrics.get("page_timestamp", "Today")
-    subtitle = metrics.get("store_line", "").replace("\n", "  ")
+    # Card-level header (valid in Cards V2)
+    card_header = {
+        "title": "📊 Retail Daily Summary",
+        "subtitle": (metrics.get("store_line") or "").replace("\n", "  "),
+    }
+
+    def title_widget(text: str) -> dict:
+        # A bold section title rendered as a textParagraph
+        return {"textParagraph": {"text": f"<b>{text}</b>"}}
 
     def kv(label: str, val: str) -> dict:
-        return {"decoratedText": {"topLabel": label, "text": val if val else "—"}}
+        # Use decoratedText for compact label/value rows
+        return {"decoratedText": {"topLabel": label, "text": (val or "—")}}
 
     sections = [
         {
-            "header": {"title": f"Retail Daily Summary — {title_date}", "subtitle": subtitle},
-            "widgets": []
+            "widgets": [
+                kv("Report Time", metrics.get("page_timestamp", "—")),
+                kv("Period", metrics.get("period_range", "—")),
+            ]
         },
         {
-            "header": {"title": "Sales & NPS"},
             "widgets": [
-                kv("Period", metrics.get("period_range", "—")),
+                title_widget("Sales & NPS"),
                 kv("Sales Total", metrics.get("sales_total", "—")),
                 kv("LFL", metrics.get("sales_lfl", "—")),
                 kv("vs Target", metrics.get("sales_vs_target", "—")),
@@ -340,59 +339,59 @@ def build_chat_card(metrics: Dict[str, str]) -> dict:
                 kv("Cafe NPS", metrics.get("cafe_nps", "—")),
                 kv("Click & Collect NPS", metrics.get("click_collect_nps", "—")),
                 kv("Customer Toilet NPS", metrics.get("customer_toilet_nps", "—")),
-            ],
+            ]
         },
         {
-            "header": {"title": "Front End Service"},
             "widgets": [
+                title_widget("Front End Service"),
                 kv("SCO Utilisation", metrics.get("sco_utilisation", "—")),
                 kv("Efficiency", metrics.get("efficiency", "—")),
                 kv("Scan Rate", f"{metrics.get('scan_rate','—')} (vs {metrics.get('scan_vs_target','—')})"),
                 kv("Interventions", f"{metrics.get('interventions','—')} (vs {metrics.get('interventions_vs_target','—')})"),
                 kv("Mainbank Closed", f"{metrics.get('mainbank_closed','—')} (vs {metrics.get('mainbank_vs_target','—')})"),
-            ],
+            ]
         },
         {
-            "header": {"title": "Online"},
             "widgets": [
+                title_widget("Online"),
                 kv("Availability", metrics.get("availability_pct", "—")),
                 kv("Despatched on Time", metrics.get("despatched_on_time", "—")),
                 kv("Delivered on Time", metrics.get("delivered_on_time", "—")),
                 kv("Click & Collect Avg Wait", metrics.get("cc_avg_wait", "—")),
-            ],
+            ]
         },
         {
-            "header": {"title": "Waste & Markdowns (Total)"},
             "widgets": [
+                title_widget("Waste & Markdowns (Total)"),
                 kv("Waste", metrics.get("waste_total", "—")),
                 kv("Markdowns", metrics.get("markdowns_total", "—")),
                 kv("Total", metrics.get("wm_total", "—")),
                 kv("+/−", metrics.get("wm_delta", "—")),
                 kv("+/− %", metrics.get("wm_delta_pct", "—")),
-            ],
+            ]
         },
         {
-            "header": {"title": "Payroll"},
             "widgets": [
+                title_widget("Payroll"),
                 kv("Payroll Outturn", metrics.get("payroll_outturn", "—")),
                 kv("Absence Outturn", metrics.get("absence_outturn", "—")),
                 kv("Productive Outturn", metrics.get("productive_outturn", "—")),
                 kv("Holiday Outturn", metrics.get("holiday_outturn", "—")),
                 kv("Current Base Cost", metrics.get("current_base_cost", "—")),
-            ],
+            ]
         },
         {
-            "header": {"title": "Shrink"},
             "widgets": [
+                title_widget("Shrink"),
                 kv("Morrisons Order Adjustments", metrics.get("moa", "—")),
                 kv("Waste Validation", metrics.get("waste_validation", "—")),
                 kv("Unrecorded Waste %", metrics.get("unrecorded_waste_pct", "—")),
                 kv("Shrink vs Budget %", metrics.get("shrink_vs_budget_pct", "—")),
-            ],
+            ]
         },
         {
-            "header": {"title": "Card Engagement & Misc"},
             "widgets": [
+                title_widget("Card Engagement & Misc"),
                 kv("Swipe Rate", metrics.get("swipe_rate", "—")),
                 kv("Swipes WOW %", metrics.get("swipes_wow_pct", "—")),
                 kv("New Customers", metrics.get("new_customers", "—")),
@@ -402,11 +401,21 @@ def build_chat_card(metrics: Dict[str, str]) -> dict:
                 kv("Trusted Data", metrics.get("trusted_data", "—")),
                 kv("My Reports", metrics.get("my_reports", "—")),
                 kv("Weekly Activity %", metrics.get("weekly_activity", "—")),
-            ],
+            ]
         },
     ]
 
-    return {"cardsV2": [{"cardId": f"daily_{int(time.time())}", "card": {"sections": sections}}]}
+    return {
+        "cardsV2": [
+            {
+                "cardId": f"daily_{int(time.time())}",
+                "card": {
+                    "header": card_header,
+                    "sections": sections,
+                },
+            }
+        ]
+    }
 
 def send_daily_card(metrics: Dict[str, str]) -> bool:
     if not MAIN_WEBHOOK or "chat.googleapis.com" not in MAIN_WEBHOOK:
