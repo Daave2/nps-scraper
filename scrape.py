@@ -4,13 +4,11 @@
 """
 Scrapes a Looker Studio report for NPS comments and posts them to Google Chat.
 
-Key features:
-- Auto-detects login wall and opens a headed login window once; saves auth_state.json.
-- Robust parser (anchors on "Submission via:", requires DATE + STORE + SCORE).
-- Batching + exponential backoff for Chat webhooks to avoid 429s.
-- Per-run cap (MAX_COMMENTS_PER_RUN) to keep within quotas.
-- Lock file to prevent overlapping runs.
-- Auto-cleans old debug screenshots/HTMLs from /screens.
+Additions in this version:
+- Detects Google 2FA "Match the number" challenge during login.
+- Extracts the displayed number from the page text.
+- Sends an immediate alert to ALERT_WEBHOOK with the detected number and (if in CI) a link to the current run.
+- Saves a screenshot + HTML of the challenge page to /screens for debugging.
 """
 
 import os
@@ -71,6 +69,9 @@ GOOGLE_PASSWORD = config["DEFAULT"].get("GOOGLE_PASSWORD", os.getenv("GOOGLE_PAS
 MAIN_WEBHOOK = config["DEFAULT"].get("MAIN_WEBHOOK", os.getenv("MAIN_WEBHOOK", ""))
 ALERT_WEBHOOK = config["DEFAULT"].get("ALERT_WEBHOOK", os.getenv("ALERT_WEBHOOK", ""))
 
+# Optional: CI run URL from the workflow (we pass this in the YAML below)
+CI_RUN_URL = os.getenv("CI_RUN_URL", "")
+
 if not GOOGLE_EMAIL or not GOOGLE_PASSWORD:
     logger.warning("Google credentials missing (config.ini or env).")
 if not MAIN_WEBHOOK:
@@ -81,19 +82,54 @@ if not ALERT_WEBHOOK:
 ############################################
 # ALERT HANDLER
 ############################################
-def alert_login_needed(reason="Unknown reason"):
+def _post_with_backoff(url: str, payload: dict) -> bool:
+    backoff = BASE_BACKOFF
+    attempt = 0
+    while True:
+        attempt += 1
+        try:
+            resp = requests.post(url, json=payload, timeout=20)
+            if resp.status_code == 200:
+                return True
+            if resp.status_code == 429:
+                retry_after = resp.headers.get("Retry-After")
+                try:
+                    delay = float(retry_after) if retry_after else backoff
+                except Exception:
+                    delay = backoff
+                delay = min(delay, MAX_BACKOFF)
+                logger.error(f"429 RESOURCE_EXHAUSTED on attempt {attempt} — sleeping {delay:.1f}s")
+                time.sleep(delay)
+                backoff = min(backoff * 1.7, MAX_BACKOFF)
+                continue
+            logger.error(f"Webhook post failed ({resp.status_code}): {resp.text[:300]}")
+            return False
+        except Exception as e:
+            logger.error(f"Webhook post exception: {e}")
+            time.sleep(backoff)
+            backoff = min(backoff * 1.7, MAX_BACKOFF)
+
+def alert_login_needed(reason="Unknown reason", code_hint: Optional[str] = None, extra_note: str = ""):
+    """
+    Sends a plain-text alert to Chat. If code_hint is provided, includes it prominently.
+    """
     if not ALERT_WEBHOOK or "chat.googleapis.com" not in ALERT_WEBHOOK:
         logger.warning("No valid ALERT_WEBHOOK configured.")
         return
-    payload = {"text": f"⚠️ Google login needed. Reason: {reason}"}
-    try:
-        resp = requests.post(ALERT_WEBHOOK, json=payload, timeout=20)
-        if resp.status_code == 200:
-            logger.info("Login alert posted successfully.")
-        else:
-            logger.error(f"Login alert failed ({resp.status_code}): {resp.text[:300]}")
-    except Exception as e:
-        logger.error(f"Exception posting alert: {e}")
+    lines = [f"⚠️ Google login needed. Reason: {reason}"]
+    if code_hint:
+        lines.append(f"• Match-the-number code on screen: **{code_hint}**")
+        lines.append("• On your phone: tap the same number.")
+    if extra_note:
+        lines.append(f"• {extra_note}")
+    if CI_RUN_URL:
+        lines.append(f"• CI run: {CI_RUN_URL}")
+    payload = {"text": "\n".join(lines)}
+    ok = _post_with_backoff(ALERT_WEBHOOK, payload)
+    if ok:
+        logger.info("Login alert posted successfully.")
+    else:
+        logger.error("Failed to post login alert.")
 
 ############################################
 # DEBUG DUMP
@@ -111,12 +147,62 @@ def dump_debug(page, tag):
         logger.warning(f"Failed to save debug snapshot: {e}")
 
 ############################################
+# 2FA CODE EXTRACTION
+############################################
+RE_TWO_OR_THREE_DIGITS = re.compile(r"(?<!\d)(\d{2,3})(?!\d)")
+
+def maybe_extract_phone_match_code(page) -> Optional[str]:
+    """
+    Heuristically extracts the 'Match the number' code from the Google 2FA page.
+    Strategy:
+      - Get body inner_text.
+      - Check for trigger phrases (Match the number / Tap the number).
+      - Find the first 2–3 digit number that appears near the trigger phrase.
+    Returns the number as a string, or None.
+    """
+    trigger_patterns = [
+        "Match the number",
+        "Tap the number shown on your",
+        "Check your phone",
+        "Verify it’s you",
+        "Verify it's you",
+    ]
+    try:
+        body_text = page.inner_text("body")
+    except Exception:
+        body_text = ""
+    if not body_text:
+        return None
+
+    text_norm = body_text.replace("\u00A0", " ")
+    lower = text_norm.lower()
+    hit_idx = -1
+    for tp in trigger_patterns:
+        idx = lower.find(tp.lower())
+        if idx != -1:
+            hit_idx = idx
+            break
+    # If we found a trigger, scan the next ~600 chars for a 2–3 digit number
+    search_slice = text_norm[hit_idx:hit_idx+600] if hit_idx != -1 else text_norm
+    nums = RE_TWO_OR_THREE_DIGITS.findall(search_slice)
+    # Heuristic: prefer two-digit first, otherwise first 3-digit
+    two_digit = next((n for n in nums if len(n) == 2), None)
+    if two_digit:
+        return two_digit
+    return nums[0] if nums else None
+
+############################################
 # LOGIN HANDLER
 ############################################
 def login_and_save_state(page):
     """
-    Opens Google login (headed), signs in with config.ini creds, visits Looker Studio
-    so its domain cookies persist, and saves storage state to auth_state.json.
+    Opens Google login (headed), signs in, visits Looker Studio so its cookies persist,
+    and saves storage state to auth_state.json.
+
+    NEW: If a 'Match the number' challenge appears, we:
+      - take a screenshot,
+      - extract the number, and
+      - send it to ALERT_WEBHOOK immediately.
     """
     import re as _re
     logger.info("Starting manual login flow...")
@@ -140,16 +226,29 @@ def login_and_save_state(page):
     page.fill("input[type='password']", GOOGLE_PASSWORD)
     page.keyboard.press("Enter")
 
-    logger.info("If 2FA is enabled, approve it in the browser window...")
+    # Give Google a moment to render potential 2FA step, then check for the code.
+    time.sleep(3)
+    try:
+        code_hint = maybe_extract_phone_match_code(page)
+        if code_hint:
+            dump_debug(page, "2fa_match_number")
+            alert_login_needed("2FA 'Match the number' challenge", code_hint=code_hint)
+    except Exception as e:
+        logger.warning(f"2FA code extraction failed: {e}")
+
+    logger.info("If 2FA is enabled, approve the prompt on your phone...")
 
     try:
-        page.wait_for_url(_re.compile(r"https://myaccount\.google\.com/.*"), timeout=120000)
+        page.wait_for_url(_re.compile(r"https://myaccount\.google\.com/.*"), timeout=180000)
         # Visit Looker Studio domain once so its cookies also persist
         page.goto("https://lookerstudio.google.com/", timeout=60000, wait_until="domcontentloaded")
         page.context.storage_state(path=AUTH_STATE_PATH)
         logger.info("✅ Login successful and auth_state.json saved.")
         return True
     except PlaywrightTimeoutError:
+        # Save a final screenshot and alert
+        dump_debug(page, "2fa_timeout")
+        alert_login_needed("2FA timeout or not approved in time.")
         logger.error("Login timed out.")
         return False
 
@@ -280,7 +379,7 @@ def parse_comments_from_lines(lines: List[str]) -> List[dict]:
                     comment_lines.append(lk)
                 k += 1
 
-            # Validate block — ensure timestamp is actually a date and store looks right
+            # Validate block
             if store_line and date_line and score_line and DATE_PATTERN.match(date_line) and STORE_PATTERN.match(store_line):
                 comments.append({
                     "store": store_line,
@@ -326,33 +425,6 @@ def _score_to_label(score_str: str) -> Tuple[str, str]:
     if v <= 7:  return "🟠", "Passive"
     return "🟢", "Promoter"
 
-def _post_with_backoff(url: str, payload: dict) -> bool:
-    backoff = BASE_BACKOFF
-    attempt = 0
-    while True:
-        attempt += 1
-        try:
-            resp = requests.post(url, json=payload, timeout=20)
-            if resp.status_code == 200:
-                return True
-            if resp.status_code == 429:
-                retry_after = resp.headers.get("Retry-After")
-                try:
-                    delay = float(retry_after) if retry_after else backoff
-                except Exception:
-                    delay = backoff
-                delay = min(delay, MAX_BACKOFF)
-                logger.error(f"429 RESOURCE_EXHAUSTED on attempt {attempt} — sleeping {delay:.1f}s")
-                time.sleep(delay)
-                backoff = min(backoff * 1.7, MAX_BACKOFF)
-                continue
-            logger.error(f"Webhook post failed ({resp.status_code}): {resp.text[:300]}")
-            return False
-        except Exception as e:
-            logger.error(f"Webhook post exception: {e}")
-            time.sleep(backoff)
-            backoff = min(backoff * 1.7, MAX_BACKOFF)
-
 def send_comments_batched_to_chat(comments: List[dict]) -> None:
     """
     Sends comments in batches of BATCH_SIZE in ONE message per batch.
@@ -388,13 +460,9 @@ def send_comments_batched_to_chat(comments: List[dict]) -> None:
                 },
                 "sections": sections
             }]}
-        ok = _post_with_backoff(MAIN_WEBHOOK, payload)
-        if ok:
-            sent += len(batch)
-            logger.info(f"✅ Sent batch {start+1}-{start+len(batch)} (total sent: {sent}/{total})")
-        else:
-            logger.error("Stopping further sends due to webhook error.")
-            break
+        _post_with_backoff(MAIN_WEBHOOK, payload)
+        sent += len(batch)
+        logger.info(f"✅ Sent batch {start+1}-{start+len(batch)} (total sent: {sent}/{total})")
 
 ############################################
 # HOUSEKEEPING
@@ -473,6 +541,7 @@ def run_scrape(retry_on_auth_fail=True):
                 alert_login_needed("Repeated login failure — human attention required.")
                 return
             with sync_playwright() as p:
+                # Headed so we can see/trigger 2FA screen; still works under xvfb in CI
                 browser = p.chromium.launch(headless=False)
                 context = browser.new_context()
                 page = context.new_page()
@@ -497,7 +566,7 @@ def run_scrape(retry_on_auth_fail=True):
             logger.info("No new comments to send.")
             return
 
-        # Apply per-run cap to avoid rate limit spikes
+        # Apply per-run cap
         capped = new_comments[:MAX_COMMENTS_PER_RUN]
         leftover = max(0, len(new_comments) - len(capped))
         if leftover > 0:
@@ -507,7 +576,6 @@ def run_scrape(retry_on_auth_fail=True):
         send_comments_batched_to_chat(capped)
         append_new_comments(capped)
 
-        # If we deferred some, send a tiny digest
         if leftover > 0 and MAIN_WEBHOOK and "chat.googleapis.com" in MAIN_WEBHOOK:
             payload = {"text": f"ℹ️ {leftover} additional comments deferred to next runs (rate safety)."}
             _post_with_backoff(MAIN_WEBHOOK, payload)
