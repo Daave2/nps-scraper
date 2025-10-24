@@ -2,13 +2,14 @@ name: Looker Studio Scrapers
 
 on:
   schedule:
-    # London 08:15, 11:15, 14:15, 17:15, 20:15 (cron is UTC)
+    # London 08:10, 08:15, 11:10, 11:15, 14:10, 14:15, 17:10, 17:15, 20:10, 20:15 (cron is UTC)
+    - cron: "10 7,10,13,16,19 * * *"
     - cron: "15 7,10,13,16,19 * * *"
   workflow_dispatch:
 
 jobs:
   scrape:
-    name: Run NPS + Complaints Scrapers
+    name: Run NPS + Complaints + Daily
     runs-on: ubuntu-latest
     timeout-minutes: 40
     concurrency:
@@ -27,7 +28,7 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install playwright schedule requests configparser
+          pip install playwright schedule requests configparser pytz
           python -m playwright install --with-deps chromium
 
       # ========= RESTORE STATE (unique primary key, prefix restore) =========
@@ -39,6 +40,7 @@ jobs:
             auth_state.json
             comments_log.csv
             complaints_log.csv
+            daily_report_log.csv
           key: scraper-state-${{ runner.os }}-v1-${{ github.run_id }}
           restore-keys: |
             scraper-state-${{ runner.os }}-v1-
@@ -67,26 +69,28 @@ jobs:
             echo "COMPLAINTS_WEBHOOK=${{ secrets.COMPLAINTS_WEBHOOK }}"
           } > config.ini
 
-      # ========= RUN NPS SCRAPER =========
+      # ========= RUN SCRAPERS =========
       - name: Run NPS scraper
         env:
           CI_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-        run: |
-          xvfb-run -a python scrape.py now || true
+        run: xvfb-run -a python scrape.py now || true
 
-      # ========= RUN COMPLAINTS SCRAPER =========
       - name: Run Complaints scraper
         env:
           CI_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-        run: |
-          xvfb-run -a python scrape_complaints.py now || true
+        run: xvfb-run -a python scrape_complaints.py now || true
+
+      - name: Run Daily Dashboard scraper
+        env:
+          CI_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: xvfb-run -a python scrape_daily_report.py || true
 
       # ========= STATE SUMMARY =========
       - name: Display state summary
         if: always()
         run: |
           echo "::group::State files"
-          for f in auth_state.json comments_log.csv complaints_log.csv scrape.log scrape_complaints.log; do
+          for f in auth_state.json comments_log.csv complaints_log.csv daily_report_log.csv scrape.log scrape_complaints.log scrape_daily.log; do
             if [ -f "$f" ]; then
               echo "[OK] $f -> $(wc -c < "$f") bytes"
             else
@@ -94,11 +98,8 @@ jobs:
             fi
           done
           echo "::endgroup::"
-          echo "::group::comments_log.csv (last 10)"
-          if [ -f comments_log.csv ]; then tail -n 10 comments_log.csv || true; else echo "comments_log.csv not found"; fi
-          echo "::endgroup::"
-          echo "::group::complaints_log.csv (last 10)"
-          if [ -f complaints_log.csv ]; then tail -n 10 complaints_log.csv || true; else echo "complaints_log.csv not found"; fi
+          echo "::group::daily_report_log.csv (last 5)"
+          if [ -f daily_report_log.csv ]; then tail -n 5 daily_report_log.csv || true; else echo "daily_report_log.csv not found"; fi
           echo "::endgroup::"
           echo "::group::screens/ listing"
           ls -lah screens || echo "no screens/"
@@ -114,8 +115,10 @@ jobs:
             auth_state.json
             comments_log.csv
             complaints_log.csv
+            daily_report_log.csv
             scrape.log
             scrape_complaints.log
+            scrape_daily.log
             screens/
           if-no-files-found: ignore
           retention-days: 7
@@ -129,4 +132,5 @@ jobs:
             auth_state.json
             comments_log.csv
             complaints_log.csv
+            daily_report_log.csv
           key: scraper-state-${{ runner.os }}-v1-${{ github.run_id }}
