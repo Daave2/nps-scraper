@@ -3,13 +3,8 @@
 
 """
 Retail Performance Dashboard → Daily Summary → Google Chat
-
-Pulls as many metrics as possible from the Retail Performance Dashboard page and
-sends a single daily summary card. Also logs a CSV row for history.
-
-- Reuses the same Playwright auth_state.json (shared Google login)
-- Extracts values with robust regexes + table-aware snippets
-- Emits ALL sections even if some values are missing (shown as "—")
+Block-scoped parsing + tile-aware extraction to avoid picking up “Target” values.
+Keeps CSV schema and Chat card from your previous version.
 """
 
 import os
@@ -19,7 +14,7 @@ import time
 import logging
 import configparser
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import requests
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
@@ -48,25 +43,17 @@ logging.basicConfig(
     handlers=[logging.FileHandler(LOG_FILE_PATH)],
 )
 logger = logging.getLogger("daily")
-
-# Also echo to stdout in CI/local
-stdout_handler = logging.StreamHandler()
-stdout_handler.setLevel(logging.INFO)
-stdout_handler.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(message)s"))
-logger.addHandler(stdout_handler)
+logger.addHandler(logging.StreamHandler())
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Config (file first, env fallback)
+# Config
 # ──────────────────────────────────────────────────────────────────────────────
 config = configparser.ConfigParser()
 config.read(BASE_DIR / "config.ini")
 
 MAIN_WEBHOOK   = config["DEFAULT"].get("MAIN_WEBHOOK",   os.getenv("MAIN_WEBHOOK", ""))
 ALERT_WEBHOOK  = config["DEFAULT"].get("ALERT_WEBHOOK",  os.getenv("ALERT_WEBHOOK", ""))
-GOOGLE_EMAIL   = config["DEFAULT"].get("GOOGLE_EMAIL",   os.getenv("GOOGLE_EMAIL", ""))
-GOOGLE_PASSWORD= config["DEFAULT"].get("GOOGLE_PASSWORD",os.getenv("GOOGLE_PASSWORD", ""))
-
-CI_RUN_URL = os.getenv("CI_RUN_URL", "")
+CI_RUN_URL     = os.getenv("CI_RUN_URL", "")
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Helpers (Chat + debug)
@@ -79,17 +66,15 @@ def _post_with_backoff(url: str, payload: dict) -> bool:
             if r.status_code == 200:
                 return True
             if r.status_code == 429:
-                delay = min(float(r.headers.get("Retry-After", backoff)), max_backoff)
+                delay = min(float(r.headers.get("Retry-After", backoff) or backoff), max_backoff)
                 logger.error(f"429 from webhook — sleeping {delay:.1f}s")
-                time.sleep(delay)
-                backoff = min(backoff * 1.7, max_backoff)
+                time.sleep(delay); backoff = min(backoff * 1.7, max_backoff)
                 continue
             logger.error(f"Webhook error {r.status_code}: {r.text[:300]}")
             return False
         except Exception as e:
             logger.error(f"Webhook exception: {e}")
-            time.sleep(backoff)
-            backoff = min(backoff * 1.7, max_backoff)
+            time.sleep(backoff); backoff = min(backoff * 1.7, max_backoff)
 
 def alert(lines: List[str]):
     if not ALERT_WEBHOOK or "chat.googleapis.com" not in ALERT_WEBHOOK:
@@ -103,11 +88,9 @@ def dump_debug(page, tag: str):
     try:
         ts = int(time.time())
         SCREENS_DIR.mkdir(parents=True, exist_ok=True)
-        png = SCREENS_DIR / f"{ts}_{tag}.png"
-        html = SCREENS_DIR / f"{ts}_{tag}.html"
-        page.screenshot(path=str(png), full_page=True)
-        html.write_text(page.content(), encoding="utf-8")
-        logger.info(f"Saved debug snapshot → {png.name}, {html.name}")
+        (SCREENS_DIR / f"{ts}_{tag}.png").write_bytes(page.screenshot(full_page=True))
+        (SCREENS_DIR / f"{ts}_{tag}.html").write_text(page.content(), encoding="utf-8")
+        logger.info(f"Saved debug snapshot → {ts}_{tag}.png/.html")
     except Exception:
         pass
 
@@ -127,21 +110,18 @@ def fetch_text_from_dashboard(page, url: str) -> Optional[str]:
         logger.warning("Redirected to login — auth state missing/invalid.")
         return None
 
-    # Give charts/frames time to render some text
     logger.info("Waiting 15s for dynamic content…")
     page.wait_for_timeout(15_000)
 
-    # Try page body first
     text = ""
     try:
         text = page.inner_text("body")
     except Exception:
         pass
 
-    # If very short, dive into frames and pick the longest meaningful text
-    if not text or len(text) < 200:
-        best = text
-        best_len = len(best) if best else 0
+    # Dive into frames for the longest text if body is short
+    if not text or len(text) < 400:
+        best = text; best_len = len(best) if best else 0
         for fr in page.frames:
             try:
                 fr.wait_for_selector("body", timeout=5_000)
@@ -165,9 +145,19 @@ def fetch_text_from_dashboard(page, url: str) -> Optional[str]:
     return text
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Parsing utilities
+# Parsing utilities (block-scoped + tile-aware)
 # ──────────────────────────────────────────────────────────────────────────────
-def _search_first(patterns: List[str], text: str, flags=0, group: int = 1) -> str:
+def _block(text: str, start: str, ends: List[str]) -> str:
+    """Slice text from first occurrence of `start` to the earliest next end marker."""
+    s = text.find(start)
+    if s == -1:
+        return ""
+    e_candidates = [text.find(end, s + len(start)) for end in ends]
+    e_candidates = [e for e in e_candidates if e != -1]
+    e = min(e_candidates) if e_candidates else len(text)
+    return text[s:e]
+
+def _search_first(patterns: List[str], text: str, flags=0, group: int = 1, default="—") -> str:
     for pat in patterns:
         m = re.search(pat, text, flags)
         if m:
@@ -175,247 +165,206 @@ def _search_first(patterns: List[str], text: str, flags=0, group: int = 1) -> st
                 return m.group(group).strip()
             except Exception:
                 return m.group(0).strip()
+    return default
+
+def _tile_value(page_text: str, label: str) -> str:
+    """
+    From the first occurrence of `label`, look ahead a small window and return the
+    first token that looks like a number or '—' BEFORE we hit 'Target:' or another tile.
+    """
+    idx = page_text.find(label)
+    if idx == -1:
+        return "—"
+    window = page_text[idx: idx + 400]  # small local window
+    # Prefer a number or '—' that is followed by a line containing 'NPS' (the dial caption),
+    # and make sure 'Target' is not between label and the value we pick.
+    lines = window.splitlines()
+    seen_label = False
+    for i, line in enumerate(lines[:20]):
+        if not seen_label:
+            if label in line:
+                seen_label = True
+            continue
+        # stop if we run into 'Target'
+        if "Target" in line:
+            break
+        token = line.strip()
+        if token in ("—", "-", "–"):
+            return "—"
+        if re.fullmatch(r"-?\d{1,3}", token):
+            # ensure next few lines include 'NPS' (the dial caption), which confirms it's the tile value
+            tail = "\n".join(lines[i:i+5])
+            if "NPS" in tail:
+                return token
     return "—"
 
-def _num(text: str) -> str:
-    # compact normaliser for tokens like 465.1K / -1.4K / 83% / 07:57
-    return text.strip()
-
 def parse_metrics(text: str) -> Dict[str, str]:
-    """
-    Pulls as many values as possible from the dashboard text.
-    Returns a flat dict of metric -> string value. Missing = "—".
-    """
     out: Dict[str, str] = {}
 
-    # Header context / period
-    out["period_range"] = _search_first(
-        [r"The data on this report is from:\s*([^\n]+)"], text
-    )
-    out["page_timestamp"] = _search_first(
-        [r"\b(\d{1,2}\s+[A-Za-z]{3}\s+\d{4},\s*\d{2}:\d{2}:\d{2})\b"], text
-    )
+    # Global context
+    out["period_range"] = _search_first([r"The data on this report is from:\s*([^\n]+)"], text)
+    out["page_timestamp"] = _search_first([r"\b(\d{1,2}\s+[A-Za-z]{3}\s+\d{4},\s*\d{2}:\d{2}:\d{2})\b"], text)
     out["store_line"] = _search_first(
         [r"([A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}).*?(\|\s*.+?\s*\|\s*\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})"],
-        text,
-        flags=re.S,
-        group=0,
+        text, flags=re.S, group=0
     )
 
-    # Sales (Total row)
-    sales_total = _search_first(
-        [
-            r"Total\s*\n\s*([£]?[0-9.,]+[KMB]?)\s*\n\s*([+-]?\d+%?)\s*\n\s*([+-]?[£]?[0-9.,]+[KMB]?)"
-        ],
-        text,
-        flags=re.I,
-    )
-    if sales_total != "—":
+    # ── Sales block
+    sales_b = _block(text, "Sales", ["Waste & Markdowns", "Colleague Happiness", "Payroll"])
+    if sales_b:
         m = re.search(
             r"Total\s*\n\s*([£]?[0-9.,]+[KMB]?)\s*\n\s*([+-]?\d+%?)\s*\n\s*([+-]?[£]?[0-9.,]+[KMB]?)",
-            text,
-            flags=re.I,
+            sales_b, flags=re.I
         )
         if m:
-            out["sales_total"] = _num(m.group(1))
-            out["sales_lfl"] = _num(m.group(2))
-            out["sales_vs_target"] = _num(m.group(3))
-    else:
-        m = re.search(
-            r"Sales.*?\b([£]?[0-9.,]+[KMB]?)\b.*?\b([+-]?\d+%)\b.*?\b([+-]?[£]?[0-9.,]+[KMB]?)\b",
-            text,
-            flags=re.I | re.S,
-        )
-        if m:
-            out["sales_total"] = _num(m.group(1))
-            out["sales_lfl"] = _num(m.group(2))
-            out["sales_vs_target"] = _num(m.group(3))
+            out["sales_total"], out["sales_lfl"], out["sales_vs_target"] = m.group(1).strip(), m.group(2).strip(), m.group(3).strip()
         else:
             out["sales_total"] = out["sales_lfl"] = out["sales_vs_target"] = "—"
+    else:
+        out["sales_total"] = out["sales_lfl"] = out["sales_vs_target"] = "—"
 
-    # NPS tiles
-    out["supermarket_nps"] = _search_first([r"\bSupermarket NPS\b.*?\b(-?\d+)\b"], text, flags=re.I | re.S)
-    out["colleague_happiness"] = _search_first([r"\bColleague Happiness\b.*?\b(-?\d+)\b"], text, flags=re.I | re.S)
-    out["home_delivery_nps"] = _search_first([r"\bHome Delivery NPS\b.*?\b(-?\d+)\b"], text, flags=re.I | re.S)
-    out["cafe_nps"] = _search_first([r"\bCafe NPS\b.*?\b(-?\d+)\b"], text, flags=re.I | re.S)
-    out["click_collect_nps"] = _search_first([r"\bClick\s*&\s*Collect NPS\b.*?\b(-?\d+)\b"], text, flags=re.I | re.S)
-    out["customer_toilet_nps"] = _search_first([r"\bCustomer Toilet NPS\b.*?\b(-?\d+)\b"], text, flags=re.I | re.S)
+    # ── NPS / tiles (tile-aware so we don’t pick “Target”)
+    out["supermarket_nps"]   = _tile_value(text, "Supermarket NPS")
+    out["colleague_happiness"]= _tile_value(text, "Colleague Happiness")
+    out["home_delivery_nps"] = _tile_value(text, "Home Delivery NPS")
+    out["cafe_nps"]          = _tile_value(text, "Cafe NPS")
+    out["click_collect_nps"] = _tile_value(text, "Click & Collect NPS")
+    out["customer_toilet_nps"]= _tile_value(text, "Customer Toilet NPS")
 
-    # Front End Service
-    out["sco_utilisation"] = _search_first([r"\bSco Utilisation\b\s*([0-9]+%)"], text, flags=re.I)
-    out["efficiency"] = _search_first([r"\bEfficiency\b\s*([0-9]+%)"], text, flags=re.I)
-    out["scan_rate"] = _search_first([r"\bScan Rate\b\s*([0-9]+)"], text, flags=re.I)
-    out["scan_vs_target"] = _search_first([r"Scan Rate\s*[0-9]+\s*\n\s*vs Target\s*([+-]?[0-9.]+)"], text, flags=re.I)
-    out["interventions"] = _search_first([r"\bInterventions\b\s*([0-9]+)"], text, flags=re.I)
-    out["interventions_vs_target"] = _search_first([r"Interventions\s*[0-9]+\s*\n\s*vs Target\s*([+-]?[0-9.]+)"], text, flags=re.I)
-    out["mainbank_closed"] = _search_first([r"\bMainbank Closed\b\s*([0-9]+)"], text, flags=re.I)
-    out["mainbank_vs_target"] = _search_first([r"Mainbank Closed\s*[0-9]+\s*\n\s*vs Target\s*([+-]?[0-9.]+)"], text, flags=re.I)
+    # ── Front End Service block
+    fes_b = _block(text, "Front End Service", ["Production Planning", "More Card Engagement", "Stock Record NPS", "Privacy"])
+    out["sco_utilisation"] = _search_first([r"Sco Utilisation\s*\n\s*([0-9]+%)"], fes_b, flags=re.I)
+    out["efficiency"]      = _search_first([r"Efficiency\s*\n\s*([0-9]+%)"], fes_b, flags=re.I)
+    # metric + vs Target
+    m = re.search(r"Scan Rate\s*\n\s*([0-9]+)\s*\n\s*vs Target\s*\n\s*([+-]?[0-9.]+)", fes_b, flags=re.I)
+    out["scan_rate"], out["scan_vs_target"] = (m.group(1).strip(), m.group(2).strip()) if m else ("—", "—")
+    m = re.search(r"Interventions\s*\n\s*([0-9]+)\s*\n\s*vs Target\s*\n\s*([+-]?[0-9.]+)", fes_b, flags=re.I)
+    out["interventions"], out["interventions_vs_target"] = (m.group(1).strip(), m.group(2).strip()) if m else ("—", "—")
+    m = re.search(r"Mainbank Closed\s*\n\s*([0-9]+)\s*\n\s*vs Target\s*\n\s*([+-]?[0-9.]+)", fes_b, flags=re.I)
+    out["mainbank_closed"], out["mainbank_vs_target"] = (m.group(1).strip(), m.group(2).strip()) if m else ("—", "—")
 
-    # Online
-    out["availability_pct"] = _search_first([r"\bAvailability\b\s*([0-9]+%)"], text, flags=re.I)
-    out["despatched_on_time"] = _search_first([r"\bDespatched on Time\b\s*([0-9]+%|No data)"], text, flags=re.I)
-    out["delivered_on_time"] = _search_first([r"\bDelivered on Time\b\s*([0-9]+%|No data)"], text, flags=re.I)
-    out["cc_avg_wait"] = _search_first([r"\bClick\s*&\s*Collect average wait\b\s*([0-9]{2}:[0-9]{2})"], text, flags=re.I)
+    # ── Online block
+    online_b = _block(text, "Online", ["Front End Service", "Production Planning", "Privacy"])
+    out["availability_pct"]  = _search_first([r"Availability\s*\n\s*([0-9]+%)"], online_b, flags=re.I)
+    out["despatched_on_time"]= _search_first([r"Despatched on Time\s*\n\s*([0-9]+%|No data)"], online_b, flags=re.I)
+    out["delivered_on_time"] = _search_first([r"Delivered on Time\s*\n\s*([0-9]+%|No data)"], online_b, flags=re.I)
+    out["cc_avg_wait"]       = _search_first([r"Click\s*&\s*Collect average wait\s*\n\s*([0-9]{2}:[0-9]{2})"], online_b, flags=re.I)
 
-    # Waste & Markdowns (Total row)
+    # ── Waste & Markdowns block
+    wm_b = _block(text, "Waste & Markdowns", ["My Reports", "Clean & Rotate", "Payroll", "Online"])
     m = re.search(
-        r"Waste\s*&\s*Markdowns.*?Total\s*\n\s*([£]?[0-9.,]+[KMB]?)\s*\n\s*([£]?[0-9.,]+[KMB]?)\s*\n\s*([£]?[0-9.,]+[KMB]?)\s*\n\s*([+-]?[£]?[0-9.,]+[KMB]?)\s*\n\s*([+-]?\d+\.?\d*%)",
-        text,
-        flags=re.I | re.S,
+        r"Total\s*\n\s*([£]?[0-9.,]+[KMB]?)\s*\n\s*([£]?[0-9.,]+[KMB]?)\s*\n\s*([£]?[0-9.,]+[KMB]?)\s*\n\s*([+-]?[£]?[0-9.,]+[KMB]?)\s*\n\s*([+-]?\d+\.?\d*%)",
+        wm_b, flags=re.I
     )
     if m:
-        out["waste_total"] = _num(m.group(1))
-        out["markdowns_total"] = _num(m.group(2))
-        out["wm_total"] = _num(m.group(3))
-        out["wm_delta"] = _num(m.group(4))
-        out["wm_delta_pct"] = _num(m.group(5))
+        out["waste_total"], out["markdowns_total"], out["wm_total"], out["wm_delta"], out["wm_delta_pct"] = \
+            m.group(1).strip(), m.group(2).strip(), m.group(3).strip(), m.group(4).strip(), m.group(5).strip()
     else:
         out.update({k: "—" for k in ["waste_total", "markdowns_total", "wm_total", "wm_delta", "wm_delta_pct"]})
 
-    # Shrink
-    out["moa"] = _search_first([r"\bMorrisons Order Adjustments\b\s*([£]?-?[0-9.,]+[KMB]?)"], text, flags=re.I)
-    out["waste_validation"] = _search_first([r"\bWaste Validation\b\s*([0-9]+%)"], text, flags=re.I)
-    out["unrecorded_waste_pct"] = _search_first([r"\bUnrecorded Waste %\b\s*([+-]?\d+\.?\d*%)"], text, flags=re.I)
-    out["shrink_vs_budget_pct"] = _search_first([r"\bShrink vs Budget %\b\s*([+-]?\d+\.?\d*%)"], text, flags=re.I)
+    # ── Payroll block
+    pay_b = _block(text, "Payroll", ["More Card Engagement", "Stock Record NPS", "Online", "Privacy"])
+    out["payroll_outturn"]   = _search_first([r"Payroll Outturn\s*\n\s*([+-]?[£]?[0-9.,]+[KMB]?)"], pay_b, flags=re.I)
+    out["absence_outturn"]   = _search_first([r"Absence Outturn\s*\n\s*([+-]?[£]?[0-9.,]+[KMB]?)"], pay_b, flags=re.I)
+    out["productive_outturn"]= _search_first([r"Productive Outturn\s*\n\s*([+-]?[£]?[0-9.,]+[KMB]?)"], pay_b, flags=re.I)
+    out["holiday_outturn"]   = _search_first([r"Holiday Outturn\s*\n\s*([+-]?[£]?[0-9.,]+[KMB]?)"], pay_b, flags=re.I)
+    out["current_base_cost"] = _search_first([r"Current Base Cost\s*\n\s*([£]?[0-9.,]+[KMB]?)"], pay_b, flags=re.I)
 
-    # Payroll panel
-    out["payroll_outturn"] = _search_first([r"\bPayroll Outturn\b\s*([+-]?[£]?[0-9.,]+[KMB]?)"], text, flags=re.I)
-    out["absence_outturn"] = _search_first([r"\bAbsence Outturn\b\s*([+-]?[£]?[0-9.,]+[KMB]?)"], text, flags=re.I)
-    out["productive_outturn"] = _search_first([r"\bProductive Outturn\b\s*([+-]?[£]?[0-9.,]+[KMB]?)"], text, flags=re.I)
-    out["holiday_outturn"] = _search_first([r"\bHoliday Outturn\b\s*([+-]?[£]?[0-9.,]+[KMB]?)"], text, flags=re.I)
-    out["current_base_cost"] = _search_first([r"\bCurrent Base Cost\b\s*([£]?[0-9.,]+[KMB]?)"], text, flags=re.I)
+    # ── Shrink block
+    shr_b = _block(text, "Shrink", ["Online", "Production Planning", "Privacy"])
+    out["moa"]                 = _search_first([r"Morrisons Order Adjustments\s*\n\s*([£]?-?[0-9.,]+[KMB]?)"], shr_b, flags=re.I)
+    out["waste_validation"]    = _search_first([r"Waste Validation\s*\n\s*([0-9]+%)"], shr_b, flags=re.I)
+    out["unrecorded_waste_pct"]= _search_first([r"Unrecorded Waste %\s*\n\s*([+-]?\d+\.?\d*%)"], shr_b, flags=re.I)
+    out["shrink_vs_budget_pct"]= _search_first([r"Shrink vs Budget %\s*\n\s*([+-]?\d+\.?\d*%)"], shr_b, flags=re.I)
 
-    # Card Engagement
-    out["swipe_rate"] = _search_first([r"\bSwipe Rate\b\s*([0-9]+%)"], text, flags=re.I)
-    out["swipes_wow_pct"] = _search_first([r"\bSwipes WOW %\b\s*([+-]?\d+%)"], text, flags=re.I)
-    out["new_customers"] = _search_first([r"\bNew Customers\b\s*([0-9]+)"], text, flags=re.I)
-    out["swipes_yoy_pct"] = _search_first([r"\bSwipes YOY %\b\s*([+-]?\d+%)"], text, flags=re.I)
+    # ── Card Engagement block
+    ce_b = _block(text, "More Card Engagement", ["Stock Record NPS", "Production Planning", "Privacy"])
+    out["swipe_rate"]   = _search_first([r"Swipe Rate\s*\n\s*([0-9]+%)"], ce_b, flags=re.I)
+    out["swipes_wow_pct"]= _search_first([r"Swipes WOW %\s*\n\s*([+-]?\d+%)"], ce_b, flags=re.I)
+    out["new_customers"]= _search_first([r"New Customers\s*\n\s*([0-9]+)"], ce_b, flags=re.I)
+    out["swipes_yoy_pct"]= _search_first([r"Swipes YOY %\s*\n\s*([+-]?\d+%)"], ce_b, flags=re.I)
 
-    # Production Planning / Misc
-    out["data_provided"] = _search_first([r"\bData Provided\b\s*([0-9]+%)"], text, flags=re.I)
-    out["trusted_data"] = _search_first([r"\bTrusted Data\b\s*([0-9]+%)"], text, flags=re.I)
+    # ── Production Planning (Data Provided / Trusted Data)
+    pp_b = _block(text, "Production Planning", ["Shrink", "Online", "Privacy"])
+    out["data_provided"] = _search_first([r"Data Provided\s*\n\s*([0-9]+%)"], pp_b, flags=re.I)
+    out["trusted_data"]  = _search_first([r"Trusted Data\s*\n\s*([0-9]+%)"], pp_b, flags=re.I)
 
-    # Misc
-    out["complaints_key"] = _search_first([r"\bKey Customer Complaints\b\s*([0-9]+)"], text, flags=re.I)
-    out["my_reports"] = _search_first([r"\bMy Reports\b\s*([0-9]+)"], text, flags=re.I)
-    out["weekly_activity"] = _search_first([r"\bWeekly Activity %\b\s*([0-9]+%|No data)"], text, flags=re.I)
+    # ── Misc
+    out["complaints_key"] = _search_first([r"Key Customer Complaints\s*\n\s*([0-9]+)"], text, flags=re.I)
+    out["my_reports"]     = _search_first([r"My Reports\s*\n\s*([0-9]+)"], text, flags=re.I)
+    out["weekly_activity"]= _search_first([r"Weekly Activity %\s*\n\s*([0-9]+%|No data)"], text, flags=re.I)
 
     return out
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Card builder + sender  (fixed for Google Chat Cards V2)
+# Card builder + sender (Cards V2 valid)
 # ──────────────────────────────────────────────────────────────────────────────
 def build_chat_card(metrics: Dict[str, str]) -> dict:
-    # Card-level header (valid in Cards V2)
     card_header = {
         "title": "📊 Retail Daily Summary",
         "subtitle": (metrics.get("store_line") or "").replace("\n", "  "),
     }
 
     def title_widget(text: str) -> dict:
-        # A bold section title rendered as a textParagraph
         return {"textParagraph": {"text": f"<b>{text}</b>"}}
 
     def kv(label: str, val: str) -> dict:
-        # Use decoratedText for compact label/value rows
         return {"decoratedText": {"topLabel": label, "text": (val or "—")}}
 
     sections = [
-        {
-            "widgets": [
-                kv("Report Time", metrics.get("page_timestamp", "—")),
-                kv("Period", metrics.get("period_range", "—")),
-            ]
-        },
-        {
-            "widgets": [
-                title_widget("Sales & NPS"),
-                kv("Sales Total", metrics.get("sales_total", "—")),
-                kv("LFL", metrics.get("sales_lfl", "—")),
-                kv("vs Target", metrics.get("sales_vs_target", "—")),
-                kv("Supermarket NPS", metrics.get("supermarket_nps", "—")),
-                kv("Colleague Happiness", metrics.get("colleague_happiness", "—")),
-                kv("Home Delivery NPS", metrics.get("home_delivery_nps", "—")),
-                kv("Cafe NPS", metrics.get("cafe_nps", "—")),
-                kv("Click & Collect NPS", metrics.get("click_collect_nps", "—")),
-                kv("Customer Toilet NPS", metrics.get("customer_toilet_nps", "—")),
-            ]
-        },
-        {
-            "widgets": [
-                title_widget("Front End Service"),
-                kv("SCO Utilisation", metrics.get("sco_utilisation", "—")),
-                kv("Efficiency", metrics.get("efficiency", "—")),
-                kv("Scan Rate", f"{metrics.get('scan_rate','—')} (vs {metrics.get('scan_vs_target','—')})"),
-                kv("Interventions", f"{metrics.get('interventions','—')} (vs {metrics.get('interventions_vs_target','—')})"),
-                kv("Mainbank Closed", f"{metrics.get('mainbank_closed','—')} (vs {metrics.get('mainbank_vs_target','—')})"),
-            ]
-        },
-        {
-            "widgets": [
-                title_widget("Online"),
-                kv("Availability", metrics.get("availability_pct", "—")),
-                kv("Despatched on Time", metrics.get("despatched_on_time", "—")),
-                kv("Delivered on Time", metrics.get("delivered_on_time", "—")),
-                kv("Click & Collect Avg Wait", metrics.get("cc_avg_wait", "—")),
-            ]
-        },
-        {
-            "widgets": [
-                title_widget("Waste & Markdowns (Total)"),
-                kv("Waste", metrics.get("waste_total", "—")),
-                kv("Markdowns", metrics.get("markdowns_total", "—")),
-                kv("Total", metrics.get("wm_total", "—")),
-                kv("+/−", metrics.get("wm_delta", "—")),
-                kv("+/− %", metrics.get("wm_delta_pct", "—")),
-            ]
-        },
-        {
-            "widgets": [
-                title_widget("Payroll"),
-                kv("Payroll Outturn", metrics.get("payroll_outturn", "—")),
-                kv("Absence Outturn", metrics.get("absence_outturn", "—")),
-                kv("Productive Outturn", metrics.get("productive_outturn", "—")),
-                kv("Holiday Outturn", metrics.get("holiday_outturn", "—")),
-                kv("Current Base Cost", metrics.get("current_base_cost", "—")),
-            ]
-        },
-        {
-            "widgets": [
-                title_widget("Shrink"),
-                kv("Morrisons Order Adjustments", metrics.get("moa", "—")),
-                kv("Waste Validation", metrics.get("waste_validation", "—")),
-                kv("Unrecorded Waste %", metrics.get("unrecorded_waste_pct", "—")),
-                kv("Shrink vs Budget %", metrics.get("shrink_vs_budget_pct", "—")),
-            ]
-        },
-        {
-            "widgets": [
-                title_widget("Card Engagement & Misc"),
-                kv("Swipe Rate", metrics.get("swipe_rate", "—")),
-                kv("Swipes WOW %", metrics.get("swipes_wow_pct", "—")),
-                kv("New Customers", metrics.get("new_customers", "—")),
-                kv("Swipes YOY %", metrics.get("swipes_yoy_pct", "—")),
-                kv("Key Complaints", metrics.get("complaints_key", "—")),
-                kv("Data Provided", metrics.get("data_provided", "—")),
-                kv("Trusted Data", metrics.get("trusted_data", "—")),
-                kv("My Reports", metrics.get("my_reports", "—")),
-                kv("Weekly Activity %", metrics.get("weekly_activity", "—")),
-            ]
-        },
+        {"widgets": [kv("Report Time", metrics.get("page_timestamp", "—")),
+                     kv("Period",      metrics.get("period_range", "—"))]},
+        {"widgets": [title_widget("Sales & NPS"),
+                     kv("Sales Total", metrics.get("sales_total", "—")),
+                     kv("LFL",         metrics.get("sales_lfl", "—")),
+                     kv("vs Target",   metrics.get("sales_vs_target", "—")),
+                     kv("Supermarket NPS",     metrics.get("supermarket_nps", "—")),
+                     kv("Colleague Happiness", metrics.get("colleague_happiness", "—")),
+                     kv("Home Delivery NPS",   metrics.get("home_delivery_nps", "—")),
+                     kv("Cafe NPS",            metrics.get("cafe_nps", "—")),
+                     kv("Click & Collect NPS", metrics.get("click_collect_nps", "—")),
+                     kv("Customer Toilet NPS", metrics.get("customer_toilet_nps", "—"))]},
+        {"widgets": [title_widget("Front End Service"),
+                     kv("SCO Utilisation", metrics.get("sco_utilisation", "—")),
+                     kv("Efficiency",      metrics.get("efficiency", "—")),
+                     kv("Scan Rate",       f"{metrics.get('scan_rate','—')} (vs {metrics.get('scan_vs_target','—')})"),
+                     kv("Interventions",   f"{metrics.get('interventions','—')} (vs {metrics.get('interventions_vs_target','—')})"),
+                     kv("Mainbank Closed", f"{metrics.get('mainbank_closed','—')} (vs {metrics.get('mainbank_vs_target','—')})")]},
+        {"widgets": [title_widget("Online"),
+                     kv("Availability",          metrics.get("availability_pct", "—")),
+                     kv("Despatched on Time",    metrics.get("despatched_on_time", "—")),
+                     kv("Delivered on Time",     metrics.get("delivered_on_time", "—")),
+                     kv("Click & Collect Avg Wait", metrics.get("cc_avg_wait", "—"))]},
+        {"widgets": [title_widget("Waste & Markdowns (Total)"),
+                     kv("Waste",      metrics.get("waste_total", "—")),
+                     kv("Markdowns",  metrics.get("markdowns_total", "—")),
+                     kv("Total",      metrics.get("wm_total", "—")),
+                     kv("+/−",        metrics.get("wm_delta", "—")),
+                     kv("+/− %",      metrics.get("wm_delta_pct", "—"))]},
+        {"widgets": [title_widget("Payroll"),
+                     kv("Payroll Outturn",   metrics.get("payroll_outturn", "—")),
+                     kv("Absence Outturn",   metrics.get("absence_outturn", "—")),
+                     kv("Productive Outturn",metrics.get("productive_outturn", "—")),
+                     kv("Holiday Outturn",   metrics.get("holiday_outturn", "—")),
+                     kv("Current Base Cost", metrics.get("current_base_cost", "—"))]},
+        {"widgets": [title_widget("Shrink"),
+                     kv("Morrisons Order Adjustments", metrics.get("moa", "—")),
+                     kv("Waste Validation",            metrics.get("waste_validation", "—")),
+                     kv("Unrecorded Waste %",          metrics.get("unrecorded_waste_pct", "—")),
+                     kv("Shrink vs Budget %",          metrics.get("shrink_vs_budget_pct", "—"))]},
+        {"widgets": [title_widget("Card Engagement & Misc"),
+                     kv("Swipe Rate",      metrics.get("swipe_rate", "—")),
+                     kv("Swipes WOW %",    metrics.get("swipes_wow_pct", "—")),
+                     kv("New Customers",   metrics.get("new_customers", "—")),
+                     kv("Swipes YOY %",    metrics.get("swipes_yoy_pct", "—")),
+                     kv("Key Complaints",  metrics.get("complaints_key", "—")),
+                     kv("Data Provided",   metrics.get("data_provided", "—")),
+                     kv("Trusted Data",    metrics.get("trusted_data", "—")),
+                     kv("My Reports",      metrics.get("my_reports", "—")),
+                     kv("Weekly Activity %",metrics.get("weekly_activity", "—"))]}
     ]
 
-    return {
-        "cardsV2": [
-            {
-                "cardId": f"daily_{int(time.time())}",
-                "card": {
-                    "header": card_header,
-                    "sections": sections,
-                },
-            }
-        ]
-    }
+    return {"cardsV2": [{"cardId": f"daily_{int(time.time())}", "card": {"header": card_header, "sections": sections}}]}
 
 def send_daily_card(metrics: Dict[str, str]) -> bool:
     if not MAIN_WEBHOOK or "chat.googleapis.com" not in MAIN_WEBHOOK:
@@ -428,7 +377,6 @@ def send_daily_card(metrics: Dict[str, str]) -> bool:
 # Main flow
 # ──────────────────────────────────────────────────────────────────────────────
 def run_daily_scrape():
-    # Must have an auth state (created by NPS/Complaints flow when you logged in).
     if not AUTH_STATE_PATH.exists():
         alert(["⚠️ Daily dashboard scrape needs login. Run `python scrape.py now` once to save auth_state.json."])
         logger.error("auth_state.json not found.")
@@ -462,7 +410,6 @@ def run_daily_scrape():
     ok = send_daily_card(metrics)
     logger.info("Daily card send → %s", "OK" if ok else "FAIL")
 
-    # CSV logging (append a wide row for history)
     headers = [
         "page_timestamp","period_range","store_line",
         "sales_total","sales_lfl","sales_vs_target",
