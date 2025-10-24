@@ -4,12 +4,12 @@
 """
 Retail Performance Dashboard → Daily Summary → Google Chat
 
-Adds:
-- Auto-click of "PROCEED" overlays in Community Visualisations (inside iframes)
-- Logs source used per gauge (text/dom/ocr)
-- OCR fallback for canvas-rendered gauges remains
-
-CSV schema unchanged.
+- Detects & clicks Community Visualisation "PROCEED" overlays
+- If placeholder text is still present, retries + waits longer
+- Extracts as much as possible from text/DOM
+- Falls back to OCR (Tesseract) for canvas-rendered gauges
+- Saves debug screenshots to screens/
+- Appends a CSV log row (daily_report_log.csv)
 """
 
 import os
@@ -24,7 +24,7 @@ from typing import Dict, List, Optional
 import requests
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 
-# Optional OCR deps
+# ── Optional OCR (Pillow + Tesseract) ─────────────────────────────────────────
 try:
     from PIL import Image
     from io import BytesIO
@@ -33,9 +33,7 @@ try:
 except Exception:
     OCR_AVAILABLE = False
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Paths / constants
-# ──────────────────────────────────────────────────────────────────────────────
+# ── Paths / constants ─────────────────────────────────────────────────────────
 BASE_DIR = Path(__file__).resolve().parent
 AUTH_STATE_PATH = BASE_DIR / "auth_state.json"
 LOG_FILE_PATH = BASE_DIR / "scrape_daily.log"
@@ -48,9 +46,11 @@ DASHBOARD_URL = (
     "?params=%7B%22f20f0n9kld%22:%22include%25EE%2580%25803%25EE%2580%2580T%22%7D"
 )
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Logging
-# ──────────────────────────────────────────────────────────────────────────────
+COMMUNITY_VIZ_PLACEHOLDER = (
+    "You are about to interact with a community visualisation in this embedded report"
+)
+
+# ── Logging ───────────────────────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s",
@@ -59,19 +59,20 @@ logging.basicConfig(
 logger = logging.getLogger("daily")
 logger.addHandler(logging.StreamHandler())
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Config
-# ──────────────────────────────────────────────────────────────────────────────
+# ── Config (file first, env fallback) ─────────────────────────────────────────
 config = configparser.ConfigParser()
 config.read(BASE_DIR / "config.ini")
 
-MAIN_WEBHOOK   = config["DEFAULT"].get("DAILY_WEBHOOK") or config["DEFAULT"].get("MAIN_WEBHOOK", os.getenv("MAIN_WEBHOOK", ""))
-ALERT_WEBHOOK  = config["DEFAULT"].get("ALERT_WEBHOOK",  os.getenv("ALERT_WEBHOOK", ""))
-CI_RUN_URL     = os.getenv("CI_RUN_URL", "")
+MAIN_WEBHOOK  = (
+    config["DEFAULT"].get("DAILY_WEBHOOK")
+    or config["DEFAULT"].get("MAIN_WEBHOOK")
+    or os.getenv("DAILY_WEBHOOK")
+    or os.getenv("MAIN_WEBHOOK", "")
+)
+ALERT_WEBHOOK = config["DEFAULT"].get("ALERT_WEBHOOK", os.getenv("ALERT_WEBHOOK", ""))
+CI_RUN_URL    = os.getenv("CI_RUN_URL", "")
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Helpers (Chat + debug)
-# ──────────────────────────────────────────────────────────────────────────────
+# ── Helpers (Chat + debug) ───────────────────────────────────────────────────
 def _post_with_backoff(url: str, payload: dict) -> bool:
     backoff, max_backoff = 2.0, 30.0
     while True:
@@ -82,13 +83,15 @@ def _post_with_backoff(url: str, payload: dict) -> bool:
             if r.status_code == 429:
                 delay = min(float(r.headers.get("Retry-After") or backoff), max_backoff)
                 logger.error(f"429 from webhook — sleeping {delay:.1f}s")
-                time.sleep(delay); backoff = min(backoff * 1.7, max_backoff)
+                time.sleep(delay)
+                backoff = min(backoff * 1.7, max_backoff)
                 continue
             logger.error(f"Webhook error {r.status_code}: {r.text[:300]}")
             return False
         except Exception as e:
             logger.error(f"Webhook exception: {e}")
-            time.sleep(backoff); backoff = min(backoff * 1.7, max_backoff)
+            time.sleep(backoff)
+            backoff = min(backoff * 1.7, max_backoff)
 
 def alert(lines: List[str]):
     if not ALERT_WEBHOOK or "chat.googleapis.com" not in ALERT_WEBHOOK:
@@ -98,69 +101,82 @@ def alert(lines: List[str]):
         lines.append(f"• CI run: {CI_RUN_URL}")
     _post_with_backoff(ALERT_WEBHOOK, {"text": "\n".join(lines)})
 
-def dump_debug(page, tag: str):
+def save_screenshot(page, tag: str):
     try:
         ts = int(time.time())
         SCREENS_DIR.mkdir(parents=True, exist_ok=True)
         (SCREENS_DIR / f"{ts}_{tag}.png").write_bytes(page.screenshot(full_page=True))
-        (SCREENS_DIR / f"{ts}_{tag}.html").write_text(page.content(), encoding="utf-8")
-        logger.info(f"Saved debug snapshot → {ts}_{tag}.png/.html")
+        logger.info(f"Saved screenshot → {ts}_{tag}.png")
+    except Exception as e:
+        logger.warning(f"Could not save screenshot: {e}")
+
+def save_text_dump(text: str, tag: str):
+    try:
+        ts = int(time.time())
+        SCREENS_DIR.mkdir(parents=True, exist_ok=True)
+        (SCREENS_DIR / f"{ts}_{tag}.txt").write_text(text, encoding="utf-8")
+        logger.info(f"Saved text dump → {ts}_{tag}.txt")
     except Exception:
         pass
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Navigation + text capture
-# ──────────────────────────────────────────────────────────────────────────────
+# ── Community Viz overlays ───────────────────────────────────────────────────
 def click_proceed_overlays(page) -> int:
-    """
-    Some Community Visualisations show a 'PROCEED' overlay inside their frames.
-    Click them so the gauges render before OCR/DOM scraping.
-    Returns count of clicks performed.
-    """
+    """Click 'PROCEED' buttons inside any frames; return count clicked."""
     clicked = 0
     for fr in page.frames:
         try:
-            btn = fr.get_by_text("PROCEED", exact=True)
-            if btn.count() > 0:
-                # Click all visible "PROCEED" in this frame
-                for i in range(btn.count()):
-                    try:
-                        btn.nth(i).click(timeout=1500)
-                        clicked += 1
-                        fr.wait_for_timeout(500)
-                    except Exception:
-                        continue
+            btns = fr.get_by_text("PROCEED", exact=True)
+            n = btns.count()
+            for i in range(n):
+                try:
+                    btns.nth(i).click(timeout=1500)
+                    clicked += 1
+                    fr.wait_for_timeout(300)
+                except Exception:
+                    continue
         except Exception:
             continue
     if clicked:
-        logger.info(f"Clicked {clicked} 'PROCEED' overlay(s). Waiting for render…")
-        page.wait_for_timeout(1200)
+        logger.info(f"Clicked {clicked} 'PROCEED' overlay(s).")
     return clicked
 
+# ── Navigation + text capture ────────────────────────────────────────────────
 def fetch_text_from_dashboard(page, url: str) -> Optional[str]:
     logger.info("Opening Retail Performance Dashboard…")
     try:
         page.goto(url, wait_until="domcontentloaded", timeout=120_000)
-    except TimeoutError:
+    except PlaywrightTimeoutError:
         logger.error("Timeout loading dashboard.")
-        dump_debug(page, "dashboard_timeout")
+        save_screenshot(page, "dashboard_timeout")
         return ""
 
     if "accounts.google.com" in page.url:
         logger.warning("Redirected to login — auth state missing/invalid.")
         return None
 
-    # Let dynamic/iframes render a bit
+    # Let dynamic/iframes render
     logger.info("Waiting 15s for dynamic content…")
     page.wait_for_timeout(15_000)
 
-    # Some Community Viz tiles require acknowledging 'PROCEED'
-    # Click once, and if we found any, give a longer settle time.
-    clicks = click_proceed_overlays(page)
-    if clicks:
+    # First pass: click overlays
+    clicked = click_proceed_overlays(page)
+    if clicked:
         page.wait_for_timeout(1500)
 
-    # Try body then frames (pick longest)
+    # Detect community-viz placeholder text in DOM; if present → retry
+    content_html = ""
+    try:
+        content_html = page.content()
+    except Exception:
+        content_html = ""
+
+    if COMMUNITY_VIZ_PLACEHOLDER in (content_html or ""):
+        logger.warning("Community visualisation placeholders detected — retrying PROCEED and waiting longer.")
+        clicked2 = click_proceed_overlays(page)
+        page.wait_for_timeout(5000)  # give canvases time to draw
+        save_screenshot(page, "community_viz_pending_after_retry")
+
+    # Try page body, else pick the longest frame text
     text = ""
     try:
         text = page.inner_text("body")
@@ -168,7 +184,8 @@ def fetch_text_from_dashboard(page, url: str) -> Optional[str]:
         pass
 
     if not text or len(text) < 400:
-        best = text; best_len = len(best) if best else 0
+        best = text
+        best_len = len(best) if best else 0
         for fr in page.frames:
             try:
                 fr.wait_for_selector("body", timeout=5_000)
@@ -180,20 +197,14 @@ def fetch_text_from_dashboard(page, url: str) -> Optional[str]:
         text = best or text
 
     if not text:
-        logger.error("No text content found.")
-        dump_debug(page, "no_text")
+        logger.error("No text content found at all.")
+        save_screenshot(page, "no_text")
         return ""
 
-    try:
-        (SCREENS_DIR / f"{int(time.time())}_daily_text.txt").write_text(text, encoding="utf-8")
-    except Exception:
-        pass
-
+    save_text_dump(text, "daily_text")
     return text
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Parsing utilities
-# ──────────────────────────────────────────────────────────────────────────────
+# ── Parsing utils ────────────────────────────────────────────────────────────
 def _block(text: str, start: str, ends: List[str]) -> str:
     s = text.find(start)
     if s == -1:
@@ -238,20 +249,13 @@ def _dom_find_tile_value_in_frame(frame, label: str) -> Optional[str]:
     (label) => {
       const intRe = /-?\\d{1,3}\\b/;
       const isInt = (s) => s && /^-?\\d{1,3}$/.test(s.trim());
+      const els = Array.from(document.querySelectorAll('*')).filter(el => (el.textContent||'').trim() === label);
+      if (els.length === 0) return null;
+      let root = els[0].closest('[role="region"], section, article, .viz-container, .widget, .card, .tile, div');
+      if (!root) root = els[0].parentElement || els[0];
 
-      const labelEls = Array.from(document.querySelectorAll('*'))
-        .filter(el => (el.textContent||'').trim() === label);
-      if (labelEls.length === 0) return null;
-
-      const start = labelEls[0];
-      let root = start.closest('[role="region"], section, article, .viz-container, .widget, .card, .tile, div');
-      if (!root) root = start.parentElement || start;
-
-      const q = [root];
-      const seen = new Set();
-      let steps = 0;
-
-      while (q.length && steps < 200) {
+      const q = [root]; const seen = new Set(); let steps = 0;
+      while (q.length && steps < 250) {
         const node = q.shift(); steps++;
         if (!node || seen.has(node)) continue;
         seen.add(node);
@@ -270,9 +274,7 @@ def _dom_find_tile_value_in_frame(frame, label: str) -> Optional[str]:
             if (m) return m[0];
           }
         }
-        if (node.children && node.children.length) {
-          q.push(...Array.from(node.children));
-        }
+        if (node.children && node.children.length) q.push(...Array.from(node.children));
       }
       return null;
     }
@@ -283,6 +285,7 @@ def _dom_find_tile_value_in_frame(frame, label: str) -> Optional[str]:
         return None
 
 def _dom_tile_value(page, label: str) -> str:
+    # Search frames that contain the label first
     for fr in page.frames:
         try:
             if fr.get_by_text(label, exact=True).count():
@@ -291,6 +294,7 @@ def _dom_tile_value(page, label: str) -> str:
                     return v
         except Exception:
             continue
+    # As a fallback, try top-level
     try:
         if page.get_by_text(label, exact=True).count():
             v = _dom_find_tile_value_in_frame(page, label)
@@ -302,26 +306,22 @@ def _dom_tile_value(page, label: str) -> str:
 
 def _ocr_tile_value(page, label: str) -> str:
     if not OCR_AVAILABLE:
-        logger.debug("OCR not available.")
         return "—"
 
-    # Look in frames that contain the label
     for fr in page.frames:
         try:
             lab = fr.get_by_text(label, exact=True).first
             if lab.count() == 0:
                 continue
-
-            # Prefer a nearest visual container ancestor
+            # Closest visual container
             container = lab.locator(
-                "xpath=ancestor::*[contains(@class,'viz') or contains(@class,'widget') or contains(@class,'card') or self::section or self::article or self::div][1]"
+                "xpath=ancestor::*[contains(@class,'viz') or contains(@class,'widget') or "
+                "contains(@class,'card') or self::section or self::article or self::div][1]"
             )
             target = container if container.count() else lab
-
+            # Screenshot and OCR
             img_bytes = target.screenshot(type="png", timeout=10000)
-
             img = Image.open(BytesIO(img_bytes))
-            # Light preprocessing to help OCR
             try:
                 img = img.convert("L")
                 w, h = img.size
@@ -329,7 +329,6 @@ def _ocr_tile_value(page, label: str) -> str:
                     img = img.resize((int(w*1.8), int(h*1.8)))
             except Exception:
                 pass
-
             txt = pytesseract.image_to_string(
                 img, config="--psm 7 -c tessedit_char_whitelist=-0123456789"
             )
@@ -343,9 +342,7 @@ def _ocr_tile_value(page, label: str) -> str:
 
     return "—"
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Parse metrics (text first, then DOM then OCR for gauges)
-# ──────────────────────────────────────────────────────────────────────────────
+# ── Parse metrics (text → DOM → OCR for gauges) ──────────────────────────────
 def parse_metrics_from_text(text: str) -> Dict[str, str]:
     out: Dict[str, str] = {}
 
@@ -358,7 +355,7 @@ def parse_metrics_from_text(text: str) -> Dict[str, str]:
     )
 
     # Sales block
-    sales_b = _block(text, "Sales", ["Waste & Markdowns", "Colleague Happiness", "Payroll", "Front End Service"])
+    sales_b = _block(text, "Sales", ["Waste & Markdowns", "Colleague Happiness", "Payroll", "Front End Service", "Online", "Privacy"])
     if sales_b:
         m = re.search(
             r"Total\s*\n\s*([£]?[0-9.,]+[KMB]?)\s*\n\s*([+-]?\d+%?)\s*\n\s*([+-]?[£]?[0-9.,]+[KMB]?)",
@@ -371,7 +368,7 @@ def parse_metrics_from_text(text: str) -> Dict[str, str]:
     else:
         out["sales_total"] = out["sales_lfl"] = out["sales_vs_target"] = "—"
 
-    # Gauges (likely Community Viz)
+    # Gauges often missing from text — try naive text scrape first
     out["supermarket_nps"]     = _tile_value_from_text(text, "Supermarket NPS")
     out["colleague_happiness"] = _tile_value_from_text(text, "Colleague Happiness")
     out["home_delivery_nps"]   = _tile_value_from_text(text, "Home Delivery NPS")
@@ -444,6 +441,7 @@ def parse_metrics_from_text(text: str) -> Dict[str, str]:
     return out
 
 def fill_missing_gauges(page, metrics: Dict[str, str]) -> Dict[str, str]:
+    """For gauge tiles: try DOM scan, then OCR if still missing."""
     labels = [
         ("supermarket_nps", "Supermarket NPS"),
         ("colleague_happiness", "Colleague Happiness"),
@@ -454,26 +452,23 @@ def fill_missing_gauges(page, metrics: Dict[str, str]) -> Dict[str, str]:
     ]
     for key, label in labels:
         if metrics.get(key) and metrics[key] != "—":
-            logger.info(f"{label}: from text")
             continue
-        # 1) DOM sniff
+        # 1) DOM
         v = _dom_tile_value(page, label)
         if v and re.fullmatch(r"-?\d{1,3}", v):
             metrics[key] = v
-            logger.info(f"{label}: from dom → {v}")
+            logger.info(f"{label}: DOM → {v}")
             continue
-        # 2) OCR fallback
+        # 2) OCR
         v = _ocr_tile_value(page, label)
         if v and re.fullmatch(r"-?\d{1,3}", v):
             metrics[key] = v
-            logger.info(f"{label}: from ocr → {v}")
+            logger.info(f"{label}: OCR → {v}")
         else:
             logger.info(f"{label}: still missing (—)")
     return metrics
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Card builder + sender
-# ──────────────────────────────────────────────────────────────────────────────
+# ── Card builder + sender ────────────────────────────────────────────────────
 def build_chat_card(metrics: Dict[str, str]) -> dict:
     def title_widget(text: str) -> dict:
         return {"textParagraph": {"text": f"<b>{text}</b>"}}
@@ -547,9 +542,7 @@ def send_daily_card(metrics: Dict[str, str]) -> bool:
     payload = build_chat_card(metrics)
     return _post_with_backoff(MAIN_WEBHOOK, payload)
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Main flow
-# ──────────────────────────────────────────────────────────────────────────────
+# ── Main flow ────────────────────────────────────────────────────────────────
 def run_daily_scrape():
     if not AUTH_STATE_PATH.exists():
         alert(["⚠️ Daily dashboard scrape needs login. Run `python scrape.py now` once to save auth_state.json."])
@@ -562,6 +555,7 @@ def run_daily_scrape():
             browser = p.chromium.launch(headless=True)
             context = browser.new_context(storage_state=str(AUTH_STATE_PATH))
             page = context.new_page()
+
             text = fetch_text_from_dashboard(page, DASHBOARD_URL)
             if text is None:
                 alert(["⚠️ Daily scrape blocked by login — please re-login (the NPS scraper will prompt you)."])
@@ -569,11 +563,14 @@ def run_daily_scrape():
             if not text:
                 logger.error("No text extracted — skipping.")
                 return
+
             metrics = parse_metrics_from_text(text)
 
-            # Click overlays again just before DOM/OCR to be safe
+            # One more overlay pass just before DOM/OCR, then fill missing gauges
             click_proceed_overlays(page)
+            page.wait_for_timeout(1200)
             metrics = fill_missing_gauges(page, metrics)
+
         finally:
             try:
                 if context: context.close()
