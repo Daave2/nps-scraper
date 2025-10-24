@@ -44,11 +44,12 @@ jobs:
 
       # Optional fallback: if cache didn’t have auth_state.json, use the secret
       - name: Fallback restore auth_state.json from secret
-        if: ${{ !hashFiles('auth_state.json') && secrets.AUTH_STATE_B64 != '' }}
-        run: |
-          echo "${AUTH_STATE_B64}" | base64 -d > auth_state.json
+        if: ${{ !hashFiles('auth_state.json') && env.AUTH_STATE_B64 != '' }}
         env:
-          AUTH_STATE_B64: ${{ secrets.AUTH_STATE_B64 }}
+         AUTH_STATE_B64: ${{ secrets.AUTH_STATE_B64 }}
+        run: |
+         echo "$AUTH_STATE_B64" | base64 -d > auth_state.json
+
 
       # ========= CONFIG =========
       - name: Create/Update config.ini from secrets
