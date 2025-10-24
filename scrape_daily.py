@@ -4,12 +4,16 @@
 """
 Retail Performance Dashboard → Daily Summary (OCR-first) → Google Chat
 
-Key updates in this version:
-- Auto-scales ROI coordinates to the actual screenshot size (so boxes line up even if
-  the runtime zoom or DPR changes).
-- Forces viewport 1365×768 with device_scale_factor=1, but still robust via auto-scale.
-- Logs devicePixelRatio, viewport size, and screenshot size for debugging.
-- Saves per-ROI crop PNGs and a green overlay PNG.
+Key fixes:
+- OCR uses pytesseract Output.DICT (no pandas dependency).
+- Viewport fixed to 1366x768; screenshot is viewport-only to match ROI map.
+- ROI map scaled from a base size (default 1366x768; overridable in roi_map.json).
+- Saves per-ROI crops and an overlay to validate alignment.
+
+Requires:
+  pip install playwright requests pillow pytesseract
+  python -m playwright install --with-deps chromium
+  (apt-get install -y tesseract-ocr on runners or locally)
 """
 
 import os
@@ -20,29 +24,26 @@ import time
 import logging
 import configparser
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Dict, List, Optional, Tuple
 
 import requests
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 
-# OCR deps (no pandas needed)
-try:
-    from PIL import Image, ImageDraw, ImageStat
-    from io import BytesIO
-    import pytesseract
-    OCR_AVAILABLE = True
-except Exception:
-    OCR_AVAILABLE = False
+# OCR deps
+from PIL import Image, ImageDraw
+from io import BytesIO
+import pytesseract
+from pytesseract import Output
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Paths / constants
 # ──────────────────────────────────────────────────────────────────────────────
-BASE_DIR        = Path(__file__).resolve().parent
+BASE_DIR = Path(__file__).resolve().parent
 AUTH_STATE_PATH = BASE_DIR / "auth_state.json"
 LOG_FILE_PATH   = BASE_DIR / "scrape_daily.log"
 DAILY_LOG_CSV   = BASE_DIR / "daily_report_log.csv"
 SCREENS_DIR     = BASE_DIR / "screens"
-ROI_MAP_PATH    = Path(os.getenv("ROI_MAP_FILE", BASE_DIR / "roi_map.json"))
+ROI_JSON_PATH   = BASE_DIR / "roi_map.json"
 
 DASHBOARD_URL = (
     "https://lookerstudio.google.com/embed/u/0/reporting/"
@@ -50,12 +51,12 @@ DASHBOARD_URL = (
     "?params=%7B%22f20f0n9kld%22:%22include%25EE%2580%25803%25EE%2580%2580T%22%7D"
 )
 
-# Base design size used when you drew the ROI boxes
-BASE_W, BASE_H = 1365, 768
+# Viewport used for ROI map
+VIEWPORT = {"width": 1366, "height": 768, "device_scale_factor": 1}
 
-# Preferred viewport; boxes will still align even if the real screenshot differs
-VIEWPORT = {"width": BASE_W, "height": BASE_H}
-DEVICE_SCALE_FACTOR = 1
+# ROI base size (used to scale normalized ROIs to screenshot pixels)
+ROI_BASE_W = 1366
+ROI_BASE_H = 768
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Logging
@@ -79,7 +80,7 @@ ALERT_WEBHOOK  = config["DEFAULT"].get("ALERT_WEBHOOK",  os.getenv("ALERT_WEBHOO
 CI_RUN_URL     = os.getenv("CI_RUN_URL", "")
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Helpers
+# Helpers (Chat + file IO)
 # ──────────────────────────────────────────────────────────────────────────────
 def _post_with_backoff(url: str, payload: dict) -> bool:
     backoff, max_backoff = 2.0, 30.0
@@ -91,7 +92,8 @@ def _post_with_backoff(url: str, payload: dict) -> bool:
             if r.status_code == 429:
                 delay = min(float(r.headers.get("Retry-After") or backoff), max_backoff)
                 log.error(f"429 from webhook — sleeping {delay:.1f}s")
-                time.sleep(delay); backoff = min(backoff * 1.7, max_backoff); continue
+                time.sleep(delay); backoff = min(backoff * 1.7, max_backoff)
+                continue
             log.error(f"Webhook error {r.status_code}: {r.text[:300]}")
             return False
         except Exception as e:
@@ -123,37 +125,118 @@ def save_text(path: Path, text: str):
         pass
 
 # ──────────────────────────────────────────────────────────────────────────────
+# ROI map (normalized coords in 0..1), with optional base size override
+# ──────────────────────────────────────────────────────────────────────────────
+DEFAULT_ROI_MAP: Dict[str, Tuple[float,float,float,float]] = {
+    # Gauges row
+    "colleague_happiness": (0.235, 0.215, 0.095, 0.140),
+    "supermarket_nps":     (0.392, 0.215, 0.095, 0.140),
+    "cafe_nps":            (0.546, 0.215, 0.095, 0.140),
+    "click_collect_nps":   (0.700, 0.215, 0.095, 0.140),
+    "home_delivery_nps":   (0.854, 0.215, 0.095, 0.140),
+    "customer_toilet_nps": (0.916, 0.240, 0.060, 0.090),  # complaints gauge nearby
+
+    # Waste & Markdowns (TOTAL row)
+    "waste_total":     (0.095, 0.436, 0.065, 0.038),
+    "markdowns_total": (0.167, 0.436, 0.065, 0.038),
+    "wm_total":        (0.238, 0.436, 0.065, 0.038),
+    "wm_delta":        (0.309, 0.436, 0.065, 0.038),
+    "wm_delta_pct":    (0.380, 0.436, 0.065, 0.038),
+
+    # Payroll
+    "payroll_outturn":     (0.528, 0.468, 0.100, 0.130),
+    "absence_outturn":     (0.636, 0.455, 0.055, 0.045),
+    "productive_outturn":  (0.636, 0.505, 0.055, 0.045),
+    "holiday_outturn":     (0.725, 0.455, 0.055, 0.045),
+    "current_base_cost":   (0.725, 0.505, 0.055, 0.045),
+
+    # Online
+    "availability_pct":    (0.456, 0.616, 0.080, 0.100),
+    "despatched_on_time":  (0.523, 0.583, 0.085, 0.050),
+    "delivered_on_time":   (0.592, 0.583, 0.085, 0.050),
+    "cc_avg_wait":         (0.622, 0.650, 0.080, 0.090),
+
+    # Front End Service (bottom-right panel)
+    "sco_utilisation":     (0.690, 0.606, 0.065, 0.060),
+    "scan_rate":           (0.690, 0.666, 0.065, 0.060),
+    "interventions":       (0.802, 0.606, 0.065, 0.060),
+    "mainbank_closed":     (0.802, 0.666, 0.065, 0.060),
+    "efficiency":          (0.935, 0.605, 0.095, 0.130),
+
+    # Card Engagement
+    "swipe_rate":          (0.830, 0.456, 0.060, 0.045),
+    "swipes_wow_pct":      (0.902, 0.456, 0.060, 0.045),
+    "new_customers":       (0.830, 0.505, 0.060, 0.045),
+    "swipes_yoy_pct":      (0.902, 0.505, 0.060, 0.045),
+
+    # Production planning
+    "data_provided":       (0.065, 0.612, 0.070, 0.075),
+    "trusted_data":        (0.065, 0.680, 0.070, 0.075),
+
+    # Misc
+    "my_reports":          (0.358, 0.470, 0.055, 0.080),
+    "weekly_activity":     (0.444, 0.482, 0.070, 0.090),
+    "complaints_key":      (0.915, 0.306, 0.050, 0.090),
+}
+
+def load_roi_map() -> Tuple[Dict[str, Tuple[float,float,float,float]], int, int]:
+    rois = DEFAULT_ROI_MAP.copy()
+    base_w, base_h = ROI_BASE_W, ROI_BASE_H
+    if ROI_JSON_PATH.exists():
+        try:
+            payload = json.loads(ROI_JSON_PATH.read_text(encoding="utf-8"))
+            if isinstance(payload, dict):
+                if "base_width" in payload and "base_height" in payload:
+                    base_w = int(payload["base_width"])
+                    base_h = int(payload["base_height"])
+                # merge any key->[x,y,w,h]
+                for k, v in payload.items():
+                    if k in ("base_width", "base_height"):
+                        continue
+                    if isinstance(v, (list, tuple)) and len(v) == 4:
+                        rois[k] = tuple(float(x) for x in v)  # type: ignore
+            log.info(f"Loaded ROI overrides from {ROI_JSON_PATH.name}: {len(payload.keys())} key(s).")
+        except Exception as e:
+            log.warning(f"Failed to parse {ROI_JSON_PATH.name}: {e}")
+    return rois, base_w, base_h
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Browser automation
 # ──────────────────────────────────────────────────────────────────────────────
 def click_this_week(page):
-    for kind, value in [("role", ("button", "This Week")), ("text", "This Week"), ("text", "This week")]:
+    tries = [
+        page.get_by_role("button", name="This Week"),
+        page.get_by_text("This Week"),
+        page.get_by_text("This week"),
+    ]
+    for q in tries:
         try:
-            btn = page.get_by_role(*value) if kind == "role" else page.get_by_text(value)
-            if btn.count():
-                btn.first.click(timeout=2500)
-                page.wait_for_timeout(900)
+            if q.count():
+                q.first.click(timeout=1500)
+                page.wait_for_timeout(700)
                 return True
         except Exception:
-            continue
+            pass
     return False
 
 def click_proceed_overlays(page) -> int:
     clicked = 0
     for fr in page.frames:
         try:
-            btn = fr.get_by_text("PROCEED", exact=True)
-            for i in range(btn.count()):
+            btns = fr.get_by_text("PROCEED", exact=True)
+            n = btns.count()
+            for i in range(n):
                 try:
-                    btn.nth(i).click(timeout=1500)
+                    btns.nth(i).click(timeout=1200)
+                    fr.wait_for_timeout(250)
                     clicked += 1
-                    fr.wait_for_timeout(350)
                 except Exception:
                     continue
         except Exception:
             continue
     if clicked:
-        log.info(f"Clicked {clicked} 'PROCEED' overlay(s). Waiting for render…")
-        page.wait_for_timeout(1500)
+        log.info(f"Clicked {clicked} 'PROCEED' overlay(s). Waiting…")
+        page.wait_for_timeout(1000)
     return clicked
 
 def open_and_prepare(page) -> bool:
@@ -168,20 +251,21 @@ def open_and_prepare(page) -> bool:
         log.warning("Redirected to login — auth state missing/invalid.")
         return False
 
-    log.info("Waiting 12s for dynamic content…")
-    page.wait_for_timeout(12_000)
+    log.info("Waiting 10s for dynamic content…")
+    page.wait_for_timeout(10_000)
 
     click_this_week(page)
     click_proceed_overlays(page)
 
+    # Detect community viz placeholders and retry once
     try:
         body_text = page.inner_text("body")
     except Exception:
         body_text = ""
     if "You are about to interact with a community visualisation" in body_text:
-        log.info("Placeholder detected — retrying PROCEED and waiting longer.")
+        log.info("Community visualisation placeholders detected — retrying PROCEED and waiting longer.")
         click_proceed_overlays(page)
-        page.wait_for_timeout(2000)
+        page.wait_for_timeout(1500)
 
     return True
 
@@ -190,58 +274,46 @@ def open_and_prepare(page) -> bool:
 # ──────────────────────────────────────────────────────────────────────────────
 def screenshot_viewport(page) -> Optional[Image.Image]:
     try:
-        # Log DPR & viewport info
-        dpr = page.evaluate("() => window.devicePixelRatio")
-        vp  = page.viewport_size
-        log.info(f"Runtime DPR={dpr}, viewport={vp}")
-
-        img_bytes = page.screenshot(full_page=False, type="png")
+        img_bytes = page.screenshot(full_page=False, type="png")  # viewport only
         ts = int(time.time())
-        path = SCREENS_DIR / f"{ts}_viewport.png"
-        save_bytes(path, img_bytes)
-        img = Image.open(BytesIO(img_bytes))
-        log.info(f"Screenshot size: {img.size}")
-        return img
+        save_bytes(SCREENS_DIR / f"{ts}_viewport.png", img_bytes)
+        return Image.open(BytesIO(img_bytes))
     except Exception as e:
         log.error(f"Viewport screenshot failed: {e}")
         return None
 
-def ocr_fullpage(img: Image.Image) -> Tuple[Optional[Image.Image], List[dict]]:
-    if not OCR_AVAILABLE or img is None:
-        return img, []
-    try:
-        W, H = img.size
-        if max(W, H) < 1400:
-            scale = 1400 / max(W, H)
-            img = img.resize((int(W*scale), int(H*scale)))
+NumPat = re.compile(r"[£]?-?\d+(?:\.\d+)?(?:[KMB]|%)?|\b\d{2}:\d{2}\b", re.I)
 
-        data = pytesseract.image_to_data(img, output_type=pytesseract.Output.DICT)
-        words: List[dict] = []
-        parts = []
-        for i in range(len(data["text"])):
-            t = (data["text"][i] or "").strip()
-            if not t:
+def ocr_words(img: Image.Image) -> List[dict]:
+    """
+    Returns a list of dicts: {text,left,top,width,height,conf}
+    Using pytesseract Output.DICT to avoid pandas dependency.
+    """
+    words: List[dict] = []
+    try:
+        W,H = img.size
+        if max(W,H) < 1300:
+            scale = 1300 / max(W,H)
+            img = img.resize((int(W*scale), int(H*scale)))
+        data = pytesseract.image_to_data(img, output_type=Output.DICT)
+        n = len(data.get("text", []))
+        for i in range(n):
+            text = (data["text"][i] or "").strip()
+            if not text:
                 continue
             words.append({
-                "text": t,
-                "left": int(data["left"][i]),
-                "top": int(data["top"][i]),
-                "width": int(data["width"][i]),
-                "height": int(data["height"][i]),
-                "conf": float(data["conf"][i]),
+                "text": text,
+                "left": int(data.get("left", [0])[i]),
+                "top": int(data.get("top", [0])[i]),
+                "width": int(data.get("width", [0])[i]),
+                "height": int(data.get("height", [0])[i]),
+                "conf": float(data.get("conf", [-1])[i]),
             })
-            parts.append(t)
-        ts = int(time.time())
-        save_text(SCREENS_DIR / f"{ts}_ocr_text.txt", " ".join(parts))
-        return img, words
+        txt = " ".join(w["text"] for w in words)
+        save_text(SCREENS_DIR / f"{int(time.time())}_daily_text.txt", txt)
     except Exception as e:
-        log.error(f"OCR failed: {e}")
-        return img, []
-
-# ──────────────────────────────────────────────────────────────────────────────
-# OCR by labels
-# ──────────────────────────────────────────────────────────────────────────────
-NumPat = re.compile(r"[£]?-?\d+(?:\.\d+)?(?:[KMB]|%)?|\b\d{2}:\d{2}\b", re.I)
+        log.error(f"OCR words failed: {e}")
+    return words
 
 def nearest_number(words: List[dict], label: str, window: int = 180) -> str:
     labs = [w for w in words if w["text"].lower() == label.lower()]
@@ -250,29 +322,26 @@ def nearest_number(words: List[dict], label: str, window: int = 180) -> str:
     if not labs:
         return "—"
     lx, ly = labs[0]["left"], labs[0]["top"]
-    best = None; bestd = 1e9
+    best, bestd = None, 1e9
     for w in words:
-        if w is labs[0]:
+        if w is labs[0]: 
             continue
         t = w["text"]
         if not NumPat.fullmatch(t):
             continue
-        dx = abs(w["left"] - lx); dy = abs(w["top"] - ly)
+        dx, dy = abs(w["left"] - lx), abs(w["top"] - ly)
         d = (dx*dx + dy*dy) ** 0.5
-        if d < bestd and dx < window and dy < window:
+        if dx < window and dy < window and d < bestd:
             best, bestd = t, d
     return best if best else "—"
 
 def build_metrics_from_ocr_labels(words: List[dict]) -> Dict[str, str]:
     m: Dict[str,str] = {}
-
+    # Context via OCR is brittle; we will fill from DOM text later
     m["page_timestamp"] = "—"
     m["period_range"]   = "—"
 
-    m["sales_total"]     = "—"
-    m["sales_lfl"]       = "—"
-    m["sales_vs_target"] = "—"
-
+    # Gauges
     m["supermarket_nps"]     = nearest_number(words, "Supermarket")
     m["colleague_happiness"] = nearest_number(words, "Colleague")
     m["home_delivery_nps"]   = nearest_number(words, "Home")
@@ -280,179 +349,79 @@ def build_metrics_from_ocr_labels(words: List[dict]) -> Dict[str, str]:
     m["click_collect_nps"]   = nearest_number(words, "Collect")
     m["customer_toilet_nps"] = nearest_number(words, "Toilet")
 
-    m["sco_utilisation"]          = nearest_number(words, "Utilisation")
-    m["efficiency"]               = nearest_number(words, "Efficiency")
-    m["scan_rate"]                = nearest_number(words, "Scan")
-    m["scan_vs_target"]           = "—"
-    m["interventions"]            = nearest_number(words, "Interventions")
-    m["interventions_vs_target"]  = "—"
-    m["mainbank_closed"]          = nearest_number(words, "Mainbank")
-    m["mainbank_vs_target"]       = "—"
+    # Front End Service
+    m["sco_utilisation"]         = nearest_number(words, "Utilisation")
+    m["efficiency"]              = nearest_number(words, "Efficiency")
+    m["scan_rate"]               = nearest_number(words, "Scan")
+    m["scan_vs_target"]          = "—"
+    m["interventions"]           = nearest_number(words, "Interventions")
+    m["interventions_vs_target"] = "—"
+    m["mainbank_closed"]         = nearest_number(words, "Mainbank")
+    m["mainbank_vs_target"]      = "—"
 
-    m["availability_pct"]   = nearest_number(words, "Availability")
-    m["despatched_on_time"] = nearest_number(words, "Despatched")
-    m["delivered_on_time"]  = nearest_number(words, "Delivered")
-    m["cc_avg_wait"]        = nearest_number(words, "wait")
+    # Online
+    m["availability_pct"]    = nearest_number(words, "Availability")
+    m["despatched_on_time"]  = nearest_number(words, "Despatched")
+    m["delivered_on_time"]   = nearest_number(words, "Delivered")
+    m["cc_avg_wait"]         = nearest_number(words, "wait")
 
-    m["waste_total"]        = "—"
-    m["markdowns_total"]    = "—"
-    m["wm_total"]           = "—"
-    m["wm_delta"]           = "—"
-    m["wm_delta_pct"]       = "—"
+    # Waste & Markdowns (via ROI later)
+    for k in ["waste_total","markdowns_total","wm_total","wm_delta","wm_delta_pct"]:
+        m[k] = "—"
 
-    m["payroll_outturn"]     = nearest_number(words, "Payroll")
-    m["absence_outturn"]     = nearest_number(words, "Absence")
-    m["productive_outturn"]  = nearest_number(words, "Productive")
-    m["holiday_outturn"]     = nearest_number(words, "Holiday")
-    m["current_base_cost"]   = nearest_number(words, "Cost")
+    # Payroll
+    m["payroll_outturn"]    = nearest_number(words, "Payroll")
+    m["absence_outturn"]    = nearest_number(words, "Absence")
+    m["productive_outturn"] = nearest_number(words, "Productive")
+    m["holiday_outturn"]    = nearest_number(words, "Holiday")
+    m["current_base_cost"]  = nearest_number(words, "Cost")
 
+    # Shrink
     m["moa"]                  = nearest_number(words, "Adjustments")
     m["waste_validation"]     = nearest_number(words, "Validation")
     m["unrecorded_waste_pct"] = nearest_number(words, "Unrecorded")
     m["shrink_vs_budget_pct"] = nearest_number(words, "Budget")
 
+    # Card Engagement & misc
     m["swipe_rate"]     = nearest_number(words, "Swipe")
     m["swipes_wow_pct"] = nearest_number(words, "WOW")
     m["new_customers"]  = nearest_number(words, "Customers")
     m["swipes_yoy_pct"] = nearest_number(words, "YOY")
-
-    m["data_provided"]   = nearest_number(words, "Provided")
-    m["trusted_data"]    = nearest_number(words, "Trusted")
-    m["complaints_key"]  = nearest_number(words, "Complaints")
-    m["my_reports"]      = nearest_number(words, "Reports")
-    m["weekly_activity"] = nearest_number(words, "Activity")
-
+    m["data_provided"]  = nearest_number(words, "Provided")
+    m["trusted_data"]   = nearest_number(words, "Trusted")
+    m["complaints_key"] = nearest_number(words, "Complaints")
+    m["my_reports"]     = nearest_number(words, "Reports")
+    m["weekly_activity"]= nearest_number(words, "Activity")
+    # Sales totals left as ROI/DOM fallback
+    m["sales_total"]     = "—"
+    m["sales_lfl"]       = "—"
+    m["sales_vs_target"] = "—"
     return m
 
 # ──────────────────────────────────────────────────────────────────────────────
-# ROI map + scaling
+# ROI fallback
 # ──────────────────────────────────────────────────────────────────────────────
-DEFAULT_ROI_MAP: Dict[str, Tuple[float,float,float,float]] = {
-    # Gauges
-    "colleague_happiness": (0.23, 0.20, 0.09, 0.12),
-    "supermarket_nps":     (0.38, 0.20, 0.09, 0.12),
-    "cafe_nps":            (0.53, 0.20, 0.09, 0.12),
-    "click_collect_nps":   (0.67, 0.20, 0.09, 0.12),
-    "home_delivery_nps":   (0.81, 0.20, 0.09, 0.12),
-    "customer_toilet_nps": (0.95, 0.20, 0.09, 0.12),
-
-    # Waste & Markdowns — TOTAL row
-    "waste_total":     (0.10, 0.42, 0.06, 0.03),
-    "markdowns_total": (0.17, 0.42, 0.06, 0.03),
-    "wm_total":        (0.24, 0.42, 0.06, 0.03),
-    "wm_delta":        (0.31, 0.42, 0.06, 0.03),
-    "wm_delta_pct":    (0.38, 0.42, 0.06, 0.03),
-
-    # Front End Service
-    "sco_utilisation": (0.68, 0.59, 0.06, 0.05),
-    "efficiency":      (0.95, 0.60, 0.07, 0.10),
-    "scan_rate":       (0.68, 0.65, 0.06, 0.04),
-    "interventions":   (0.81, 0.59, 0.06, 0.05),
-    "mainbank_closed": (0.81, 0.65, 0.06, 0.04),
-
-    # Online
-    "availability_pct":   (0.45, 0.59, 0.06, 0.07),
-    "despatched_on_time": (0.52, 0.59, 0.08, 0.05),
-    "delivered_on_time":  (0.59, 0.59, 0.08, 0.05),
-    "cc_avg_wait":        (0.62, 0.65, 0.06, 0.07),
-
-    # Payroll
-    "payroll_outturn":    (0.53, 0.46, 0.08, 0.10),
-    "absence_outturn":    (0.64, 0.45, 0.05, 0.04),
-    "productive_outturn": (0.64, 0.50, 0.05, 0.04),
-    "holiday_outturn":    (0.73, 0.45, 0.05, 0.04),
-    "current_base_cost":  (0.73, 0.50, 0.05, 0.04),
-
-    # Card Engagement
-    "swipe_rate":     (0.83, 0.45, 0.05, 0.04),
-    "swipes_wow_pct": (0.90, 0.45, 0.05, 0.04),
-    "new_customers":  (0.83, 0.50, 0.05, 0.04),
-    "swipes_yoy_pct": (0.90, 0.50, 0.05, 0.04),
-
-    # Production Planning + misc
-    "data_provided":   (0.07, 0.60, 0.06, 0.06),
-    "trusted_data":    (0.07, 0.66, 0.06, 0.06),
-    "my_reports":      (0.34, 0.46, 0.05, 0.06),
-    "weekly_activity": (0.44, 0.48, 0.06, 0.06),
-    "complaints_key":  (0.96, 0.27, 0.05, 0.06),
-}
-
-def _normalize_rect(value: Union[list, tuple, dict]) -> Optional[Tuple[float,float,float,float]]:
-    if isinstance(value, (list, tuple)) and len(value) == 4:
-        rect = tuple(float(v) for v in value)
-    elif isinstance(value, dict):
-        if "rect" in value and isinstance(value["rect"], (list, tuple)) and len(value["rect"]) == 4:
-            rect = tuple(float(v) for v in value["rect"])
-        elif all(k in value for k in ("x","y","w","h")):
-            rect = (float(value["x"]), float(value["y"]), float(value["w"]), float(value["h"]))
-        elif all(k in value for k in ("left","top","width","height")):
-            rect = (float(value["left"]), float(value["top"]), float(value["width"]), float(value["height"]))
-        else:
-            return None
-    else:
-        return None
-    x,y,w,h = rect
-    if not (0 <= x <= 1 and 0 <= y <= 1 and 0 <= w <= 1 and 0 <= h <= 1):
-        return None
-    return (x,y,w,h)
-
-def load_roi_map() -> Dict[str, Tuple[float,float,float,float]]:
-    merged = dict(DEFAULT_ROI_MAP)
-    if ROI_MAP_PATH.exists():
-        try:
-            data = json.loads(ROI_MAP_PATH.read_text(encoding="utf-8"))
-            applied = 0
-            for k, v in data.items():
-                rect = _normalize_rect(v)
-                if rect:
-                    merged[k] = rect
-                    applied += 1
-            log.info(f"Loaded ROI overrides from {ROI_MAP_PATH.name}: {applied} entrie(s).")
-        except Exception as e:
-            log.error(f"Failed to read {ROI_MAP_PATH.name}: {e}. Using defaults.")
-    else:
-        log.info("No roi_map.json found — using default ROI map.")
-    return merged
-
-def scale_roi_map(roi_map: Dict[str, Tuple[float,float,float,float]], shot_w: int, shot_h: int) -> Dict[str, Tuple[float,float,float,float]]:
-    """Return a map expressed as absolute pixels scaled to the actual screenshot size."""
-    sx = shot_w / BASE_W if BASE_W else 1.0
-    sy = shot_h / BASE_H if BASE_H else 1.0
-    scaled = {}
-    for k, (x,y,w,h) in roi_map.items():
-        # convert normalized → pixel on base → scale to actual → back to normalized *for this image*
-        # but we will crop using pixel coords directly, so store pixels
-        scaled[k] = (int(x*shot_w), int(y*shot_h), int(w*shot_w), int(h*shot_h))
-    log.info(f"ROI auto-scale factors: sx={sx:.3f}, sy={sy:.3f} (shot {shot_w}×{shot_h}, base {BASE_W}×{BASE_H})")
-    return scaled
-
-ROI_MAP_NORM = load_roi_map()
-
-# ──────────────────────────────────────────────────────────────────────────────
-# ROI helpers
-# ──────────────────────────────────────────────────────────────────────────────
-def _crop_roi_pixels(img: Image.Image, rect_px: Tuple[int,int,int,int]) -> Image.Image:
-    x,y,w,h = rect_px
-    box = (x, y, x+w, y+h)
+def crop_roi(img: Image.Image, norm_roi: Tuple[float,float,float,float], base_w: int, base_h: int) -> Image.Image:
+    W, H = img.size
+    # scale normalized coordinates by base, then remap to current image size
+    x, y, w, h = norm_roi
+    # target pixels if base==current; normalize to current by W/(base_w), H/(base_h)
+    px = int((x * base_w) * (W / base_w))
+    py = int((y * base_h) * (H / base_h))
+    pw = int((w * base_w) * (W / base_w))
+    ph = int((h * base_h) * (H / base_h))
+    box = (px, py, px + pw, py + ph)
     return img.crop(box)
 
-def _looks_black(img: Image.Image) -> bool:
-    try:
-        g = img.convert("L")
-        stat = ImageStat.Stat(g)
-        return stat.mean[0] < 3 and stat.var[0] < 5
-    except Exception:
-        return False
-
-def _ocr_from_image(img: Image.Image, want_time=False, allow_percent=True) -> str:
-    if not OCR_AVAILABLE:
-        return "—"
+def ocr_number_from_image(img: Image.Image, want_time=False, allow_percent=True) -> str:
     try:
         w,h = img.size
         if max(w,h) < 240:
-            img = img.resize((int(w*2.0), int(h*2.0)))
-        g = img.convert("L")
-        txt = pytesseract.image_to_string(g, config="--psm 7")
+            scale = 240 / max(w,h)
+            img = img.resize((int(w*scale), int(h*scale)))
+        img = img.convert("L")
+        cfg = "--psm 7"
+        txt = pytesseract.image_to_string(img, config=cfg)
         if want_time:
             m = re.search(r"\b\d{2}:\d{2}\b", txt)
             if m: return m.group(0)
@@ -467,50 +436,53 @@ def _ocr_from_image(img: Image.Image, want_time=False, allow_percent=True) -> st
         pass
     return "—"
 
-def draw_roi_overlay(img: Image.Image, outfile: Path, roi_px_map: Dict[str, Tuple[int,int,int,int]]):
+def draw_roi_overlay(img: Image.Image, rois: Dict[str, Tuple[float,float,float,float]], base_w: int, base_h: int, ts: int):
     try:
-        dbg = img.copy().convert("RGB")
+        dbg = img.copy()
         draw = ImageDraw.Draw(dbg)
-        for key, (x,y,w,h) in roi_px_map.items():
-            box = (x, y, x+w, y+h)
+        W,H = dbg.size
+        for key, norm in rois.items():
+            x,y,w,h = norm
+            px = int((x * base_w) * (W / base_w))
+            py = int((y * base_h) * (H / base_h))
+            pw = int((w * base_w) * (W / base_w))
+            ph = int((h * base_h) * (H / base_h))
+            box = (px, py, px+pw, py+ph)
             draw.rectangle(box, outline=(0,255,0), width=2)
-            draw.text((x+3, y+3), key, fill=(0,255,0))
-        dbg.save(outfile)
-        log.info(f"ROI overlay saved → {outfile.name}")
+            draw.text((px+3, py+3), key, fill=(0,255,0))
+        out = SCREENS_DIR / f"{ts}_roi_overlay.png"
+        dbg.save(out)
+        log.info(f"ROI overlay saved → {out.name}")
     except Exception:
         pass
 
-def fill_from_roi(metrics: Dict[str,str], img: Optional[Image.Image], roi_norm_map: Dict[str, Tuple[float,float,float,float]]):
+def fill_from_roi(metrics: Dict[str,str], img: Optional[Image.Image], rois: Dict[str, Tuple[float,float,float,float]], base_w: int, base_h: int):
     if img is None:
         return
-    W,H = img.size
-    roi_px_map = scale_roi_map(roi_norm_map, W, H)
-
     ts = int(time.time())
-    any_filled = False
-    for key, rect_px in roi_px_map.items():
-        if metrics.get(key) and metrics[key] != "—":
+    changed = False
+    for key, norm in rois.items():
+        if metrics.get(key, "—") != "—":
             continue
-        crop = _crop_roi_pixels(img, rect_px)
+        want_time = (key == "cc_avg_wait")
+        allow_percent = not key.endswith("_nps")
+        crop = crop_roi(img, norm, base_w, base_h)
+        # save small crops for debug
         try:
-            crop.save(SCREENS_DIR / f"{ts}_{key}_crop.png")
+            crop_path = SCREENS_DIR / f"{ts}_{key}_crop.png"
+            crop.save(crop_path)
         except Exception:
             pass
-        black_flag = _looks_black(crop)
-        val = _ocr_from_image(crop, want_time=(key=="cc_avg_wait"), allow_percent=not key.endswith("_nps"))
-        log.info(f"ROI {key}: px={rect_px} black={black_flag} -> OCR='{val}'")
+        val = ocr_number_from_image(crop, want_time=want_time, allow_percent=allow_percent)
         if val and val != "—":
             metrics[key] = val
-            any_filled = True
-
-    draw_roi_overlay(img, SCREENS_DIR / f"{ts}_roi_overlay.png", roi_px_map)
-    if any_filled:
+            changed = True
+    draw_roi_overlay(img, rois, base_w, base_h, ts)
+    if changed:
         log.info("Filled some missing values from ROI OCR.")
-    else:
-        log.warning("ROI OCR did not fill any values (check crops/overlay & mapping).")
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Card + CSV
+# Build + send Chat card
 # ──────────────────────────────────────────────────────────────────────────────
 def kv(label: str, val: str) -> dict:
     return {"decoratedText": {"topLabel": label, "text": (val or "—")}}
@@ -581,8 +553,12 @@ def send_daily_card(metrics: Dict[str, str]) -> bool:
     if not MAIN_WEBHOOK or "chat.googleapis.com" not in MAIN_WEBHOOK:
         log.error("MAIN_WEBHOOK/DAILY_WEBHOOK missing or invalid — cannot send daily report.")
         return False
-    return _post_with_backoff(MAIN_WEBHOOK, build_chat_card(metrics))
+    payload = build_chat_card(metrics)
+    return _post_with_backoff(MAIN_WEBHOOK, payload)
 
+# ──────────────────────────────────────────────────────────────────────────────
+# CSV logging
+# ──────────────────────────────────────────────────────────────────────────────
 CSV_HEADERS = [
     "page_timestamp","period_range","store_line",
     "sales_total","sales_lfl","sales_vs_target",
@@ -607,13 +583,15 @@ def write_csv_row(metrics: Dict[str,str]):
     log.info(f"Appended daily metrics row to {DAILY_LOG_CSV.name}")
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Main
+# Run
 # ──────────────────────────────────────────────────────────────────────────────
 def run_daily_scrape():
     if not AUTH_STATE_PATH.exists():
         alert(["⚠️ Daily dashboard scrape needs login. Run `python scrape.py now` once to save auth_state.json."])
         log.error("auth_state.json not found.")
         return
+
+    rois, base_w, base_h = load_roi_map()
 
     with sync_playwright() as p:
         browser = context = page = None
@@ -623,25 +601,24 @@ def run_daily_scrape():
             browser = p.chromium.launch(headless=True)
             context = browser.new_context(
                 storage_state=str(AUTH_STATE_PATH),
-                viewport=VIEWPORT,
-                device_scale_factor=DEVICE_SCALE_FACTOR,
-                is_mobile=False,
+                viewport={"width": VIEWPORT["width"], "height": VIEWPORT["height"]},
+                device_scale_factor=VIEWPORT["device_scale_factor"],
                 user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36",
-                screen=VIEWPORT,  # align "screen" and "viewport"
             )
             page = context.new_page()
-            page.add_init_script("document.addEventListener('DOMContentLoaded', () => { document.body.style.zoom='1'; });")
-
             if not open_and_prepare(page):
                 alert(["⚠️ Daily scrape blocked by login or load failure — please re-login."])
                 return
 
+            # Screenshot viewport (matches ROI base)
             img = screenshot_viewport(page)
-            img, words = ocr_fullpage(img)
 
+            # OCR words + label proximity
+            if img:
+                words = ocr_words(img)
             metrics = build_metrics_from_ocr_labels(words)
 
-            # Long context fields via DOM text
+            # Context from DOM text (for long strings)
             try:
                 body = page.inner_text("body")
             except Exception:
@@ -654,8 +631,8 @@ def run_daily_scrape():
                           body, flags=re.S)
             metrics["store_line"] = m.group(0).strip() if m else ""
 
-            # ROI fallback (auto-scaled to screenshot)
-            fill_from_roi(metrics, img, ROI_MAP_NORM)
+            # ROI fallback for anything still missing
+            fill_from_roi(metrics, img, rois, base_w, base_h)
 
         finally:
             try:
