@@ -1,4 +1,4 @@
-name: Looker Studio Scraper
+name: Looker Studio Scrapers
 
 on:
   workflow_dispatch: {}
@@ -13,7 +13,7 @@ concurrency:
 jobs:
   scrape:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 40
 
     steps:
       - name: Checkout
@@ -31,19 +31,20 @@ jobs:
           python -m playwright install --with-deps chromium
 
       # ========= RESTORE STATE =========
-      - name: Restore scraper state (auth_state.json + comments_log.csv)
+      - name: Restore scraper state (auth + logs)
         id: cache-restore
         uses: actions/cache/restore@v4
         with:
           path: |
             auth_state.json
             comments_log.csv
+            complaints_log.csv
           key: scraper-state-${{ runner.os }}-v1
           restore-keys: |
             scraper-state-${{ runner.os }}-
             scraper-state-
 
-      # Optional fallback from Base64 secret
+      # Optional fallback from Base64 secret for auth_state.json
       - name: Fallback restore auth_state.json from secret
         if: ${{ !hashFiles('auth_state.json') }}
         env:
@@ -53,7 +54,7 @@ jobs:
             echo "$AUTH_STATE_B64" | base64 -d > auth_state.json
             echo "Restored auth_state.json from AUTH_STATE_B64 secret."
           else
-            echo "No AUTH_STATE_B64 secret provided — continuing without auth_state.json."
+            echo "No AUTH_STATE_B64 provided — continuing without preseeded auth."
           fi
 
       # ========= CONFIG =========
@@ -65,21 +66,29 @@ jobs:
             echo "GOOGLE_PASSWORD=${{ secrets.GOOGLE_PASSWORD }}"
             echo "MAIN_WEBHOOK=${{ secrets.MAIN_WEBHOOK }}"
             echo "ALERT_WEBHOOK=${{ secrets.ALERT_WEBHOOK }}"
+            echo "COMPLAINTS_WEBHOOK=${{ secrets.COMPLAINTS_WEBHOOK }}"
           } > config.ini
 
-      # ========= RUN SCRAPER =========
-      - name: Run scraper (headed via Xvfb, phone 2FA supported)
+      # ========= RUN NPS SCRAPER =========
+      - name: Run NPS scraper (headed via Xvfb for potential 2FA)
         env:
           CI_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           xvfb-run -a python scrape.py now
+
+      # ========= RUN COMPLAINTS SCRAPER =========
+      - name: Run Complaints scraper (headed via Xvfb for potential 2FA)
+        env:
+          CI_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          xvfb-run -a python scrape_complaints.py now
 
       # ========= STATE SUMMARY =========
       - name: State summary (files and sizes)
         if: always()
         run: |
           echo "::group::State files"
-          for f in auth_state.json comments_log.csv scrape.log; do
+          for f in auth_state.json comments_log.csv complaints_log.csv scrape.log scrape_complaints.log; do
             if [ -f "$f" ]; then
               echo "[OK] $f -> $(wc -c < "$f") bytes"
             else
@@ -87,33 +96,29 @@ jobs:
             fi
           done
           echo "::endgroup::"
-          echo "::group::comments_log.csv (last 20 lines)"
-          if [ -f comments_log.csv ]; then
-            tail -n 20 comments_log.csv || true
-          else
-            echo "comments_log.csv not found"
-          fi
+          echo "::group::comments_log.csv (last 10 lines)"
+          if [ -f comments_log.csv ]; then tail -n 10 comments_log.csv || true; else echo "comments_log.csv not found"; fi
+          echo "::endgroup::"
+          echo "::group::complaints_log.csv (last 10 lines)"
+          if [ -f complaints_log.csv ]; then tail -n 10 complaints_log.csv || true; else echo "complaints_log.csv not found"; fi
           echo "::endgroup::"
           echo "::group::screens/ listing"
-          if [ -d screens ]; then
-            ls -lah screens || true
-          else
-            echo "no screens/ dir"
-          fi
+          if [ -d screens ]; then ls -lah screens || true; else echo "no screens/ dir"; fi
           echo "::endgroup::"
 
       # ========= SAVE UPDATED STATE =========
       - name: Save updated scraper state to cache
-        if: ${{ hashFiles('auth_state.json', 'comments_log.csv') != '' }}
+        if: ${{ hashFiles('auth_state.json', 'comments_log.csv', 'complaints_log.csv') != '' }}
         uses: actions/cache/save@v4
         with:
           path: |
             auth_state.json
             comments_log.csv
+            complaints_log.csv
           key: scraper-state-${{ runner.os }}-v1
 
       # ========= UPLOAD ARTIFACTS =========
-      - name: Upload current state as artifact
+      - name: Upload state artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -121,6 +126,7 @@ jobs:
           path: |
             auth_state.json
             comments_log.csv
+            complaints_log.csv
           if-no-files-found: ignore
 
       - name: Upload logs & screenshots
@@ -130,5 +136,7 @@ jobs:
           name: logs-and-screens
           path: |
             scrape.log
+            scrape_complaints.log
             screens/*
+            screenshot_complaints_*.png
           if-no-files-found: ignore
