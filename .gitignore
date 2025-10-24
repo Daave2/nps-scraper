@@ -1,4 +1,13 @@
+# Python virtualenv
+.venv/
+__pycache__/
+
+# Scraper runtime files
 auth_state.json
 comments_log.csv
-screens/
 scrape.log
+screens/
+
+# Editor / OS
+.DS_Store
+*.pyc
