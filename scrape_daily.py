@@ -11,7 +11,7 @@ Key points in this build:
 - Availability: prefer a % within 3 lines ABOVE the label, else search nearby (prevents bleed).
 - C&C average wait: nearest HH:MM to the label (wide window).
 - Waste & Markdowns: robust block regex (Total row with (+/-) and (+/-)%).
-- Keeps ROI OCR fallback and debug artifacts (full screenshot, numbered lines, ROI overlay).
+- Updated ROI map for accurate OCR fallback on gauges and key tiles.
 """
 
 import os
@@ -257,7 +257,7 @@ def _contains_num_of_type(s: str, kind: str) -> Optional[str]:
     if kind == "money":
         m = NUM_MONEY_RE.search(s)
         if m: return re.sub(r"\s+", "", m.group(0))  # tidy spaces
-        m2 = re.search(r"-?\d+(?:\.\d+)?[KMB]", s, re.I); return m2.group(0) if m2 else None
+        m2 = re.search(r"-?\d+(?:\.\d+)?[KMB]?", s, re.I); return m2.group(0) if m2 else None
     m = NUM_ANY_RE.search(s); return m.group(0) if m else None
 
 def _idx(lines: List[str], needle: str, start=0, end=None) -> int:
@@ -493,31 +493,38 @@ def parse_from_lines(lines: List[str]) -> Dict[str, str]:
     return m
 
 # ──────────────────────────────────────────────────────────────────────────────
-# ROI OCR fallback
+# ROI OCR fallback (UPDATED with corrected coordinates)
 # ──────────────────────────────────────────────────────────────────────────────
 DEFAULT_ROI_MAP = {
-    # Gauges row (override in roi_map.json if needed)
-    "colleague_happiness": (0.235, 0.205, 0.095, 0.135),
-    "supermarket_nps":     (0.385, 0.205, 0.095, 0.135),
-    "cafe_nps":            (0.535, 0.205, 0.095, 0.135),
-    "click_collect_nps":   (0.685, 0.205, 0.095, 0.135),
-    "home_delivery_nps":   (0.835, 0.205, 0.095, 0.135),
-    "customer_toilet_nps": (0.955, 0.205, 0.095, 0.135),
+    # Gauges row (UPDATED)
+    "colleague_happiness": (0.252, 0.230, 0.060, 0.040),
+    "supermarket_nps":     (0.402, 0.230, 0.050, 0.040),
+    "cafe_nps":            (0.552, 0.230, 0.050, 0.040),
+    "click_collect_nps":   (0.702, 0.230, 0.050, 0.040),
+    "home_delivery_nps":   (0.852, 0.230, 0.050, 0.040),
+    "customer_toilet_nps": (0.950, 0.230, 0.050, 0.040),
 
-    # Waste & Markdowns TOTAL row cells
+    # Waste & Markdowns TOTAL row cells (Original, kept as backup)
     "waste_total":     (0.105, 0.415, 0.065, 0.035),
     "markdowns_total": (0.170, 0.415, 0.065, 0.035),
     "wm_total":        (0.235, 0.415, 0.065, 0.035),
     "wm_delta":        (0.300, 0.415, 0.065, 0.035),
     "wm_delta_pct":    (0.365, 0.415, 0.065, 0.035),
 
-    # Online
-    "availability_pct":   (0.455, 0.605, 0.065, 0.085),
-    "despatched_on_time": (0.515, 0.585, 0.085, 0.055),
-    "delivered_on_time":  (0.585, 0.585, 0.085, 0.055),
-    "cc_avg_wait":        (0.615, 0.650, 0.065, 0.085),
+    # Online (UPDATED for better accuracy)
+    "availability_pct":   (0.480, 0.770, 0.050, 0.040),
+    "despatched_on_time": (0.515, 0.585, 0.085, 0.055), # Still targets blank area
+    "delivered_on_time":  (0.585, 0.585, 0.085, 0.055), # Still targets blank area
+    "cc_avg_wait":        (0.620, 0.770, 0.065, 0.040),
+    
+    # Payroll (ADDED for robust fallback, line-parsing usually gets these)
+    "payroll_outturn":    (0.457, 0.485, 0.065, 0.040),
+    "absence_outturn":    (0.535, 0.485, 0.065, 0.040),
+    "productive_outturn": (0.535, 0.540, 0.065, 0.040),
+    "holiday_outturn":    (0.615, 0.485, 0.065, 0.040),
+    "current_base_cost":  (0.615, 0.540, 0.065, 0.040),
 
-    # Front End Service
+    # Front End Service (Original, kept as backup)
     "sco_utilisation": (0.680, 0.590, 0.065, 0.060),
     "efficiency":      (0.940, 0.585, 0.090, 0.120),
     "scan_rate":       (0.680, 0.655, 0.065, 0.050),
@@ -550,7 +557,8 @@ def ocr_cell(img: "Image.Image", want_time=False, allow_percent=True) -> str:
         w, h = img.size
         if max(w, h) < 240:
             img = img.resize((int(w*2), int(h*2)))
-        txt = pytesseract.image_to_string(img, config="--psm 7")
+        # Use simple PSM for single block of text/number
+        txt = pytesseract.image_to_string(img, config="--psm 7") 
         if want_time:
             m = TIME_RE.search(txt)
             if m: return m.group(0)
@@ -561,6 +569,9 @@ def ocr_cell(img: "Image.Image", want_time=False, allow_percent=True) -> str:
             if m and m.group(0): return m.group(0)
         m = re.search(r"\b-?\d{1,3}\b", txt)
         if m and m.group(0): return m.group(0)
+        # Catch case where OCR reads '-' for missing NPS gauges
+        if re.search(r"^\s*-\s*$", txt.strip()):
+            return "—"
     except Exception:
         pass
     return "—"
