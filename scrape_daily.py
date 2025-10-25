@@ -316,6 +316,14 @@ def sales_three_after_total(lines: List[str]) -> Optional[Tuple[str,str,str]]:
             break
     return None
 
+# NEW: safe "coalesce" to handle "—" being truthy
+def coalesce(*vals: str) -> str:
+    """Return the first value that isn't empty and isn't '—'."""
+    for v in vals:
+        if v and v != "—":
+            return v
+    return "—"
+
 # FES helpers (scoped KPI value + correctly paired vs Target)
 def _fes_value(lines: List[str], label: str, num_type: str, scope: Tuple[int,int]) -> str:
     s, e = scope
@@ -328,7 +336,6 @@ def _fes_value(lines: List[str], label: str, num_type: str, scope: Tuple[int,int
     vsi = _idx(lines, "vs Target", li+1, e)
     limit = min([x for x in [bound, vsi if vsi >= 0 else e] if x > li], default=e)
     # typed search right after label; if nothing, peek one line above (some tiles render above)
-    # then do a bounded outward search inside KPI area
     # after
     for i in range(li+1, min(limit, li+1+8)):
         v = _contains_num_of_type(lines[i], num_type)
@@ -418,8 +425,11 @@ def parse_from_lines(lines: List[str]) -> Dict[str, str]:
         m.update({k: "—" for k in ["waste_total","markdowns_total","wm_total","wm_delta","wm_delta_pct"]})
 
     # ── Front End Service (scoped) ───────────────────────────────────────────
-    # Support both "Sco" and "SCO"
-    m["sco_utilisation"]         = _fes_value(lines, "Sco Utilisation", "percent", FES_SCOPE) or _fes_value(lines, "SCO Utilisation", "percent", FES_SCOPE)
+    # Use coalesce to handle "Sco" vs "SCO" variants (since "—" is truthy)
+    m["sco_utilisation"]         = coalesce(
+        _fes_value(lines, "Sco Utilisation", "percent", FES_SCOPE),
+        _fes_value(lines, "SCO Utilisation", "percent", FES_SCOPE),
+    )
     m["efficiency"]              = _fes_value(lines, "Efficiency",      "percent", FES_SCOPE)
     m["scan_rate"]               = _fes_value(lines, "Scan Rate",       "integer", FES_SCOPE)
     m["interventions"]           = _fes_value(lines, "Interventions",   "integer", FES_SCOPE)
