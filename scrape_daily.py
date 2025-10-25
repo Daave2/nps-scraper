@@ -261,7 +261,7 @@ def dump_numbered_lines(txt: str) -> List[str]:
     return lines
 
 def _contains_num_of_type(s: str, kind: str) -> Optional[str]:
-    # --- TARGETED FIXES: Enforce % if number found ---
+    # --- TARGETED FIXES START: Enforce % if number found ---
     if kind == "percent_format":
         m = NUM_PCT_RE.search(s)
         if m: return m.group(0)
@@ -272,7 +272,7 @@ def _contains_num_of_type(s: str, kind: str) -> Optional[str]:
             if not re.search(r"[£KMB]", m_num.group(0), re.I):
                 return m_num.group(0) + "%"
         return None
-    # --- END TARGETED FIXES ---
+    # --- TARGETED FIXES END ---
     
     if kind == "time":
         m = TIME_RE.search(s); return m.group(0) if m else None
@@ -416,6 +416,10 @@ def extract_gemini_metrics(metrics: Dict[str, str], image_path: Path) -> Dict[st
     if metrics.get("complaints_key") in [None, "—", "0"]:
         fields_to_query.append("key_customer_complaints")
     
+    # Add other key metrics to query Gemini for validation (can remove later if confident in line parsing)
+    fields_to_query.extend(["swipe_rate", "swipes_wow_pct"])
+    fields_to_query = list(set(fields_to_query)) # Remove duplicates
+
     if not fields_to_query:
         log.info("All high-value metrics were successfully line-parsed. Skipping Gemini call.")
         return metrics
@@ -435,7 +439,7 @@ def extract_gemini_metrics(metrics: Dict[str, str], image_path: Path) -> Dict[st
     
     user_prompt = (
         f"Analyze the image and return the exact values for the following metrics as a single JSON object. "
-        f"For any NPS value, return the number. For Payroll/Finance, return the number with K or M/B if present, and the negative sign if present. "
+        f"For any NPS value, return the number. For Payroll/Finance, include K or M/B if present, and the negative sign if present. "
         f"Metrics to extract: {list(prompt_map.keys())}"
     )
 
@@ -466,7 +470,7 @@ def extract_gemini_metrics(metrics: Dict[str, str], image_path: Path) -> Dict[st
         for ai_key, ai_val in ai_data.items():
             python_key = prompt_map.get(ai_key)
             if python_key and ai_val is not None:
-                # Update the metric, letting the AI's result overwrite the empty placeholder
+                # 💥 The AI's result is the definitive value
                 updated_metrics[python_key] = str(ai_val).strip()
                 log.info(f"Gemini Success: {python_key} -> {updated_metrics[python_key]}")
 
@@ -533,8 +537,7 @@ def parse_from_lines(lines: List[str]) -> Dict[str, str]:
     else:
         m.update({k: "—" for k in ["waste_total","markdowns_total","wm_total","wm_delta","wm_delta_pct"]})
 
-    # ── Front End Service (scoped) ───────────────────────────────────────────
-    # These are highly likely to be extracted here (easy text), but Gemini serves as a fallback for the rest
+    # ── Front End Service (Line Parse) ───────────────────────────────────────────
     m["sco_utilisation"]         = coalesce(_fes_value(lines, "Sco Utilisation", "percent", FES_SCOPE), _fes_value(lines, "SCO Utilisation", "percent", FES_SCOPE))
     m["efficiency"]              = _fes_value(lines, "Efficiency",      "percent", FES_SCOPE)
     m["scan_rate"]               = _fes_value(lines, "Scan Rate",       "integer", FES_SCOPE)
@@ -544,34 +547,32 @@ def parse_from_lines(lines: List[str]) -> Dict[str, str]:
     m["interventions_vs_target"] = _fes_vs(lines, "Interventions",   FES_SCOPE)
     m["mainbank_vs_target"]      = _fes_vs(lines, "Mainbank Closed", FES_SCOPE)
     
-    # ── Online (Scoped, easy parts) / Card Engagement (easy parts) ─────────────────
+    # ── Other easy/contextual metrics (Line Parse) ─────────────────────────────────────────
     m["cc_avg_wait"]        = value_near_scoped(lines, "average wait",       "time",    ONLINE_SCOPE, near_before=15, near_after=20)
     m["new_customers"]      = value_near_scoped(lines, "New Customers",      "integer", CARD_SCOPE, near_before=6, near_after=10)
     m["swipe_rate"]         = value_near_scoped(lines, "Swipe Rate",         "percent_format", CARD_SCOPE, near_before=4, near_after=8)
     m["swipes_wow_pct"]     = value_near_scoped(lines, "Swipes WOW",         "percent_format", CARD_SCOPE, near_before=4, near_after=8)
-    
-    # ── Other easy/contextual metrics ─────────────────────────────────────────
     m["data_provided"] = value_near_scoped(lines, "Data Provided", "percent_format", PP_SCOPE, near_before=6, near_after=8)
     m["trusted_data"]  = value_near_scoped(lines, "Trusted Data",  "percent_format", PP_SCOPE, near_before=6, near_after=8)
     m["my_reports"]    = value_near_scoped(lines, "My Reports", "integer", section_bounds(lines, "My Reports", ["Cafe NPS","Privacy","Payroll","Shrink","Waste & Markdowns"]), near_before=6, near_after=10)
     m["complaints_key"] = value_near_scoped(lines, "Key Customer Complaints", "integer", COMPLAINTS_SCOPE, near_before=10, near_after=12)
-    m["weekly_activity"] = "No data" if "No data" in "\n".join(lines[clean_rotate_scope[0]:clean_rotate_scope[1]]) else "—"
+    m["weekly_activity"] = "No data" if "No data" in "\n".join(lines[CLEAN_ROTATE_SCOPE[0]:CLEAN_ROTATE_SCOPE[1]]) else "—"
 
 
     # ── Placeholder for Gemini Metrics (will be overwritten by AI call) ────────────────
     for k in GEMINI_METRICS:
-        # Check if the line parser already found the value. If so, apply formatting.
+        # Check if the line parser already found the value. If so, apply formatting and keep it.
         if k in m and m[k] not in [None, "—"]:
             if "pct" in k or k in ["availability_pct", "waste_validation"]:
                 if "%" not in m[k] and re.match(r"^-?\d+(\.\d+)?$", m[k]):
                     m[k] += "%"
-            continue # Keep the line-parsed value
+            continue 
         m[k] = "—" # Mark for Gemini if not found
         
     return m
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Screenshot is now handled by the main flow and Gemini API
+# Main
 # ──────────────────────────────────────────────────────────────────────────────
 def run_daily_scrape():
     if not AUTH_STATE.exists():
@@ -579,9 +580,11 @@ def run_daily_scrape():
         log.error("auth_state.json not found.")
         return
     
-    if not GEMINI_AVAILABLE or not GEMINI_API_KEY:
-        alert(["⚠️ Gemini API Key is missing or library is not installed. Falling back to brittle text parsing only."])
-        log.error("Gemini environment not ready.")
+    if not GEMINI_AVAILABLE:
+        alert(["⚠️ Gemini library (google-genai) is not installed. Please install it to use the AI features."])
+    
+    if not GEMINI_API_KEY:
+        alert(["⚠️ Gemini API Key is missing. Check your GitHub Secrets/Environment variables."])
 
 
     with sync_playwright() as p:
@@ -603,6 +606,7 @@ def run_daily_scrape():
             # Screenshot for GEMINI and debugging
             img_bytes = page.screenshot(full_page=True, type="png")
             ts = int(time.time())
+            SCREENS_DIR.mkdir(parents=True, exist_ok=True)
             screenshot_path = SCREENS_DIR / f"{ts}_fullpage.png"
             save_bytes(screenshot_path, img_bytes)
             
@@ -614,6 +618,9 @@ def run_daily_scrape():
             # 💥 FALLBACK: Use Gemini for all metrics marked as '—' or requiring visual confirmation
             if GEMINI_AVAILABLE and GEMINI_API_KEY and screenshot_path.exists():
                  metrics = extract_gemini_metrics(metrics, screenshot_path)
+            else:
+                 log.warning("Skipping Gemini Extraction. Results may be incomplete or incorrect due to missing dependencies/key.")
+
 
         finally:
             try:
