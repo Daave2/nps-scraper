@@ -3,61 +3,52 @@ name: Looker Studio Scraper Suite
 on:
   workflow_dispatch: {}
   schedule:
-    # Runs at 08:05, 11:05, 14:05, 17:05, 20:05 London-time equivalent in UTC cron
-    - cron: "5 7,10,13,16,19 * * *"
+    # Daily Report: Runs once at 8:30 AM GMT (08:30 UTC)
+    - cron: "30 8 * * *" 
+    # Periodic Scrapes: Runs every 2 hours from 10:30 AM to 8:30 PM GMT (10:30-20:30 UTC)
+    - cron: "30 10-20/2 * * *"
 
 concurrency:
   group: looker-scrape
-  cancel-in-progress: false
+  cancel-in-progress: true # Changed to true for cleaner operation
 
 jobs:
-  scrape:
+  # ----------------------------------------------------------------------
+  # JOB 1: Daily Report (Runs once at 8:30 AM GMT)
+  # ----------------------------------------------------------------------
+  daily_report:
     runs-on: ubuntu-latest
     timeout-minutes: 40
+    if: github.event_name == 'workflow_dispatch' || github.event.schedule == '30 8 * * *'
 
     steps:
-      # ────────────────────────────────
-      # Checkout
-      # ────────────────────────────────
       - name: Checkout
         uses: actions/checkout@v4
 
       # ────────────────────────────────
-      # System deps for OCR
+      # Install Dependencies for Gemini/Playwright/Python
       # ────────────────────────────────
-      - name: Install Tesseract (for OCR fallback)
+      - name: Setup Python & Install Dependencies (Gemini Ready)
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends tesseract-ocr
-
-      # ────────────────────────────────
-      # Setup Python + Playwright + OCR deps
-      # ────────────────────────────────
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-
-      - name: Install Python deps
-        run: |
           python -m pip install -U pip
-          pip install playwright requests schedule pytz pillow pytesseract
+          pip install playwright requests pillow google-genai schedule pytz
           python -m playwright install --with-deps chromium
 
       # ────────────────────────────────
-      # Export helpers/env
+      # Export Env Vars (Including GEMINI_API_KEY)
       # ────────────────────────────────
-      - name: Export TODAY, CI_RUN_URL and ROI_MAP_FILE
+      - name: Export ENV VARS
         run: |
           echo "TODAY=$(date -u +%Y%m%d)" >> $GITHUB_ENV
           echo "CI_RUN_URL=${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" >> $GITHUB_ENV
           echo "ROI_MAP_FILE=${{ github.workspace }}/roi_map.json" >> $GITHUB_ENV
+          echo "GEMINI_API_KEY=${{ secrets.GEMINI_API_KEY }}" >> $GITHUB_ENV # Export Gemini Key
 
       # ────────────────────────────────
-      # Restore state from cache (auth + CSV logs + ROI map)
+      # Restore State
       # ────────────────────────────────
-      - name: Restore scraper state (auth + logs + ROI)
-        id: cache-restore
+      - name: Restore scraper state (auth + logs)
         uses: actions/cache/restore@v4
         with:
           path: |
@@ -69,24 +60,116 @@ jobs:
           key: scraper-state-${{ runner.os }}-v1-${{ github.ref_name }}-${{ env.TODAY }}
           restore-keys: |
             scraper-state-${{ runner.os }}-v1-${{ github.ref_name }}-
-            scraper-state-${{ runner.os }}-v1-
 
       # ────────────────────────────────
-      # Optional fallback (first-ever run)
+      # Create config.ini (Updated with GEMINI_API_KEY)
       # ────────────────────────────────
-      - name: Fallback restore auth_state.json from secret
+      - name: Create/Update config.ini from secrets
         run: |
-          if [ -n "${AUTH_STATE_B64}" ]; then
-            echo "${AUTH_STATE_B64}" | base64 --decode > auth_state.json
-            echo "Decoded auth_state.json from AUTH_STATE_B64."
-          else
-            echo "No AUTH_STATE_B64 secret provided — continuing without."
-          fi
-        env:
-          AUTH_STATE_B64: ${{ secrets.AUTH_STATE_B64 }}
+          {
+            echo "[DEFAULT]"
+            echo "GOOGLE_EMAIL=${{ secrets.GOOGLE_EMAIL }}"
+            echo "GOOGLE_PASSWORD=${{ secrets.GOOGLE_PASSWORD }}"
+            echo "MAIN_WEBHOOK=${{ secrets.MAIN_WEBHOOK }}"
+            echo "ALERT_WEBHOOK=${{ secrets.ALERT_WEBHOOK }}"
+            echo "COMPLAINTS_WEBHOOK=${{ secrets.COMPLAINTS_WEBHOOK }}"
+            echo "DAILY_WEBHOOK=${{ secrets.DAILY_WEBHOOK }}"
+            echo "GEMINI_API_KEY=${{ secrets.GEMINI_API_KEY }}"
+          } > config.ini
 
       # ────────────────────────────────
-      # Create config.ini from secrets
+      # Run ALL 3 Scrapers (NPS -> Complaints -> Daily)
+      # ────────────────────────────────
+      - name: Run NPS scraper
+        run: xvfb-run -a python scrape.py now || true
+
+      - name: Run Complaints scraper
+        run: xvfb-run -a python scrape_complaints.py now || true
+
+      - name: Run Daily Report scraper (Gemini Vision)
+        run: xvfb-run -a python scrape_daily.py || true
+
+      # ────────────────────────────────
+      # Upload/Save Cache
+      # ────────────────────────────────
+      - name: Upload logs and state as artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: scraper-state-daily-${{ github.run_id }}
+          path: |
+            auth_state.json
+            comments_log.csv
+            complaints_log.csv
+            daily_report_log.csv
+            roi_map.json
+            scrape.log
+            scrape_complaints.log
+            scrape_daily.log
+            screens/
+          if-no-files-found: ignore
+
+      - name: Save updated scraper state to cache
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            auth_state.json
+            comments_log.csv
+            complaints_log.csv
+            daily_report_log.csv
+            roi_map.json
+          key: scraper-state-${{ runner.os }}-v1-${{ github.run_id }}
+
+
+  # ----------------------------------------------------------------------
+  # JOB 2: Periodic Scrapes (Runs every 2 hours after the daily report)
+  # ----------------------------------------------------------------------
+  periodic_scrapes:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    # Runs ONLY if the event is a schedule and the cron time does NOT match the daily report time
+    if: github.event.schedule == '30 10/2 * * *' || github.event.schedule == '30 12/2 * * *' || github.event.schedule == '30 14/2 * * *' || github.event.schedule == '30 16/2 * * *' || github.event.schedule == '30 18/2 * * *' || github.event.schedule == '30 20/2 * * *'
+    
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ────────────────────────────────
+      # Install Dependencies for Python/Playwright (Simplified as no Gemini needed)
+      # ────────────────────────────────
+      - name: Setup Python & Install Dependencies
+        run: |
+          sudo apt-get update
+          python -m pip install -U pip
+          pip install playwright requests pillow pytesseract schedule pytz
+          python -m playwright install --with-deps chromium
+
+      # ────────────────────────────────
+      # Export Env Vars (Simplified)
+      # ────────────────────────────────
+      - name: Export ENV VARS
+        run: |
+          echo "TODAY=$(date -u +%Y%m%d)" >> $GITHUB_ENV
+          echo "CI_RUN_URL=${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" >> $GITHUB_ENV
+
+      # ────────────────────────────────
+      # Restore State
+      # ────────────────────────────────
+      - name: Restore scraper state (auth + logs)
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            auth_state.json
+            comments_log.csv
+            complaints_log.csv
+            daily_report_log.csv
+            roi_map.json
+          key: scraper-state-${{ runner.os }}-v1-${{ github.ref_name }}-${{ env.TODAY }}
+          restore-keys: |
+            scraper-state-${{ runner.os }}-v1-${{ github.ref_name }}-
+
+      # ────────────────────────────────
+      # Create config.ini (Standard)
       # ────────────────────────────────
       - name: Create/Update config.ini from secrets
         run: |
@@ -101,55 +184,22 @@ jobs:
           } > config.ini
 
       # ────────────────────────────────
-      # Run scrapers (NPS → Complaints → Daily)
+      # Run ONLY NPS and Complaints Scrapers
       # ────────────────────────────────
       - name: Run NPS scraper
-        env:
-          CI_RUN_URL: ${{ env.CI_RUN_URL }}
         run: xvfb-run -a python scrape.py now || true
 
       - name: Run Complaints scraper
-        env:
-          CI_RUN_URL: ${{ env.CI_RUN_URL }}
         run: xvfb-run -a python scrape_complaints.py now || true
 
-      - name: Run Daily Report scraper (OCR + ROI mapping)
-        env:
-          CI_RUN_URL: ${{ env.CI_RUN_URL }}
-          ROI_MAP_FILE: ${{ env.ROI_MAP_FILE }}
-        run: xvfb-run -a python scrape_daily.py || true
-
       # ────────────────────────────────
-      # Show file states for debugging
-      # ────────────────────────────────
-      - name: Show state files
-        run: |
-          echo "::group::State files"
-          for f in auth_state.json comments_log.csv complaints_log.csv daily_report_log.csv roi_map.json scrape.log scrape_complaints.log scrape_daily.log; do
-            if [ -f "$f" ]; then
-              echo "[OK] $f -> $(wc -c < "$f") bytes"
-            else
-              echo "[MISS] $f"
-            fi
-          done
-          echo "::endgroup::"
-
-          echo "::group::daily_report_log.csv (last 5)"
-          if [ -f daily_report_log.csv ]; then tail -n 5 daily_report_log.csv || true; else echo "daily_report_log.csv not found"; fi
-          echo "::endgroup::"
-
-          echo "::group::screens/ listing"
-          if [ -d screens ]; then ls -lah screens || true; else echo "no screens/"; fi
-          echo "::endgroup::"
-
-      # ────────────────────────────────
-      # Upload artifacts for inspection
+      # Upload/Save Cache
       # ────────────────────────────────
       - name: Upload logs and state as artifact
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: scraper-state-${{ github.run_id }}
+          name: scraper-state-periodic-${{ github.run_id }}
           path: |
             auth_state.json
             comments_log.csv
@@ -158,13 +208,8 @@ jobs:
             roi_map.json
             scrape.log
             scrape_complaints.log
-            scrape_daily.log
-            screens/
           if-no-files-found: ignore
 
-      # ────────────────────────────────
-      # Save updated cache snapshot
-      # ────────────────────────────────
       - name: Save updated scraper state to cache
         uses: actions/cache/save@v4
         with:
