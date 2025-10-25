@@ -2,12 +2,12 @@
 # -*- coding: utf-8 -*-
 
 """
-Retail Performance Dashboard → Daily Summary (layout-by-lines + ROI OCR) → Google Chat
+Retail Performance Dashboard → Daily Summary (layout-by-lines + GEMINI VISION) → Google Chat
 
 Key points in this build:
-- FINAL WORKING COORDINATES: Implemented the user-generated ROI map for guaranteed accuracy.
-- Image Preprocessing: Aggressive greyscale/binarization to read red/colored fonts (NPS/Payroll) effectively.
-- Logic Fixes: Percentage formatting, fixed indentation, and robust Payroll Outturn logic.
+- Gemini Vision Integration: Uses Gemini Pro Vision for all difficult, visual-based metrics (NPS, Payroll, Shrink circles).
+- Robustness: Eliminates brittle ROI coordinates and traditional OCR misreads.
+- Efficiency: Retains fast, reliable line parsing for easy text-based metrics.
 """
 
 import os
@@ -24,13 +24,18 @@ from typing import Dict, List, Optional, Tuple
 import requests
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 
-# Optional OCR deps
+# --- GEMINI INTEGRATION IMPORTS ---
 try:
-    from PIL import Image, ImageDraw, ImageEnhance
-    import pytesseract
-    OCR_AVAILABLE = True
-except Exception:
-    OCR_AVAILABLE = False
+    from google import genai
+    from google.genai import types
+    from PIL import Image
+    GEMINI_AVAILABLE = True
+except ImportError:
+    GEMINI_AVAILABLE = False
+    class Image: pass # Placeholder for type hints
+
+# --- Placeholder for compatibility/simplicity of the final script structure ---
+OCR_AVAILABLE = False 
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Paths / constants
@@ -52,6 +57,15 @@ DASHBOARD_URL = (
 
 VIEWPORT = {"width": 1366, "height": 768}
 
+# --- METRICS REQUIRING GEMINI (The previously failing list) ---
+GEMINI_METRICS = [
+    "supermarket_nps", "colleague_happiness", "home_delivery_nps", "cafe_nps", 
+    "click_collect_nps", "customer_toilet_nps", "payroll_outturn", "absence_outturn", 
+    "productive_outturn", "holiday_outturn", "current_base_cost", "moa", 
+    "waste_validation", "unrecorded_waste_pct", "shrink_vs_budget_pct", "availability_pct",
+    "cc_avg_wait"
+]
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Logging
 # ──────────────────────────────────────────────────────────────────────────────
@@ -68,6 +82,9 @@ log.addHandler(logging.StreamHandler())
 # ──────────────────────────────────────────────────────────────────────────────
 config = configparser.ConfigParser()
 config.read(BASE_DIR / "config.ini")
+
+# Safely retrieve GEMINI_API_KEY
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", config["DEFAULT"].get("GEMINI_API_KEY"))
 
 MAIN_WEBHOOK  = config["DEFAULT"].get("DAILY_WEBHOOK") or config["DEFAULT"].get("MAIN_WEBHOOK", os.getenv("MAIN_WEBHOOK", ""))
 ALERT_WEBHOOK = config["DEFAULT"].get("ALERT_WEBHOOK",  os.getenv("ALERT_WEBHOOK", ""))
@@ -244,7 +261,7 @@ def dump_numbered_lines(txt: str) -> List[str]:
     return lines
 
 def _contains_num_of_type(s: str, kind: str) -> Optional[str]:
-    # --- TARGETED FIXES START: Enforce % if number found ---
+    # --- TARGETED FIXES: Enforce % if number found ---
     if kind == "percent_format":
         m = NUM_PCT_RE.search(s)
         if m: return m.group(0)
@@ -255,7 +272,7 @@ def _contains_num_of_type(s: str, kind: str) -> Optional[str]:
             if not re.search(r"[£KMB]", m_num.group(0), re.I):
                 return m_num.group(0) + "%"
         return None
-    # --- TARGETED FIXES END ---
+    # --- END TARGETED FIXES ---
     
     if kind == "time":
         m = TIME_RE.search(s); return m.group(0) if m else None
@@ -384,6 +401,85 @@ def _fes_vs(lines: List[str], label: str, scope: Tuple[int,int]) -> str:
         if v: return v
     return "—"
 
+# ──────────────────────────────────────────────────────────────────────────────
+# Gemini Vision Extraction (For hard-to-read metrics)
+# ──────────────────────────────────────────────────────────────────────────────
+def extract_gemini_metrics(metrics: Dict[str, str], image_path: Path) -> Dict[str, str]:
+    if not GEMINI_AVAILABLE or not GEMINI_API_KEY:
+        log.warning("Gemini API not available or key missing. Skipping AI extraction.")
+        return metrics
+
+    # 1. Determine which fields are missing or require AI validation
+    fields_to_query = [k for k in GEMINI_METRICS if metrics.get(k) in [None, "—"]]
+
+    # Also add key complaints to the AI query for robustness
+    if metrics.get("complaints_key") in [None, "—", "0"]:
+        fields_to_query.append("key_customer_complaints")
+    
+    if not fields_to_query:
+        log.info("All high-value metrics were successfully line-parsed. Skipping Gemini call.")
+        return metrics
+
+    log.info(f"Querying Gemini for {len(fields_to_query)} fields: {', '.join(fields_to_query)}")
+    
+    # Clean up keys for the prompt (e.g., 'payroll_outturn' -> 'Payroll Outturn')
+    # and map back to Python keys later.
+    prompt_map = {k.replace('_', ' ').title(): k for k in fields_to_query}
+    
+    system_instruction = (
+        "You are a hyper-accurate retail dashboard data extraction engine. Your task is to extract "
+        "the exact numeric or short text values for the requested metrics from the provided image. "
+        "Return the output as a single, valid JSON object, using the requested keys exactly as provided. "
+        "For percentages, include the '%' symbol."
+    )
+    
+    user_prompt = (
+        f"Analyze the image and return the exact values for the following metrics as a single JSON object. "
+        f"For any NPS value, return the number. For Payroll/Finance, return the number with K or M/B if present, and the negative sign if present. "
+        f"Metrics to extract: {list(prompt_map.keys())}"
+    )
+
+    try:
+        client = genai.Client(api_key=GEMINI_API_KEY)
+        
+        # Load the image
+        img = Image.open(image_path)
+        
+        # Configure model and send prompt
+        response = client.models.generate_content(
+            model='gemini-2.5-flash',
+            contents=[img, user_prompt],
+            config=types.GenerateContentConfig(
+                system_instruction=system_instruction,
+                response_mime_type="application/json",
+                response_schema=types.Schema(
+                    type=types.Type.OBJECT,
+                    properties={v: types.Schema(type=types.Type.STRING) for v in prompt_map.keys()}
+                )
+            )
+        )
+        
+        # Parse the AI's JSON response
+        ai_data = json.loads(response.text)
+        
+        updated_metrics = metrics.copy()
+        for ai_key, ai_val in ai_data.items():
+            python_key = prompt_map.get(ai_key)
+            if python_key and ai_val is not None:
+                # Update the metric, letting the AI's result overwrite the empty placeholder
+                updated_metrics[python_key] = str(ai_val).strip()
+                log.info(f"Gemini Success: {python_key} -> {updated_metrics[python_key]}")
+
+        return updated_metrics
+
+    except Exception as e:
+        log.error(f"Gemini API Error: Failed to extract metrics: {e}")
+        return metrics
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Main Parser
+# ──────────────────────────────────────────────────────────────────────────────
+
 def parse_from_lines(lines: List[str]) -> Dict[str, str]:
     m: Dict[str, str] = {}
 
@@ -438,11 +534,8 @@ def parse_from_lines(lines: List[str]) -> Dict[str, str]:
         m.update({k: "—" for k in ["waste_total","markdowns_total","wm_total","wm_delta","wm_delta_pct"]})
 
     # ── Front End Service (scoped) ───────────────────────────────────────────
-    # Use coalesce to handle "Sco" vs "SCO" variants (since "—" is truthy)
-    m["sco_utilisation"]         = coalesce(
-        _fes_value(lines, "Sco Utilisation", "percent", FES_SCOPE),
-        _fes_value(lines, "SCO Utilisation", "percent", FES_SCOPE),
-    )
+    # These are highly likely to be extracted here (easy text), but Gemini serves as a fallback for the rest
+    m["sco_utilisation"]         = coalesce(_fes_value(lines, "Sco Utilisation", "percent", FES_SCOPE), _fes_value(lines, "SCO Utilisation", "percent", FES_SCOPE))
     m["efficiency"]              = _fes_value(lines, "Efficiency",      "percent", FES_SCOPE)
     m["scan_rate"]               = _fes_value(lines, "Scan Rate",       "integer", FES_SCOPE)
     m["interventions"]           = _fes_value(lines, "Interventions",   "integer", FES_SCOPE)
@@ -450,367 +543,51 @@ def parse_from_lines(lines: List[str]) -> Dict[str, str]:
     m["scan_vs_target"]          = _fes_vs(lines, "Scan Rate",       FES_SCOPE)
     m["interventions_vs_target"] = _fes_vs(lines, "Interventions",   FES_SCOPE)
     m["mainbank_vs_target"]      = _fes_vs(lines, "Mainbank Closed", FES_SCOPE)
-
-    # ── Online (scoped; Availability prefers 3 lines above) ──────────────────
-    m["availability_pct"]   = value_near_scoped(lines, "Availability",       "percent_format", ONLINE_SCOPE, near_before=6,  near_after=10, prefer_before_first=3)
-    m["despatched_on_time"] = value_near_scoped(lines, "Despatched on Time", "percent_format", ONLINE_SCOPE, near_before=8,  near_after=12)
-    m["delivered_on_time"]  = value_near_scoped(lines, "Delivered on Time",  "percent_format", ONLINE_SCOPE, near_before=8,  near_after=12)
-    # Increased search window slightly as '15:12' is far from the label
+    
+    # ── Online (Scoped, easy parts) / Card Engagement (easy parts) ─────────────────
     m["cc_avg_wait"]        = value_near_scoped(lines, "average wait",       "time",    ONLINE_SCOPE, near_before=15, near_after=20)
-
-    # ── Payroll (scoped) ─────────────────────────────────────────────────────
-    # Increased 'near_after' window to catch values if the label is at the top of the scope
-    m["payroll_outturn"]    = value_near_scoped(lines, "Payroll Outturn",    "any", PAYROLL_SCOPE, near_before=4, near_after=8)
-    m["absence_outturn"]    = value_near_scoped(lines, "Absence Outturn",    "any", PAYROLL_SCOPE, near_before=4, near_after=8)
-    m["productive_outturn"] = value_near_scoped(lines, "Productive Outturn", "any", PAYROLL_SCOPE, near_before=4, near_after=8)
-    m["holiday_outturn"]    = value_near_scoped(lines, "Holiday Outturn",    "any", PAYROLL_SCOPE, near_before=4, near_after=8)
-    m["current_base_cost"]  = value_near_scoped(lines, "Current Base Cost",  "any", PAYROLL_SCOPE, near_before=4, near_after=8)
-
-    # ── Card Engagement (scoped) ─────────────────────────────────────────────
-    # Increased 'near_after' window to catch values if the label is at the top of the scope
-    m["swipe_rate"]      = value_near_scoped(lines, "Swipe Rate",    "percent_format", CARD_SCOPE, near_before=4, near_after=8)
-    m["swipes_wow_pct"]  = value_near_scoped(lines, "Swipes WOW",    "percent_format", CARD_SCOPE, near_before=4, near_after=8)
-    m["new_customers"]   = value_near_scoped(lines, "New Customers", "integer", CARD_SCOPE, near_before=6, near_after=10)
-    m["swipes_yoy_pct"]  = value_near_scoped(lines, "Swipes YOY",    "percent_format", CARD_SCOPE, near_before=6, near_after=10)
-
-    # ── Production Planning (scoped) ─────────────────────────────────────────
+    m["new_customers"]      = value_near_scoped(lines, "New Customers",      "integer", CARD_SCOPE, near_before=6, near_after=10)
+    m["swipe_rate"]         = value_near_scoped(lines, "Swipe Rate",         "percent_format", CARD_SCOPE, near_before=4, near_after=8)
+    m["swipes_wow_pct"]     = value_near_scoped(lines, "Swipes WOW",         "percent_format", CARD_SCOPE, near_before=4, near_after=8)
+    
+    # ── Other easy/contextual metrics ─────────────────────────────────────────
     m["data_provided"] = value_near_scoped(lines, "Data Provided", "percent_format", PP_SCOPE, near_before=6, near_after=8)
     m["trusted_data"]  = value_near_scoped(lines, "Trusted Data",  "percent_format", PP_SCOPE, near_before=6, near_after=8)
-
-    # ── Shrink (scoped + strict types) ───────────────────────────────────────
-    # Values appear near the bottom of the section, so increased 'near_after' slightly
-    m["moa"]                  = value_near_scoped(lines, "Morrisons Order Adjustments", "money",   SHRINK_SCOPE, near_before=10, near_after=12)
-    m["waste_validation"]     = value_near_scoped(lines, "Waste Validation",            "percent_format", SHRINK_SCOPE, near_before=10, near_after=12)
-    m["unrecorded_waste_pct"] = value_near_scoped(lines, "Unrecorded Waste",            "percent_format", SHRINK_SCOPE, near_before=10, near_after=12)
-    m["shrink_vs_budget_pct"] = value_near_scoped(lines, "Shrink vs Budget",            "percent_format", SHRINK_SCOPE, near_before=10, near_after=12)
-
-    # ── Complaints / My Reports (scoped) ─────────────────────────────────────
-    comp_scope = COMPLAINTS_SCOPE if COMPLAINTS_SCOPE[0] >= 0 else (0, len(lines))
-    m["complaints_key"] = value_near_scoped(lines, "Key Customer Complaints", "integer", comp_scope, near_before=10, near_after=12)
-    m["my_reports"]     = value_near_scoped(lines, "My Reports", "integer",
-                         section_bounds(lines, "My Reports", ["Cafe NPS","Privacy","Payroll","Shrink","Waste & Markdowns"]),
-                         near_before=6, near_after=10)
-
-    # ── Weekly Activity — preserve literal “No data” in Clean & Rotate scope ─
-    m["weekly_activity"] = "—"
-    s,e = CLEAN_ROTATE_SCOPE
-    if s >= 0:
-        li = _idx(lines, "Weekly Activity", s, e)
-        if li >= 0:
-            window = lines[max(s, li-2):min(e, li+6)]
-            if any("No data" in w for w in window):
-                m["weekly_activity"] = "No data"
-            else:
-                m["weekly_activity"] = value_near_scoped(lines, "Weekly Activity", "any", (s,e), near_before=4, near_after=6)
-    
-    # ── ADVANCED DEBUG LOGGING ──────────────────────────────────────────
-    log.info("--- START LINE PARSING DEBUG ---")
-    
-    # Check if a value for Availability was found by the parser
-    avail_val = value_near_scoped(lines, "Availability", "percent_format", ONLINE_SCOPE, near_before=6, near_after=10, prefer_before_first=3)
-    log.info(f"DEBUG: Availability (Line Parser): {avail_val} (Line Index: {_idx(lines, 'Availability')})")
-    
-    # Check if a value for Key Complaints was found by the parser
-    comp_val = value_near_scoped(lines, "Key Customer Complaints", "integer", COMPLAINTS_SCOPE, near_before=10, near_after=12)
-    log.info(f"DEBUG: Complaints Key (Line Parser): {comp_val} (Line Index: {_idx(lines, 'Key Customer Complaints')})")
-    
-    log.info("--- END LINE PARSING DEBUG ---")
+    m["my_reports"]    = value_near_scoped(lines, "My Reports", "integer", section_bounds(lines, "My Reports", ["Cafe NPS","Privacy","Payroll","Shrink","Waste & Markdowns"]), near_before=6, near_after=10)
+    m["complaints_key"] = value_near_scoped(lines, "Key Customer Complaints", "integer", COMPLAINTS_SCOPE, near_before=10, near_after=12)
+    m["weekly_activity"] = "No data" if "No data" in "\n".join(lines[clean_rotate_scope[0]:clean_rotate_scope[1]]) else "—"
 
 
-    # Gauges via ROI OCR later
-    for k in ["supermarket_nps","colleague_happiness","home_delivery_nps","cafe_nps","click_collect_nps","customer_toilet_nps"]:
-        m.setdefault(k, "—")
-
+    # ── Placeholder for Gemini Metrics (will be overwritten by AI call) ────────────────
+    for k in GEMINI_METRICS:
+        # Check if the line parser already found the value. If so, apply formatting.
+        if k in m and m[k] not in [None, "—"]:
+            if "pct" in k or k in ["availability_pct", "waste_validation"]:
+                if "%" not in m[k] and re.match(r"^-?\d+(\.\d+)?$", m[k]):
+                    m[k] += "%"
+            continue # Keep the line-parsed value
+        m[k] = "—" # Mark for Gemini if not found
+        
     return m
 
 # ──────────────────────────────────────────────────────────────────────────────
-# ROI OCR fallback (ULTIMATE FINAL CORRECTED coordinates - User-Provided)
-# ──────────────────────────────────────────────────────────────────────────────
-DEFAULT_ROI_MAP = {
-    # 💥 FINAL WORKING COORDINATES - Derived EXACTLY from user-generated map 
-    
-    # NPS Gauges (ANCHOR Y=0.1615/0.1563 and W/H from user map)
-    "colleague_happiness": (0.2233, 0.2201, 0.0849, 0.1458), # -34 (User's Coords)
-    "supermarket_nps":     (0.3258, 0.2253, 0.0930, 0.1341), # 54 (User's Coords)
-    "cafe_nps":            (0.4290, 0.2279, 0.0915, 0.1354), # - (User's Coords)
-    "click_collect_nps":   (0.5329, 0.2266, 0.0900, 0.1302), # - (User's Coords)
-    "home_delivery_nps":   (0.6391, 0.2318, 0.0922, 0.1224), # - (User's Coords)
-    "customer_toilet_nps": (0.7504, 0.2305, 0.0849, 0.1172), # - (User's Coords)
-    "complaints_key":      (0.8712, 0.2122, 0.1047, 0.0495), # Added Key Complaints for robustness
-
-    # Waste & Markdowns TOTAL row cells (Vertical alignment corrected based on visual inspection)
-    "waste_total":     (0.105, 0.575, 0.065, 0.035),
-    "markdowns_total": (0.170, 0.575, 0.065, 0.035),
-    "wm_total":        (0.235, 0.575, 0.065, 0.035),
-    "wm_delta":        (0.300, 0.575, 0.065, 0.035),
-    "wm_delta_pct":    (0.365, 0.575, 0.065, 0.035),
-
-    # Online (ANCHOR Y=0.7318 for C&C, Y=0.7253 for Availability)
-    "availability_pct":   (0.3997, 0.7253, 0.0593, 0.1120), # 84% (User's Coords)
-    "despatched_on_time": (0.515, 0.585, 0.085, 0.055), # Placeholder (not displayed)
-    "delivered_on_time":  (0.585, 0.585, 0.085, 0.055), # Placeholder (not displayed)
-    "cc_avg_wait":        (0.5842, 0.7292, 0.0688, 0.1081), # 15:12 (User's Coords)
-    
-    # Payroll (ANCHOR Y=0.4818/0.5400)
-    "payroll_outturn":    (0.4619, 0.4948, 0.0761, 0.0898), # -753.6 (User's Coords)
-    "absence_outturn":    (0.5425, 0.4727, 0.0630, 0.0573), # 652.4 (User's Coords)
-    "productive_outturn": (0.5395, 0.5378, 0.0710, 0.0690), # -1.4K (User's Coords)
-    "holiday_outturn":    (0.6091, 0.4714, 0.0666, 0.0612), # -354.8 (User's Coords)
-    "current_base_cost":  (0.6120, 0.5365, 0.0637, 0.0690), # 45.1K (User's Coords)
-    
-    # Shrink (ANCHOR Y=0.7292)
-    "moa":                  (0.1340, 0.7487, 0.0542, 0.0664), # £-8K (User's Coords)
-    "waste_validation":     (0.1955, 0.7526, 0.0564, 0.0716), # 100% (User's Coords)
-    "unrecorded_waste_pct": (0.2577, 0.7370, 0.0571, 0.0924), # 9.73% (User's Coords)
-    "shrink_vs_budget_pct": (0.3163, 0.7253, 0.0637, 0.1068), # -0.05% (User's Coords)
-
-    # Card Engagement (Final)
-    "new_customers": (0.7079, 0.5365, 0.0659, 0.0625), # 63 (User's Coords)
-    "swipes_yoy_pct": (0.7870, 0.5378, 0.0666, 0.0625), # 16% (User's Coords)
-    "efficiency": (0.9114, 0.7083, 0.0769, 0.1159), # 86% (User's Coords - added for completeness)
-}
-
-
-def load_roi_map() -> Dict[str, Tuple[float,float,float,float]]:
-    # 💥 FINAL FIX: IGNORE ALL EXTERNAL ROI FILES. 
-    # The default map embedded in this script is the correct one.
-    return DEFAULT_ROI_MAP.copy()
-
-
-def crop_norm(img: "Image.Image", roi: Tuple[float,float,float,float]) -> "Image.Image":
-    from PIL import Image  # type: ignore
-    W, H = img.size
-    x, y, w, h = roi
-    box = (int(x*W), int(y*H), int((x+w)*W), int((y+h)*H))
-    return img.crop(box)
-
-def ocr_cell(img: "Image.Image", want_time=False, allow_percent=True) -> str:
-    if not OCR_AVAILABLE:
-        return "—"
-    try:
-        from PIL import ImageEnhance, Image # lazy import
-        
-        # 1. Aggressive Upscaling (x4)
-        w, h = img.size
-        scale_factor = 4
-        img_upscaled = img.resize((int(w * scale_factor), int(h * scale_factor)), Image.Resampling.LANCZOS)
-        
-        # 2. Image Preprocessing: Greyscale, Sharpen, and Binarize (High Contrast B/W)
-        img_greyscale = img_upscaled.convert('L')
-        enhancer = ImageEnhance.Sharpness(img_greyscale)
-        img_sharpened = enhancer.enhance(2.0)
-        
-        # Binarize: Set all pixels below a threshold to black (0), above to white (255)
-        # Tesseract performs best on pure B/W text
-        threshold = 150 # Adjusting threshold for bright red color
-        img_final = img_sharpened.point(lambda p: p > threshold and 255)
-        
-        # 3. Use PSM 6 (Assume a single uniform block of text)
-        txt = pytesseract.image_to_string(img_final, config="--psm 6") 
-
-        # 💥 DEBUG LOG: Log raw Tesseract output for analysis
-        if txt.strip():
-             log.warning(f"RAW OCR OUTPUT: '{txt.strip().replace('\n', ' ')}'")
-        
-        # --- TARGETED FINAL OCR OUTPUT CLEANUP/FILTERING ---
-        # 1. Normalize and clean misreads
-        # Removed space removal here to be more careful with decimal points in numbers like 9.73
-        txt = txt.replace('/', '-').replace(']', '').replace('I', '1').replace('O', '0')
-        
-        # 2. Parsing Logic (Unchanged, relies on robust regex)
-        if want_time:
-            m = TIME_RE.search(txt)
-            if m: return m.group(0)
-        
-        # Look for number with money/K/M/B (this is needed for Payroll, Moa)
-        m = re.search(r"[£]?-?\d+(?:\.\d+)?[KMB]?", txt, flags=re.I)
-        if m and m.group(0): return m.group(0)
-        
-        if allow_percent:
-            m = re.search(r"-?\d+(?:\.\d+)?%", txt)
-            if m and m.group(0): return m.group(0)
-        
-        # Look for simple integer/NPS score (this will catch '34' and fix the NPS problem)
-        m = re.search(r"-?\d+", txt) 
-        if m and m.group(0): return m.group(0)
-        
-        # Catch case where OCR reads '-' for missing NPS gauges
-        if re.search(r"^\s*-\s*$", txt.strip()):
-            return "—"
-        
-    except Exception:
-        pass
-    return "—"
-
-
-def draw_overlay(img: "Image.Image", roi_map: Dict[str, Tuple[float,float,float,float]]):
-    try:
-        from PIL import ImageDraw  # type: ignore
-        dbg = img.copy()
-        draw = ImageDraw.Draw(dbg)
-        W, H = dbg.size
-        for key, (x,y,w,h) in roi_map.items():
-            box = (int(x*W), int(y*H), int((x+w)*W), int((y+h)*H))
-            draw.rectangle(box, outline=(0,255,0), width=2)
-            draw.text((box[0]+3, box[1]+3), key, fill=(0,255,0))
-        ts = int(time.time())
-        outfile = SCREENS_DIR / f"{ts}_roi_overlay.png"
-        dbg.save(outfile)
-        log.info(f"ROI overlay saved → {outfile.name}")
-    except Exception:
-        pass
-
-def fill_missing_with_roi(metrics: Dict[str, str], img: Optional["Image.Image"]):
-    if img is None:
-        return
-    roi_map = load_roi_map()
-    used = False
-    for key, roi in roi_map.items():
-        if metrics.get(key) and metrics[key] != "—":
-            continue
-        want_time = (key == "cc_avg_wait")
-        allow_percent = not key.endswith("_nps")
-        
-        # Get raw extracted value
-        val = ocr_cell(crop_norm(img, roi), want_time=want_time, allow_percent=allow_percent)
-        
-        # --- TARGETED FINAL FIXES for Formatting Loss ---
-        if key in ["availability_pct", "waste_validation", "unrecorded_waste_pct", "swipes_yoy_pct", "data_provided", "trusted_data", "efficiency", "sco_utilisation"] and val and "%" not in val and re.match(r"^-?\d+(\.\d+)?$", val.replace('%', '')):
-            # Re-apply % sign if the value is a numeric percent, but it's missing the %
-            val = val.replace('%', '') # Remove potential misreads and re-add cleanly
-            val += "%"
-
-        # FIX: Payroll Outturn - Specific misread fix based on visual context
-        if key == "payroll_outturn" and val and not val.startswith('-'):
-            # The value is visually negative and often misread as '53.6' or '753.6'.
-            if val in ['53.6', '753.6']:
-                val = '-753.6'
-            elif val.startswith('53.6'):
-                 val = '-753.6'
-
-        # FIX: Supermarket NPS - If we got a number, but it's wrong (e.g. '4'), assume it's the intended 54.
-        # This is a last-resort brittle fix ONLY for NPS. The improved OCR is meant to eliminate this.
-        if key == "supermarket_nps" and val and re.match(r"^-?\d+(\.\d+)?$", val) and float(val) < 60 and float(val) > 0 and val != '54':
-             val = '54'
-        
-        if val and val != "—":
-            metrics[key] = val
-            used = True
-    if used:
-        draw_overlay(img, roi_map)
-        log.info("Filled some missing values from ROI OCR.")
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Card + CSV
-# ──────────────────────────────────────────────────────────────────────────────
-def kv(label: str, val: str) -> dict:
-    return {"decoratedText": {"topLabel": label, "text": (val or "—")}}
-
-def title_widget(text: str) -> dict:
-    return {"textParagraph": {"text": f"<b>{text}</b>"}}
-
-def build_chat_card(metrics: Dict[str, str]) -> dict:
-    header = {
-        "title": "📊 Retail Daily Summary (Layout+ROI OCR)",
-        "subtitle": (metrics.get("store_line") or "").replace("\n", "  "),
-    }
-    sections = [
-        {"widgets": [kv("Report Time", metrics.get("page_timestamp","—")),
-                     kv("Period",      metrics.get("period_range","—"))]},
-        {"widgets": [title_widget("Sales & NPS"),
-                     kv("Sales Total", metrics.get("sales_total","—")),
-                     kv("LFL",         metrics.get("sales_lfl","—")),
-                     kv("vs Target",   metrics.get("sales_vs_target","—")),
-                     kv("Supermarket NPS",     metrics.get("supermarket_nps","—")),
-                     kv("Colleague Happiness", metrics.get("colleague_happiness","—")),
-                     kv("Home Delivery NPS",   metrics.get("home_delivery_nps","—")),
-                     kv("Cafe NPS",            metrics.get("cafe_nps","—")),
-                     kv("Click & Collect NPS", metrics.get("click_collect_nps","—")),
-                     kv("Customer Toilet NPS", metrics.get("customer_toilet_nps","—"))]},
-        {"widgets": [title_widget("Front End Service"),
-                     kv("SCO Utilisation", metrics.get("sco_utilisation","—")),
-                     kv("Efficiency",      metrics.get("efficiency","—")),
-                     kv("Scan Rate",       f"{metrics.get('scan_rate','—')} (vs {metrics.get('scan_vs_target','—')})"),
-                     kv("Interventions",   f"{metrics.get('interventions','—')} (vs {metrics.get('interventions_vs_target','—')})"),
-                     kv("Mainbank Closed", f"{metrics.get('mainbank_closed','—')} (vs {metrics.get('mainbank_vs_target','—')})")]},
-        {"widgets": [title_widget("Online"),
-                     kv("Availability",              metrics.get("availability_pct","—")),
-                     kv("Despatched on Time",        metrics.get("despatched_on_time","—")),
-                     kv("Delivered on Time",         metrics.get("delivered_on_time","—")),
-                     kv("Click & Collect Avg Wait",  metrics.get("cc_avg_wait","—"))]},
-        {"widgets": [title_widget("Waste & Markdowns (Total)"),
-                     kv("Waste",     metrics.get("waste_total","—")),
-                     kv("Markdowns", metrics.get("markdowns_total","—")),
-                     kv("Total",     metrics.get("wm_total","—")),
-                     kv("+/−",       metrics.get("wm_delta","—")),
-                     kv("+/− %",     metrics.get("wm_delta_pct","—"))]},
-        {"widgets": [title_widget("Payroll"),
-                     kv("Payroll Outturn",    metrics.get("payroll_outturn","—")),
-                     kv("Absence Outturn",    metrics.get("absence_outturn","—")),
-                     kv("Productive Outturn", metrics.get("productive_outturn","—")),
-                     kv("Holiday Outturn",    metrics.get("holiday_outturn","—")),
-                     kv("Current Base Cost",  metrics.get("current_base_cost","—"))]},
-        {"widgets": [title_widget("Shrink"),
-                     kv("Morrisons Order Adjustments", metrics.get("moa","—")),
-                     kv("Waste Validation",            metrics.get("waste_validation","—")),
-                     kv("Unrecorded Waste %",          metrics.get("unrecorded_waste_pct","—")),
-                     kv("Shrink vs Budget %",          metrics.get("shrink_vs_budget_pct","—"))]},
-        {"widgets": [title_widget("Card Engagement & Misc"),
-                     kv("Swipe Rate",      metrics.get("swipe_rate","—")),
-                     kv("Swipes WOW %",    metrics.get("swipes_wow_pct","—")),
-                     kv("New Customers",   metrics.get("new_customers","—")),
-                     kv("Swipes YOY %",    metrics.get("swipes_yoy_pct","—")),
-                     kv("Key Complaints",  metrics.get("complaints_key","—")),
-                     kv("Data Provided",   metrics.get("data_provided","—")),
-                     kv("Trusted Data",    metrics.get("trusted_data","—")),
-                     kv("My Reports",      metrics.get("my_reports","—")),
-                     kv("Weekly Activity %",metrics.get("weekly_activity","—"))]},
-    ]
-    return {"cardsV2": [{"cardId": f"daily_{int(time.time())}", "card": {"header": header, "sections": sections}}]}
-
-CSV_HEADERS = [
-    "page_timestamp","period_range","store_line",
-    "sales_total","sales_lfl","sales_vs_target",
-    "supermarket_nps","colleague_happiness","home_delivery_nps","cafe_nps","click_collect_nps","customer_toilet_nps",
-    "sco_utilisation","efficiency","scan_rate","scan_vs_target","interventions","interventions_vs_target",
-    "mainbank_closed","mainbank_vs_target",
-    "availability_pct","despatched_on_time","delivered_on_time","cc_avg_wait",
-    "waste_total","markdowns_total","wm_total","wm_delta","wm_delta_pct",
-    "moa","waste_validation","unrecorded_waste_pct","shrink_vs_budget_pct",
-    "payroll_outturn","absence_outturn","productive_outturn","holiday_outturn","current_base_cost",
-    "swipe_rate","swipes_wow_pct","new_customers","swipes_yoy_pct",
-    "complaints_key","data_provided","trusted_data","my_reports","weekly_activity",
-]
-
-def write_csv(metrics: Dict[str,str]):
-    write_header = not DAILY_LOG_CSV.exists() or DAILY_LOG_CSV.stat().st_size == 0
-    with open(DAILY_LOG_CSV, "a", newline="", encoding="utf-8") as f:
-        w = csv.writer(f)
-        if write_header:
-            w.writerow(CSV_HEADERS)
-        w.writerow([metrics.get(h, "—") for h in CSV_HEADERS])
-    log.info(f"Appended daily metrics row to {DAILY_LOG_CSV.name}")
-
-def send_card(metrics: Dict[str, str]) -> bool:
-    if not MAIN_WEBHOOK or "chat.googleapis.com" not in MAIN_WEBHOOK:
-        log.error("MAIN_WEBHOOK/DAILY_WEBHOOK missing or invalid — cannot send daily report.")
-        return False
-    return _post_with_backoff(MAIN_WEBHOOK, build_chat_card(metrics))
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Main
+# Screenshot is now handled by the main flow and Gemini API
 # ──────────────────────────────────────────────────────────────────────────────
 def run_daily_scrape():
     if not AUTH_STATE.exists():
         alert(["⚠️ Daily dashboard scrape needs login. Run `python scrape.py now` once to save auth_state.json."])
         log.error("auth_state.json not found.")
         return
+    
+    if not GEMINI_AVAILABLE or not GEMINI_API_KEY:
+        alert(["⚠️ Gemini API Key is missing or library is not installed. Falling back to brittle text parsing only."])
+        log.error("Gemini environment not ready.")
 
-    from PIL import Image  # ensure PIL available for type refs
+
     with sync_playwright() as p:
         browser = context = page = None
         metrics: Dict[str,str] = {}
-        screenshot: Optional[Image.Image] = None
+        screenshot_path: Optional[Path] = None
         try:
             browser = p.chromium.launch(headless=True)
             context = browser.new_context(
@@ -823,16 +600,20 @@ def run_daily_scrape():
                 alert(["⚠️ Daily scrape blocked by login or load failure — please re-login."])
                 return
 
-            # Screenshot for ROI + debugging
-            screenshot = screenshot_full(page)
-
-            # BODY TEXT → numbered lines → layout parser
+            # Screenshot for GEMINI and debugging
+            img_bytes = page.screenshot(full_page=True, type="png")
+            ts = int(time.time())
+            screenshot_path = SCREENS_DIR / f"{ts}_fullpage.png"
+            save_bytes(screenshot_path, img_bytes)
+            
+            # BODY TEXT → numbered lines → layout parser (Primary extraction)
             body_text = get_body_text(page)
             lines = dump_numbered_lines(body_text)
             metrics = parse_from_lines(lines)
 
-            # Fill stubborn tiles with ROI OCR (esp. gauges / online wait)
-            fill_missing_with_roi(metrics, screenshot)
+            # 💥 FALLBACK: Use Gemini for all metrics marked as '—' or requiring visual confirmation
+            if GEMINI_AVAILABLE and GEMINI_API_KEY and screenshot_path.exists():
+                 metrics = extract_gemini_metrics(metrics, screenshot_path)
 
         finally:
             try:
