@@ -96,12 +96,8 @@ jobs:
       # ────────────────────────────────
       # Run only Daily Report scraper
       # ────────────────────────────────
-      - name: Remove cached/old roi_map.json to use script default
-        run: |
-          if [ -f ${{ env.ROI_MAP_FILE }} ]; then
-            echo "Deleting cached/old roi_map.json to force script's embedded DEFAULT_ROI_MAP."
-            rm ${{ env.ROI_MAP_FILE }}
-          fi
+      # NOTE: The explicit removal of roi_map.json is no longer needed 
+      # as load_roi_map() in scrape_daily.py now ignores the content of the local file.
 
       - name: Run Daily Report Scraper (OCR + ROI)
         env:
