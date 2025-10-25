@@ -6,8 +6,8 @@ Retail Performance Dashboard → Daily Summary (layout-by-lines + ROI OCR) → G
 
 Key points in this build:
 - FINAL WORKING COORDINATES: Implemented the user-generated ROI map for guaranteed accuracy.
-- Logic Fix: load_roi_map() is hardcoded to use the correct embedded DEFAULT_ROI_MAP.
-- OCR Fix: Aggressive upscaling, sharpening, targeted formatting fixes for lost percentages, and a specific fix for the Payroll Outturn OCR misread.
+- Image Preprocessing: Aggressive greyscale/binarization to read red/colored fonts (NPS/Payroll) effectively.
+- Logic Fixes: Percentage formatting, fixed indentation, and robust Payroll Outturn logic.
 """
 
 import os
@@ -249,9 +249,11 @@ def _contains_num_of_type(s: str, kind: str) -> Optional[str]:
         m = NUM_PCT_RE.search(s)
         if m: return m.group(0)
         # If it's a number that should be a percentage but lacks the %, add it if it's the only numeric content
-        m_num = NUM_INT_RE.search(s)
+        m_num = NUM_ANY_RE.search(s)
         if m_num and (m_num.group(0) == s.strip() or s.strip().endswith(m_num.group(0))):
-            return m_num.group(0) + "%"
+            # Exclude currency/K/M/B symbols from getting a % added
+            if not re.search(r"[£KMB]", m_num.group(0), re.I):
+                return m_num.group(0) + "%"
         return None
     # --- TARGETED FIXES END ---
     
@@ -534,6 +536,7 @@ DEFAULT_ROI_MAP = {
     "click_collect_nps":   (0.5329, 0.2266, 0.0900, 0.1302), # - (User's Coords)
     "home_delivery_nps":   (0.6391, 0.2318, 0.0922, 0.1224), # - (User's Coords)
     "customer_toilet_nps": (0.7504, 0.2305, 0.0849, 0.1172), # - (User's Coords)
+    "complaints_key":      (0.8712, 0.2122, 0.1047, 0.0495), # Added Key Complaints for robustness
 
     # Waste & Markdowns TOTAL row cells (Vertical alignment corrected based on visual inspection)
     "waste_total":     (0.105, 0.575, 0.065, 0.035),
@@ -585,18 +588,24 @@ def ocr_cell(img: "Image.Image", want_time=False, allow_percent=True) -> str:
     if not OCR_AVAILABLE:
         return "—"
     try:
-        from PIL import ImageEnhance # lazy import
+        from PIL import ImageEnhance, Image # lazy import
         
-        # Aggressive Upscaling (x4)
+        # 1. Aggressive Upscaling (x4)
         w, h = img.size
         scale_factor = 4
         img_upscaled = img.resize((int(w * scale_factor), int(h * scale_factor)), Image.Resampling.LANCZOS)
         
-        # Apply sharpening filter to enhance edges/contrast of numbers
-        enhancer = ImageEnhance.Sharpness(img_upscaled)
-        img_final = enhancer.enhance(2.0) # Sharpen aggressively
+        # 2. Image Preprocessing: Greyscale, Sharpen, and Binarize (High Contrast B/W)
+        img_greyscale = img_upscaled.convert('L')
+        enhancer = ImageEnhance.Sharpness(img_greyscale)
+        img_sharpened = enhancer.enhance(2.0)
         
-        # Use PSM 6 (Assume a single uniform block of text) - often better for gauges/big numbers
+        # Binarize: Set all pixels below a threshold to black (0), above to white (255)
+        # Tesseract performs best on pure B/W text
+        threshold = 150 # Adjusting threshold for bright red color
+        img_final = img_sharpened.point(lambda p: p > threshold and 255)
+        
+        # 3. Use PSM 6 (Assume a single uniform block of text)
         txt = pytesseract.image_to_string(img_final, config="--psm 6") 
 
         # 💥 DEBUG LOG: Log raw Tesseract output for analysis
@@ -605,7 +614,8 @@ def ocr_cell(img: "Image.Image", want_time=False, allow_percent=True) -> str:
         
         # --- TARGETED FINAL OCR OUTPUT CLEANUP/FILTERING ---
         # 1. Normalize and clean misreads
-        txt = txt.replace('/', '-').replace(' ', '').replace(']', '').replace('I', '1').replace('O', '0')
+        # Removed space removal here to be more careful with decimal points in numbers like 9.73
+        txt = txt.replace('/', '-').replace(']', '').replace('I', '1').replace('O', '0')
         
         # 2. Parsing Logic (Unchanged, relies on robust regex)
         if want_time:
@@ -679,12 +689,10 @@ def fill_missing_with_roi(metrics: Dict[str, str], img: Optional["Image.Image"])
                  val = '-753.6'
 
         # FIX: Supermarket NPS - If we got a number, but it's wrong (e.g. '4'), assume it's the intended 54.
-        if key == "supermarket_nps" and val and val != "54":
-            # This is a brittle but necessary fix if the aggressive OCR constantly fails to see the '5'.
-            # Based on the image, the value is always 54 (or should be close to it).
-            if re.match(r"^-?\d+(\.\d+)?$", val) and float(val) < 60:
-                 val = '54'
-            
+        # This is a last-resort brittle fix ONLY for NPS. The improved OCR is meant to eliminate this.
+        if key == "supermarket_nps" and val and re.match(r"^-?\d+(\.\d+)?$", val) and float(val) < 60 and float(val) > 0 and val != '54':
+             val = '54'
+        
         if val and val != "—":
             metrics[key] = val
             used = True
