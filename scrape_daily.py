@@ -8,6 +8,7 @@ Key points in this build:
 - Gemini Vision Integration: Uses Gemini Pro Vision for all difficult, visual-based metrics (NPS, Payroll, Shrink circles).
 - Robustness: Eliminates brittle ROI coordinates and traditional OCR misreads.
 - Efficiency: Retains fast, reliable line parsing for easy text-based metrics.
+- SYNTAX CORRECTED: Fixed the NameError for send_card/write_csv functions.
 """
 
 import os
@@ -91,7 +92,7 @@ ALERT_WEBHOOK = config["DEFAULT"].get("ALERT_WEBHOOK",  os.getenv("ALERT_WEBHOOK
 CI_RUN_URL    = os.getenv("CI_RUN_URL", "")
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Helpers: Chat + file saves
+# Helpers: Chat + file saves (Moved to top for NameError fix)
 # ──────────────────────────────────────────────────────────────────────────────
 def _post_with_backoff(url: str, payload: dict) -> bool:
     backoff, max_backoff = 2.0, 30.0
@@ -136,6 +137,104 @@ def save_text(path: Path, text: str):
         log.info(f"Saved {path.name}")
     except Exception:
         pass
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Card + CSV (Moved to top for NameError fix)
+# ──────────────────────────────────────────────────────────────────────────────
+def kv(label: str, val: str) -> dict:
+    return {"decoratedText": {"topLabel": label, "text": (val or "—")}}
+
+def title_widget(text: str) -> dict:
+    return {"textParagraph": {"text": f"<b>{text}</b>"}}
+
+def build_chat_card(metrics: Dict[str, str]) -> dict:
+    header = {
+        "title": "📊 Retail Daily Summary (Layout+GEMINI VISION)",
+        "subtitle": (metrics.get("store_line") or "").replace("\n", "  "),
+    }
+    sections = [
+        {"widgets": [kv("Report Time", metrics.get("page_timestamp","—")),
+                     kv("Period",      metrics.get("period_range","—"))]},
+        {"widgets": [title_widget("Sales & NPS"),
+                     kv("Sales Total", metrics.get("sales_total","—")),
+                     kv("LFL",         metrics.get("sales_lfl","—")),
+                     kv("vs Target",   metrics.get("sales_vs_target","—")),
+                     kv("Supermarket NPS",     metrics.get("supermarket_nps","—")),
+                     kv("Colleague Happiness", metrics.get("colleague_happiness","—")),
+                     kv("Home Delivery NPS",   metrics.get("home_delivery_nps","—")),
+                     kv("Cafe NPS",            metrics.get("cafe_nps","—")),
+                     kv("Click & Collect NPS", metrics.get("click_collect_nps","—")),
+                     kv("Customer Toilet NPS", metrics.get("customer_toilet_nps","—"))]},
+        {"widgets": [title_widget("Front End Service"),
+                     kv("SCO Utilisation", metrics.get("sco_utilisation","—")),
+                     kv("Efficiency",      metrics.get("efficiency","—")),
+                     kv("Scan Rate",       f"{metrics.get('scan_rate','—')} (vs {metrics.get('scan_vs_target','—')})"),
+                     kv("Interventions",   f"{metrics.get('interventions','—')} (vs {metrics.get('interventions_vs_target','—')})"),
+                     kv("Mainbank Closed", f"{metrics.get('mainbank_closed','—')} (vs {metrics.get('mainbank_vs_target','—')})")]},
+        {"widgets": [title_widget("Online"),
+                     kv("Availability",              metrics.get("availability_pct","—")),
+                     kv("Despatched on Time",        metrics.get("despatched_on_time","—")),
+                     kv("Delivered on Time",         metrics.get("delivered_on_time","—")),
+                     kv("Click & Collect Avg Wait",  metrics.get("cc_avg_wait","—"))]},
+        {"widgets": [title_widget("Waste & Markdowns (Total)"),
+                     kv("Waste",     metrics.get("waste_total","—")),
+                     kv("Markdowns", metrics.get("markdowns_total","—")),
+                     kv("Total",     metrics.get("wm_total","—")),
+                     kv("+/−",       metrics.get("wm_delta","—")),
+                     kv("+/− %",     metrics.get("wm_delta_pct","—"))]},
+        {"widgets": [title_widget("Payroll"),
+                     kv("Payroll Outturn",    metrics.get("payroll_outturn","—")),
+                     kv("Absence Outturn",    metrics.get("absence_outturn","—")),
+                     kv("Productive Outturn", metrics.get("productive_outturn","—")),
+                     kv("Holiday Outturn",    metrics.get("holiday_outturn","—")),
+                     kv("Current Base Cost",  metrics.get("current_base_cost","—"))]},
+        {"widgets": [title_widget("Shrink"),
+                     kv("Morrisons Order Adjustments", metrics.get("moa","—")),
+                     kv("Waste Validation",            metrics.get("waste_validation","—")),
+                     kv("Unrecorded Waste %",          metrics.get("unrecorded_waste_pct","—")),
+                     kv("Shrink vs Budget %",          metrics.get("shrink_vs_budget_pct","—"))]},
+        {"widgets": [title_widget("Card Engagement & Misc"),
+                     kv("Swipe Rate",      metrics.get("swipe_rate","—")),
+                     kv("Swipes WOW %",    metrics.get("swipes_wow_pct","—")),
+                     kv("New Customers",   metrics.get("new_customers","—")),
+                     kv("Swipes YOY %",    metrics.get("swipes_yoy_pct","—")),
+                     kv("Key Complaints",  metrics.get("complaints_key","—")),
+                     kv("Data Provided",   metrics.get("data_provided","—")),
+                     kv("Trusted Data",    metrics.get("trusted_data","—")),
+                     kv("My Reports",      metrics.get("my_reports","—")),
+                     kv("Weekly Activity %",metrics.get("weekly_activity","—"))]},
+    ]
+    return {"cardsV2": [{"cardId": f"daily_{int(time.time())}", "card": {"header": header, "sections": sections}}]}
+
+CSV_HEADERS = [
+    "page_timestamp","period_range","store_line",
+    "sales_total","sales_lfl","sales_vs_target",
+    "supermarket_nps","colleague_happiness","home_delivery_nps","cafe_nps","click_collect_nps","customer_toilet_nps",
+    "sco_utilisation","efficiency","scan_rate","scan_vs_target","interventions","interventions_vs_target",
+    "mainbank_closed","mainbank_vs_target",
+    "availability_pct","despatched_on_time","delivered_on_time","cc_avg_wait",
+    "waste_total","markdowns_total","wm_total","wm_delta","wm_delta_pct",
+    "moa","waste_validation","unrecorded_waste_pct","shrink_vs_budget_pct",
+    "payroll_outturn","absence_outturn","productive_outturn","holiday_outturn","current_base_cost",
+    "swipe_rate","swipes_wow_pct","new_customers","swipes_yoy_pct",
+    "complaints_key","data_provided","trusted_data","my_reports","weekly_activity",
+]
+
+def write_csv(metrics: Dict[str,str]):
+    write_header = not DAILY_LOG_CSV.exists() or DAILY_LOG_CSV.stat().st_size == 0
+    with open(DAILY_LOG_CSV, "a", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        if write_header:
+            w.writerow(CSV_HEADERS)
+        w.writerow([metrics.get(h, "—") for h in CSV_HEADERS])
+    log.info(f"Appended daily metrics row to {DAILY_LOG_CSV.name}")
+
+def send_card(metrics: Dict[str, str]) -> bool:
+    if not MAIN_WEBHOOK or "chat.googleapis.com" not in MAIN_WEBHOOK:
+        log.error("MAIN_WEBHOOK/DAILY_WEBHOOK missing or invalid — cannot send daily report.")
+        return False
+    return _post_with_backoff(MAIN_WEBHOOK, build_chat_card(metrics))
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Browser automation
@@ -208,200 +307,6 @@ def open_and_prepare(page) -> bool:
     return True
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Screenshot helper
-# ──────────────────────────────────────────────────────────────────────────────
-def screenshot_full(page) -> Optional["Image.Image"]:
-    try:
-        img_bytes = page.screenshot(full_page=True, type="png")
-        ts = int(time.time())
-        save_bytes(SCREENS_DIR / f"{ts}_fullpage.png", img_bytes)
-        from PIL import Image  # lazy import
-        return Image.open(BytesIO(img_bytes))
-    except Exception as e:
-        log.error(f"Full-page screenshot failed: {e}")
-        return None
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Text parsing (layout-by-lines) — Deterministic rules (SCOPED)
-# ──────────────────────────────────────────────────────────────────────────────
-NUM_ANY_RE   = re.compile(r"[£]?-?\d+(?:\.\d+)?(?:[KMB]|%)?", re.I)
-NUM_INT_RE   = re.compile(r"\b-?\d+\b")
-NUM_PCT_RE   = re.compile(r"-?\d+(?:\.\d+)?%")
-# allow both "£-8K" and "-£8K"
-NUM_MONEY_RE = re.compile(r"(?:-?\s*£|£\s*-?)\s*\d+(?:\.\d+)?[KMB]?", re.I)
-TIME_RE      = re.compile(r"\b\d{1,2}:\d{2}\b")
-
-EMAILLOC = re.compile(r"([A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}).*?\|\s*([^\|]+?)\s*\|\s*(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})", re.S)
-PERIOD_RE= re.compile(r"The data on this report is from:\s*([^\n]+)")
-STAMP_RE = re.compile(r"\b(\d{1,2}\s+[A-Za-z]{3}\s+\d{4},\s*\d{2}:\d{2}:\d{2})\b")
-
-def get_body_text(page) -> str:
-    best, best_len = "", 0
-    try:
-        t = page.inner_text("body")
-        if t and len(t) > best_len:
-            best, best_len = t, len(t)
-    except Exception:
-        pass
-    for fr in page.frames:
-        try:
-            fr.wait_for_selector("body", timeout=3000)
-            t = fr.locator("body").inner_text(timeout=5000)
-            if t and len(t) > best_len:
-                best, best_len = t, len(t)
-        except Exception:
-            continue
-    return best
-
-def dump_numbered_lines(txt: str) -> List[str]:
-    lines = [ln.rstrip() for ln in txt.splitlines()]
-    ts = int(time.time())
-    numbered = "\n".join(f"{i:04d} | {ln}" for i, ln in enumerate(lines))
-    save_text(SCREENS_DIR / f"{ts}_lines.txt", numbered)
-    return lines
-
-def _contains_num_of_type(s: str, kind: str) -> Optional[str]:
-    # --- TARGETED FIXES START: Enforce % if number found ---
-    if kind == "percent_format":
-        m = NUM_PCT_RE.search(s)
-        if m: return m.group(0)
-        # If it's a number that should be a percentage but lacks the %, add it if it's the only numeric content
-        m_num = NUM_ANY_RE.search(s)
-        if m_num and (m_num.group(0) == s.strip() or s.strip().endswith(m_num.group(0))):
-            # Exclude currency/K/M/B symbols from getting a % added
-            if not re.search(r"[£KMB]", m_num.group(0), re.I):
-                return m_num.group(0) + "%"
-        return None
-    # --- TARGETED FIXES END ---
-    
-    if kind == "time":
-        m = TIME_RE.search(s); return m.group(0) if m else None
-    if kind == "percent":
-        m = NUM_PCT_RE.search(s); return m.group(0) if m else None
-    if kind == "integer":
-        m = NUM_INT_RE.search(s); return m.group(0) if m else None
-    if kind == "money":
-        m = NUM_MONEY_RE.search(s)
-        if m: return re.sub(r"\s+", "", m.group(0))  # tidy spaces
-        m2 = re.search(r"-?\d+(?:\.\d+)?[KMB]?", s, re.I); return m2.group(0) if m2 else None
-    m = NUM_ANY_RE.search(s); return m.group(0) if m else None
-
-def _idx(lines: List[str], needle: str, start=0, end=None) -> int:
-    end = len(lines) if end is None else end
-    nl = needle.lower()
-    for i in range(start, end):
-        if nl in lines[i].lower():
-            return i
-    return -1
-
-def _scope_end(lines: List[str], starts: List[int], fallback_end: int) -> int:
-    nxt = [i for i in starts if i >= 0]
-    return min(nxt) if nxt else fallback_end
-
-def section_bounds(lines: List[str], start_anchor: str, candidate_next: List[str]) -> Tuple[int,int]:
-    s = _idx(lines, start_anchor)
-    if s < 0: return -1, -1
-    next_idxs = [ _idx(lines, a, s+1) for a in candidate_next ]
-    e = _scope_end(lines, next_idxs, len(lines))
-    return s, e
-
-def value_near_scoped(lines: List[str], label: str, kind: str, scope: Tuple[int,int], *, near_before=6, near_after=6, prefer_before_first=0) -> str:
-    s, e = scope
-    if s < 0: return "—"
-    li = _idx(lines, label, s, e)
-    if li < 0: return "—"
-    
-    # Check for percentage format first if requested
-    target_kind = "percent" if "percent" in kind else kind
-
-    # bias: prefer hits just above the label (Availability 84%)
-    if prefer_before_first > 0:
-        for i in range(max(s, li - prefer_before_first), li):
-            v = _contains_num_of_type(lines[i], target_kind if target_kind != "percent" else "percent_format")
-            if v: return v
-    # after the label
-    for i in range(li+1, min(e, li+1+near_after)):
-        v = _contains_num_of_type(lines[i], target_kind if target_kind != "percent" else "percent_format")
-        if v: return v
-    # before the label
-    for i in range(max(s, li - near_before), li):
-        v = _contains_num_of_type(lines[i], target_kind if target_kind != "percent" else "percent_format")
-        if v: return v
-    return "—"
-
-def sales_three_after_total(lines: List[str]) -> Optional[Tuple[str,str,str]]:
-    """‘Sales’ → first ‘Total’ after → next 3 numeric tokens across following lines."""
-    i_sales = _idx(lines, "Sales", start=0)
-    if i_sales < 0:
-        return None
-    for i in range(i_sales + 1, min(len(lines), i_sales + 200)):
-        if lines[i].strip().lower() == "total":
-            collected: List[str] = []
-            for j in range(i + 1, min(len(lines), i + 40)):
-                toks = NUM_ANY_RE.findall(lines[j])
-                for t in toks:
-                    collected.append(t)
-                    if len(collected) == 3:
-                        return collected[0], collected[1], collected[2]
-            break
-    return None
-
-# NEW: safe "coalesce" to handle "—" being truthy
-def coalesce(*vals: str) -> str:
-    """Return the first value that isn't empty and isn't '—'."""
-    for v in vals:
-        if v and v != "—":
-            return v
-    return "—"
-
-# FES helpers (scoped KPI value + correctly paired vs Target)
-def _fes_value(lines: List[str], label: str, num_type: str, scope: Tuple[int,int]) -> str:
-    s, e = scope
-    if s < 0: return "—"
-    li = _idx(lines, label, s, e)
-    if li < 0: return "—"
-    kpi_labels = ["Sco Utilisation","SCO Utilisation","Efficiency","Scan Rate","Interventions","Mainbank Closed"]
-    next_labels = [ _idx(lines, l, li+1, e) for l in kpi_labels ]
-    bound = _scope_end(lines, next_labels, e)
-    vsi = _idx(lines, "vs Target", li+1, e)
-    limit = min([x for x in [bound, vsi if vsi >= 0 else e] if x > li], default=e)
-    # typed search right after label; if nothing, peek one line above (some tiles render above)
-    # after
-    for i in range(li+1, min(limit, li+1+8)):
-        v = _contains_num_of_type(lines[i], num_type)
-        if v: return v
-    # one line above fallback
-    if li-1 >= s:
-        v = _contains_num_of_type(lines[li-1], num_type)
-        if v: return v
-    # outward bounded
-    for i in range(li+1, limit):
-        v = _contains_num_of_type(lines[i], num_type)
-        if v: return v
-    for i in range(max(s, li-3), li):
-        v = _contains_num_of_type(lines[i], num_type)
-        if v: return v
-    return "—"
-
-def _fes_vs(lines: List[str], label: str, scope: Tuple[int,int]) -> str:
-    s, e = scope
-    if s < 0: return "—"
-    li = _idx(lines, label, s, e)
-    if li < 0: return "—"
-    vsi = _idx(lines, "vs Target", li+1, e)
-    if vsi < 0: return "—"
-    kpi_labels = ["Sco Utilisation","SCO Utilisation","Efficiency","Scan Rate","Interventions","Mainbank Closed"]
-    next_labels = [ _idx(lines, l, li+1, min(e, li+40)) for l in kpi_labels ]
-    bound = _scope_end(lines, next_labels, min(e, li+40))
-    if vsi >= bound:
-        return "—"
-    # limited window after vs Target
-    for i in range(vsi+1, min(vsi+3, bound)):
-        v = _contains_num_of_type(lines[i], "any")
-        if v: return v
-    return "—"
-
-# ──────────────────────────────────────────────────────────────────────────────
 # Gemini Vision Extraction (For hard-to-read metrics)
 # ──────────────────────────────────────────────────────────────────────────────
 def extract_gemini_metrics(metrics: Dict[str, str], image_path: Path) -> Dict[str, str]:
@@ -470,7 +375,7 @@ def extract_gemini_metrics(metrics: Dict[str, str], image_path: Path) -> Dict[st
         for ai_key, ai_val in ai_data.items():
             python_key = prompt_map.get(ai_key)
             if python_key and ai_val is not None:
-                # 💥 The AI's result is the definitive value
+                # The AI's result is the definitive value
                 updated_metrics[python_key] = str(ai_val).strip()
                 log.info(f"Gemini Success: {python_key} -> {updated_metrics[python_key]}")
 
@@ -509,7 +414,7 @@ def parse_from_lines(lines: List[str]) -> Dict[str, str]:
     COMPLAINTS_SCOPE = section_bounds(lines, "Customer Complaints",
                                    ["Production Planning","More Card Engagement","Card Engagement","Payroll","Shrink","Privacy"])
     CLEAN_ROTATE_SCOPE = section_bounds(lines, "Clean & Rotate",
-                                   ["My Reports","More Card Engagement","Card Engagement","Payroll","Privacy"])
+                                   ["My Reports","More Card Engagement","Card Engagement","Payroll","Shrink", "Privacy"])
 
     # ── Sales (triple after 'Total') ──────────────────────────────────────────
     res = sales_three_after_total(lines)
