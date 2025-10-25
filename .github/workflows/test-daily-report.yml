@@ -1,29 +1,34 @@
 name: 🧪 Test Daily Report Scraper
 
 on:
-  workflow_dispatch: {}   # Manual trigger only
-  # you can uncomment below if you want automatic test runs
-  # schedule:
-  #   - cron: "0 8 * * *"  # 8:00 AM UTC → 9:00 AM London
+  workflow_dispatch: {}  # Manual trigger only
 
 concurrency:
-  group: daily-report-test
+  group: looker-scrape-test
   cancel-in-progress: true
 
 jobs:
   test-daily:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 40
 
     steps:
       # ────────────────────────────────
       # Checkout
       # ────────────────────────────────
-      - name: Checkout repo
+      - name: Checkout
         uses: actions/checkout@v4
 
       # ────────────────────────────────
-      # Setup Python + Playwright + OCR
+      # System deps (OCR)
+      # ────────────────────────────────
+      - name: Install Tesseract OCR
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends tesseract-ocr
+
+      # ────────────────────────────────
+      # Python + Playwright
       # ────────────────────────────────
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -33,44 +38,54 @@ jobs:
       - name: Install Python deps
         run: |
           python -m pip install -U pip
-          pip install playwright requests pillow pytesseract
+          pip install playwright requests pillow pytesseract schedule pytz
           python -m playwright install --with-deps chromium
 
-      - name: Install Tesseract OCR
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y tesseract-ocr
-
       # ────────────────────────────────
-      # Environment setup
+      # Env vars
       # ────────────────────────────────
-      - name: Export environment info
+      - name: Export TODAY, CI_RUN_URL, ROI_MAP_FILE
         run: |
+          echo "TODAY=$(date -u +%Y%m%d)" >> $GITHUB_ENV
           echo "CI_RUN_URL=${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" >> $GITHUB_ENV
+          echo "ROI_MAP_FILE=${{ github.workspace }}/roi_map.json" >> $GITHUB_ENV
 
-      - name: Restore auth + log cache
+      # ────────────────────────────────
+      # Restore scraper state (auth + CSV + ROI)
+      # ────────────────────────────────
+      - name: Restore scraper state (auth + logs + ROI)
         id: cache-restore
         uses: actions/cache/restore@v4
         with:
           path: |
             auth_state.json
+            comments_log.csv
+            complaints_log.csv
             daily_report_log.csv
-          key: daily-test-cache-${{ runner.os }}-${{ github.ref_name }}
+            roi_map.json
+          key: scraper-state-${{ runner.os }}-v1-${{ github.ref_name }}-${{ env.TODAY }}
           restore-keys: |
-            daily-test-cache-${{ runner.os }}-
+            scraper-state-${{ runner.os }}-v1-${{ github.ref_name }}-
+            scraper-state-${{ runner.os }}-v1-
 
-      - name: Fallback decode auth_state.json
+      # ────────────────────────────────
+      # Fallback: decode auth_state.json from secret
+      # ────────────────────────────────
+      - name: Fallback restore auth_state.json from secret
         run: |
           if [ -n "${AUTH_STATE_B64}" ]; then
             echo "${AUTH_STATE_B64}" | base64 --decode > auth_state.json
-            echo "Decoded auth_state.json from secret"
+            echo "Decoded auth_state.json from AUTH_STATE_B64."
           else
-            echo "No AUTH_STATE_B64 secret — run login manually first."
+            echo "No AUTH_STATE_B64 secret provided — continuing without."
           fi
         env:
           AUTH_STATE_B64: ${{ secrets.AUTH_STATE_B64 }}
 
-      - name: Create config.ini
+      # ────────────────────────────────
+      # Create config.ini (same as prod)
+      # ────────────────────────────────
+      - name: Create/Update config.ini
         run: |
           {
             echo "[DEFAULT]"
@@ -78,41 +93,62 @@ jobs:
             echo "GOOGLE_PASSWORD=${{ secrets.GOOGLE_PASSWORD }}"
             echo "MAIN_WEBHOOK=${{ secrets.MAIN_WEBHOOK }}"
             echo "ALERT_WEBHOOK=${{ secrets.ALERT_WEBHOOK }}"
-            echo "DAILY_WEBHOOK=${{ secrets.DAILY_WEBHOOK }}"
+            echo "COMPLAINTS_WEBHOOK=${{ secrets.COMPLAINTS_WEBHOOK }}"
+            echo "DAILY_WEBHOOK=${{ secrets.DAILY_TEST_WEBHOOK || secrets.DAILY_WEBHOOK }}"
           } > config.ini
 
       # ────────────────────────────────
-      # Run the Daily Report scraper
+      # Run only Daily Report scraper
       # ────────────────────────────────
-      - name: Run Daily Report Scraper
+      - name: Run Daily Report Scraper (OCR + ROI)
         env:
           CI_RUN_URL: ${{ env.CI_RUN_URL }}
+          ROI_MAP_FILE: ${{ env.ROI_MAP_FILE }}
         run: xvfb-run -a python scrape_daily.py || true
 
       # ────────────────────────────────
-      # Show outputs for debugging
+      # Show summary info
       # ────────────────────────────────
-      - name: Show debug files
+      - name: Show summary + debug
         run: |
-          echo "::group::Screenshots"
-          ls -lah screens || true
+          echo "::group::State files"
+          for f in auth_state.json daily_report_log.csv roi_map.json scrape_daily.log; do
+            if [ -f "$f" ]; then
+              echo "[OK] $f → $(wc -c < "$f") bytes"
+            else
+              echo "[MISS] $f"
+            fi
+          done
           echo "::endgroup::"
 
-          echo "::group::CSV tail"
-          tail -n 10 daily_report_log.csv || true
+          echo "::group::Last 5 log lines"
+          tail -n 5 scrape_daily.log || true
           echo "::endgroup::"
 
       # ────────────────────────────────
       # Upload artifacts
       # ────────────────────────────────
-      - name: Upload debug artifacts
+      - name: Upload logs and screenshots
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: daily-report-test-${{ github.run_id }}
+          name: test-daily-report-${{ github.run_id }}
           path: |
             auth_state.json
-            scrape_daily.log
             daily_report_log.csv
+            roi_map.json
+            scrape_daily.log
             screens/
           if-no-files-found: ignore
+
+      # ────────────────────────────────
+      # Save updated state to cache
+      # ────────────────────────────────
+      - name: Save updated cache
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            auth_state.json
+            daily_report_log.csv
+            roi_map.json
+          key: scraper-state-${{ runner.os }}-v1-${{ github.run_id }}
