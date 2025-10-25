@@ -5,9 +5,9 @@
 Retail Performance Dashboard → Daily Summary (layout-by-lines + ROI OCR) → Google Chat
 
 Key points in this build:
-- Final Coordinate Fix: Highly accurate normalized coordinates based on pixel analysis of the screenshot.
-- Final Logic Fix: load_roi_map() is hardcoded to use the correct embedded DEFAULT_ROI_MAP.
-- OCR Fix: Aggressive upscaling and sharpening for reliability on small gauge numbers.
+- Final FINAL FINAL Coordinate Fix: Highly accurate, BUFFERED coordinates for robust OCR.
+- Logic Fix: load_roi_map() is hardcoded to use the correct embedded DEFAULT_ROI_MAP.
+- OCR Fix: Aggressive upscaling, sharpening, and debug logging enabled.
 """
 
 import os
@@ -485,6 +485,20 @@ def parse_from_lines(lines: List[str]) -> Dict[str, str]:
                 m["weekly_activity"] = "No data"
             else:
                 m["weekly_activity"] = value_near_scoped(lines, "Weekly Activity", "any", (s,e), near_before=4, near_after=6)
+    
+    # ── ADVANCED DEBUG LOGGING ──────────────────────────────────────────
+    log.info("--- START LINE PARSING DEBUG ---")
+    
+    # Check if a value for Availability was found by the parser
+    avail_val = value_near_scoped(lines, "Availability", "percent", ONLINE_SCOPE, near_before=6, near_after=10, prefer_before_first=3)
+    log.info(f"DEBUG: Availability (Line Parser): {avail_val} (Line Index: {_idx(lines, 'Availability')})")
+    
+    # Check if a value for Key Complaints was found by the parser
+    comp_val = value_near_scoped(lines, "Key Customer Complaints", "integer", COMPLAINTS_SCOPE, near_before=10, near_after=12)
+    log.info(f"DEBUG: Complaints Key (Line Parser): {comp_val} (Line Index: {_idx(lines, 'Key Customer Complaints')})")
+    
+    log.info("--- END LINE PARSING DEBUG ---")
+
 
     # Gauges via ROI OCR later
     for k in ["supermarket_nps","colleague_happiness","home_delivery_nps","cafe_nps","click_collect_nps","customer_toilet_nps"]:
@@ -493,52 +507,45 @@ def parse_from_lines(lines: List[str]) -> Dict[str, str]:
     return m
 
 # ──────────────────────────────────────────────────────────────────────────────
-# ROI OCR fallback (UPDATED with FINAL CORRECTED coordinates)
+# ROI OCR fallback (FINAL FINAL FINAL CORRECTED coordinates + Buffer)
 # ──────────────────────────────────────────────────────────────────────────────
 DEFAULT_ROI_MAP = {
-    # Gauges row (FINAL CORRECTED coordinates - Y-axis is 0.349)
-    "colleague_happiness": (0.252, 0.349, 0.036, 0.040),
-    "supermarket_nps":     (0.399, 0.349, 0.036, 0.040),
-    "cafe_nps":            (0.546, 0.349, 0.036, 0.040), # Estimate based on pattern
-    "click_collect_nps":   (0.693, 0.349, 0.036, 0.040), # Estimate based on pattern
-    "home_delivery_nps":   (0.840, 0.349, 0.036, 0.040), # Estimate based on pattern
-    "customer_toilet_nps": (0.915, 0.349, 0.036, 0.040), # Adjusted to align with key complaints row
+    # Gauges row (FINAL FINAL FINAL CORRECTED coordinates + BUFFER)
+    "colleague_happiness": (0.280, 0.280, 0.055, 0.060), # 34
+    "supermarket_nps":     (0.430, 0.280, 0.055, 0.060), # 54
+    "cafe_nps":            (0.580, 0.280, 0.055, 0.060), # -
+    "click_collect_nps":   (0.730, 0.280, 0.055, 0.060), # -
+    "home_delivery_nps":   (0.880, 0.280, 0.055, 0.060), # -
+    "customer_toilet_nps": (0.940, 0.280, 0.055, 0.060), # -
     
-    # Waste & Markdowns TOTAL row cells (Original, kept as backup)
-    "waste_total":     (0.105, 0.415, 0.065, 0.035),
-    "markdowns_total": (0.170, 0.415, 0.065, 0.035),
-    "wm_total":        (0.235, 0.415, 0.065, 0.035),
-    "wm_delta":        (0.300, 0.415, 0.065, 0.035),
-    "wm_delta_pct":    (0.365, 0.415, 0.065, 0.035),
+    # Waste & Markdowns TOTAL row cells (Adjusted Y based on new anchor)
+    "waste_total":     (0.105, 0.580, 0.065, 0.035),
+    "markdowns_total": (0.170, 0.580, 0.065, 0.035),
+    "wm_total":        (0.235, 0.580, 0.065, 0.035),
+    "wm_delta":        (0.300, 0.580, 0.065, 0.035),
+    "wm_delta_pct":    (0.365, 0.580, 0.065, 0.035),
 
-    # Online (FINAL CORRECTED coordinates)
-    "availability_pct":   (0.472, 0.915, 0.036, 0.040), # 84%
-    "despatched_on_time": (0.515, 0.585, 0.085, 0.055), 
-    "delivered_on_time":  (0.585, 0.585, 0.085, 0.055),
-    "cc_avg_wait":        (0.615, 0.915, 0.055, 0.040), # 15:12
+    # Online (FINAL FINAL FINAL CORRECTED coordinates + BUFFER)
+    "availability_pct":   (0.470, 0.880, 0.065, 0.050), # 84%
+    "despatched_on_time": (0.515, 0.585, 0.085, 0.055), # Placeholder
+    "delivered_on_time":  (0.585, 0.585, 0.085, 0.055), # Placeholder
+    "cc_avg_wait":        (0.605, 0.880, 0.075, 0.050), # 15:12
     
-    # Payroll (FINAL CORRECTED coordinates - Y-axis is 0.640 for high, 0.700 for low)
-    "payroll_outturn":    (0.465, 0.640, 0.055, 0.040), # -753.6
-    "absence_outturn":    (0.540, 0.640, 0.055, 0.040), # 652.4
-    "productive_outturn": (0.540, 0.700, 0.055, 0.040), # -1.4K
-    "holiday_outturn":    (0.615, 0.640, 0.055, 0.040), # -354.8
-    "current_base_cost":  (0.615, 0.700, 0.055, 0.040), # 45.1K
+    # Payroll (FINAL FINAL FINAL CORRECTED coordinates + BUFFER)
+    "payroll_outturn":    (0.460, 0.630, 0.065, 0.050), # -753.6
+    "absence_outturn":    (0.535, 0.630, 0.065, 0.050), # 652.4
+    "productive_outturn": (0.535, 0.680, 0.065, 0.050), # -1.4K
+    "holiday_outturn":    (0.610, 0.630, 0.065, 0.050), # -354.8
+    "current_base_cost":  (0.610, 0.680, 0.065, 0.050), # 45.1K
     
-    # Shrink (FINAL CORRECTED coordinates - Y-axis is 0.915)
-    "moa":                  (0.250, 0.915, 0.085, 0.040), # £-8K
-    "waste_validation":     (0.375, 0.915, 0.060, 0.040), # 100%
-    "unrecorded_waste_pct": (0.435, 0.915, 0.060, 0.040), # 9.73%
-    "shrink_vs_budget_pct": (0.495, 0.915, 0.060, 0.040), # -0.05%
+    # Shrink (FINAL FINAL FINAL CORRECTED coordinates + BUFFER)
+    "moa":                  (0.245, 0.880, 0.090, 0.050), # £-8K
+    "waste_validation":     (0.370, 0.880, 0.070, 0.050), # 100%
+    "unrecorded_waste_pct": (0.430, 0.880, 0.070, 0.050), # 9.73%
+    "shrink_vs_budget_pct": (0.490, 0.880, 0.070, 0.050), # -0.05%
 
-    # Front End Service (Original, kept as backup)
-    "sco_utilisation": (0.680, 0.590, 0.065, 0.060),
-    "efficiency":      (0.940, 0.585, 0.090, 0.120),
-    "scan_rate":       (0.680, 0.655, 0.065, 0.050),
-    "interventions":   (0.810, 0.590, 0.065, 0.060),
-    "mainbank_closed": (0.810, 0.655, 0.065, 0.050),
-
-    # Card Engagement (FINAL CORRECTED coordinates - Y-axis is 0.620)
-    "new_customers": (0.742, 0.620, 0.060, 0.035),
+    # Card Engagement (FINAL FINAL FINAL CORRECTED coordinates + BUFFER)
+    "new_customers": (0.750, 0.700, 0.050, 0.040), # 63
 }
 
 def load_roi_map() -> Dict[str, Tuple[float,float,float,float]]:
@@ -572,6 +579,10 @@ def ocr_cell(img: "Image.Image", want_time=False, allow_percent=True) -> str:
         # Use PSM 6 (Assume a single uniform block of text) - often better for gauges/big numbers
         txt = pytesseract.image_to_string(img_final, config="--psm 6") 
 
+        # 💥 DEBUG LOG: Log raw Tesseract output for analysis
+        if txt.strip():
+             log.warning(f"RAW OCR OUTPUT: '{txt.strip().replace('\n', ' ')}'")
+        
         # Parsing Logic (Unchanged, relies on robust regex)
         if want_time:
             m = TIME_RE.search(txt)
