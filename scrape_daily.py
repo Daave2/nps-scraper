@@ -7,7 +7,9 @@ Retail Performance Dashboard → Daily Summary (layout-by-lines + ROI OCR) → G
 Updates:
 - Sales 'Total' row: FIRST 'Total' AFTER the 'Sales' header → capture next 3 numeric tokens.
 - Front End Service: scoped values + correctly paired "vs Target" per KPI.
-- Online/Complaints/Payroll/etc.: global, bidirectional near-label scan with type guards.
+- Online/Complaints/Payroll/Shrink/Card Engagement: nearest, bidirectional, typed extraction.
+- Availability: prefer a % within 3 lines ABOVE the label, else search nearby (prevents CE bleed).
+- C&C average wait: nearest HH:MM to the label (wide window).
 - Waste & Markdowns: robust block regex (Total row with (+/-) and (+/-)%).
 - Keeps ROI OCR fallback and debug artifacts (full screenshot, numbered lines, ROI overlay).
 """
@@ -244,6 +246,13 @@ def dump_numbered_lines(txt: str) -> List[str]:
     save_text(SCREENS_DIR / f"{ts}_lines.txt", numbered)
     return lines
 
+def index_of_label(lines: List[str], label: str, start: int = 0, end: Optional[int] = None) -> int:
+    end = len(lines) if end is None else end
+    for i in range(start, end):
+        if label.lower() in lines[i].lower():
+            return i
+    return -1
+
 def _contains_num_of_type(s: str, kind: str) -> Optional[str]:
     if kind == "time":
         m = TIME_RE.search(s); return m.group(0) if m else None
@@ -257,53 +266,31 @@ def _contains_num_of_type(s: str, kind: str) -> Optional[str]:
         m2 = re.search(r"-?\d+(?:\.\d+)?[KMB]", s, re.I); return m2.group(0) if m2 else None
     m = NUM_ANY_RE.search(s); return m.group(0) if m else None
 
-def index_of_label(lines: List[str], label: str, start: int = 0, end: Optional[int] = None) -> int:
-    end = len(lines) if end is None else end
-    for i in range(start, end):
-        if label.lower() in lines[i].lower():
-            return i
-    return -1
-
-def _first_num_in_range(lines: List[str], s: int, e: int, kind="any") -> str:
-    for i in range(max(0, s), min(e, len(lines))):
-        v = _contains_num_of_type(lines[i], kind)
-        if v:
-            return v
+def nearest_num_of_type(lines: List[str], idx: int, window: int, *, prefer_before_first: int = 0, kind: str = "any") -> str:
+    """
+    Scan symmetrically outward from idx within ±window, optionally first try up to
+    `prefer_before_first` lines above the label (useful for Availability 84% sitting above).
+    """
+    # First, a small bias search above the label
+    if prefer_before_first > 0:
+        for i in range(max(0, idx - prefer_before_first), idx):
+            v = _contains_num_of_type(lines[i], kind)
+            if v:
+                return v
+    # Then symmetric outward search
+    for d in range(1, window + 1):
+        j = idx + d
+        if j < len(lines):
+            v = _contains_num_of_type(lines[j], kind)
+            if v: return v
+        k = idx - d
+        if k >= 0:
+            v = _contains_num_of_type(lines[k], kind)
+            if v: return v
     return "—"
-
-def _first_num_backwards(lines: List[str], s: int, back: int, kind="any") -> str:
-    for i in range(max(0, s - back), s):
-        v = _contains_num_of_type(lines[i], kind)
-        if v:
-            return v
-    return "—"
-
-def numbers_near(lines: List[str], idx: int, span: int = 8, want_time: bool = False) -> List[str]:
-    if idx < 0:
-        return []
-    s = max(0, idx - span)
-    e = min(len(lines), idx + span + 1)
-    window = " ".join(lines[s:e])
-    if want_time:
-        t = TIME_RE.findall(window)
-        return t if t else []
-    return NUM_ANY_RE.findall(window)
-
-def first_number_near_label(lines: List[str], label: str, span: int = 8, want_time: bool = False, kind: Optional[str] = None) -> str:
-    idx = index_of_label(lines, label, start=0)
-    if idx < 0:
-        return "—"
-    # Prefer after, then before, with optional type filtering
-    if kind:
-        v = _first_num_in_range(lines, idx + 1, min(len(lines), idx + 1 + span), kind=kind)
-        if v == "—":
-            v = _first_num_backwards(lines, idx, span, kind=kind)
-        return v
-    vals = numbers_near(lines, idx, span=span, want_time=want_time)
-    return vals[0] if vals else "—"
 
 def sales_three_after_total(lines: List[str]) -> Optional[Tuple[str,str,str]]:
-    """‘Sales’ → first ‘Total’ after → next 3 numeric tokens."""
+    """‘Sales’ → first ‘Total’ after → next 3 numeric tokens across following lines."""
     i_sales = index_of_label(lines, "Sales", start=0)
     if i_sales < 0:
         return None
@@ -324,18 +311,18 @@ def parse_from_lines(lines: List[str]) -> Dict[str, str]:
 
     # Context
     joined = "\n".join(lines)
-    z = EMAILLOC.search(joined); m["store_line"] = z.group(0).strip() if z else ""
+    z = EMAILLOC.search(joined); m["store_line"]   = z.group(0).strip() if z else ""
     y = PERIOD_RE.search(joined); m["period_range"] = y.group(1).strip() if y else "—"
-    x = STAMP_RE.search(joined);  m["page_timestamp"] = x.group(1) if x else "—"
+    x = STAMP_RE.search(joined);  m["page_timestamp"]= x.group(1) if x else "—"
 
-    # Sales (structural)
+    # Sales
     res = sales_three_after_total(lines)
     if res:
         m["sales_total"], m["sales_lfl"], m["sales_vs_target"] = res
     else:
         m["sales_total"] = m["sales_lfl"] = m["sales_vs_target"] = "—"
 
-    # Waste & Markdowns (Total row, robust block around (+/-)% or section header)
+    # Waste & Markdowns (Total row around (+/-)% or section header)
     pivot = index_of_label(lines, "(+/-)%")
     if pivot < 0:
         pivot = index_of_label(lines, "Waste & Markdowns")
@@ -354,11 +341,11 @@ def parse_from_lines(lines: List[str]) -> Dict[str, str]:
     else:
         m.update({k: "—" for k in ["waste_total","markdowns_total","wm_total","wm_delta","wm_delta_pct"]})
 
-    # Front End Service — scoped values and vs Target pairs
+    # ── Front End Service (scoped to its block; correct KPI ↔ vs Target)
     fes_start = index_of_label(lines, "Front End Service")
     anchors = []
     if fes_start >= 0:
-        for a in ["More Card Engagement", "Privacy", "Online"]:
+        for a in ["More Card Engagement", "Privacy", "Stock Record NPS", "Production Planning", "Online"]:
             anchors.append(index_of_label(lines, a, start=fes_start+1))
     fes_end = min([i for i in anchors if i >= 0], default=len(lines)) if fes_start >= 0 else len(lines)
 
@@ -366,16 +353,18 @@ def parse_from_lines(lines: List[str]) -> Dict[str, str]:
         if fes_start < 0: return "—"
         li = index_of_label(lines, label, start=fes_start, end=fes_end)
         if li < 0: return "—"
-        stop_i = index_of_label(lines, "vs Target", start=li+1, end=fes_end)
-        # boundary = next KPI label or section end
+        # search up to the local "vs Target" or next KPI label (whichever comes first)
         kpi_labels = ["Sco Utilisation","Efficiency","Scan Rate","Interventions","Mainbank Closed"]
         next_labels = [index_of_label(lines, l, start=li+1, end=fes_end) for l in kpi_labels]
         bound = min([i for i in next_labels if i >= 0], default=fes_end)
-        limit = min([x for x in [stop_i if stop_i >= 0 else fes_end, bound] if x > li], default=fes_end)
-        val = _first_num_in_range(lines, li+1, limit, kind=num_type)
-        if val == "—":
-            val = _first_num_backwards(lines, li, 1, kind=num_type)
-        return val
+        vsi = index_of_label(lines, "vs Target", start=li+1, end=fes_end)
+        limit = min([x for x in [bound, vsi if vsi >= 0 else fes_end] if x > li], default=fes_end)
+        # try just after label; if blank (some UIs render above), try one line before
+        v = nearest_num_of_type(lines, li, window=max(1, limit - li), kind=num_type)
+        if v == "—":
+            v = _contains_num_of_type(lines[li-1], num_type) if li-1 >= fes_start else None
+            v = v or "—"
+        return v
 
     def _fes_vs(label: str) -> str:
         if fes_start < 0: return "—"
@@ -388,7 +377,7 @@ def parse_from_lines(lines: List[str]) -> Dict[str, str]:
         bound = min([i for i in next_labels if i >= 0], default=fes_end)
         if vsi >= bound:
             return "—"
-        return _first_num_in_range(lines, vsi+1, min(vsi+3, bound), kind="any")
+        return nearest_num_of_type(lines, vsi, window=min(3, bound - vsi), kind="any")
 
     m["sco_utilisation"]        = _fes_value("Sco Utilisation", "percent")
     m["efficiency"]             = _fes_value("Efficiency",      "percent")
@@ -399,44 +388,67 @@ def parse_from_lines(lines: List[str]) -> Dict[str, str]:
     m["interventions_vs_target"]= _fes_vs("Interventions")
     m["mainbank_vs_target"]     = _fes_vs("Mainbank Closed")
 
-    # Online (bidirectional near-label, with types)
-    m["availability_pct"]   = first_number_near_label(lines, "Availability",        span=20, kind="percent")
-    m["despatched_on_time"] = first_number_near_label(lines, "Despatched on Time",  span=20, kind="percent")
-    m["delivered_on_time"]  = first_number_near_label(lines, "Delivered on Time",   span=20, kind="percent")
-    m["cc_avg_wait"]        = first_number_near_label(lines, "average wait",        span=40, want_time=True, kind="time")
+    # ── Online (global nearest-with-type; Availability prefers above-the-label hit)
+    i_av  = index_of_label(lines, "Availability")
+    i_dsp = index_of_label(lines, "Despatched on Time")
+    i_del = index_of_label(lines, "Delivered on Time")
+    i_wait= index_of_label(lines, "average wait")
 
-    # Payroll (bidirectional near-label)
-    m["payroll_outturn"]    = first_number_near_label(lines, "Payroll Outturn",    span=8)
-    m["absence_outturn"]    = first_number_near_label(lines, "Absence Outturn",    span=8)
-    m["productive_outturn"] = first_number_near_label(lines, "Productive Outturn", span=8)
-    m["holiday_outturn"]    = first_number_near_label(lines, "Holiday Outturn",    span=8)
-    m["current_base_cost"]  = first_number_near_label(lines, "Current Base Cost",  span=8)
+    m["availability_pct"]   = nearest_num_of_type(lines, i_av,  window=30, prefer_before_first=3, kind="percent")  if i_av  >= 0 else "—"
+    m["despatched_on_time"] = nearest_num_of_type(lines, i_dsp, window=30, prefer_before_first=0, kind="percent")   if i_dsp >= 0 else "—"
+    m["delivered_on_time"]  = nearest_num_of_type(lines, i_del, window=30, prefer_before_first=0, kind="percent")   if i_del >= 0 else "—"
+    m["cc_avg_wait"]        = nearest_num_of_type(lines, i_wait,window=80, prefer_before_first=0, kind="time")      if i_wait>= 0 else "—"
 
-    # Card Engagement (bidirectional near-label)
-    m["swipe_rate"]     = first_number_near_label(lines, "Swipe Rate",   span=8,  kind="percent")
-    m["swipes_wow_pct"] = first_number_near_label(lines, "Swipes WOW",   span=8,  kind="percent")
-    m["new_customers"]  = first_number_near_label(lines, "New Customers",span=8,  kind="integer")
-    m["swipes_yoy_pct"] = first_number_near_label(lines, "Swipes YOY",   span=8,  kind="percent")
+    # ── Payroll (nearest + types)
+    for lbl, key in [
+        ("Payroll Outturn", "payroll_outturn"),
+        ("Absence Outturn", "absence_outturn"),
+        ("Productive Outturn", "productive_outturn"),
+        ("Holiday Outturn", "holiday_outturn"),
+        ("Current Base Cost", "current_base_cost"),
+    ]:
+        i = index_of_label(lines, lbl)
+        m[key] = nearest_num_of_type(lines, i, window=12, kind="any") if i >= 0 else "—"
 
-    # Production Planning
-    m["data_provided"] = first_number_near_label(lines, "Data Provided", span=8,  kind="percent")
-    m["trusted_data"]  = first_number_near_label(lines, "Trusted Data",  span=8,  kind="percent")
+    # ── Card Engagement (nearest + types)
+    for lbl, key, kind in [
+        ("Swipe Rate", "swipe_rate", "percent"),
+        ("Swipes WOW", "swipes_wow_pct", "percent"),
+        ("New Customers", "new_customers", "integer"),
+        ("Swipes YOY", "swipes_yoy_pct", "percent"),
+    ]:
+        i = index_of_label(lines, lbl)
+        m[key] = nearest_num_of_type(lines, i, window=12, kind=kind) if i >= 0 else "—"
 
-    # Shrink
-    m["moa"]                  = first_number_near_label(lines, "Morrisons Order Adjustments", span=12)
-    m["waste_validation"]     = first_number_near_label(lines, "Waste Validation",            span=12, kind="percent")
-    m["unrecorded_waste_pct"] = first_number_near_label(lines, "Unrecorded Waste",            span=12, kind="percent")
-    m["shrink_vs_budget_pct"] = first_number_near_label(lines, "Shrink vs Budget",            span=12, kind="percent")
+    # ── Production Planning
+    for lbl, key in [
+        ("Data Provided", "data_provided"),
+        ("Trusted Data", "trusted_data"),
+    ]:
+        i = index_of_label(lines, lbl)
+        m[key] = nearest_num_of_type(lines, i, window=8, kind="percent") if i >= 0 else "—"
 
-    # Complaints / My Reports / Weekly Activity
-    val = first_number_near_label(lines, "Key Customer Complaints", span=10, kind="integer")
-    if val == "—":
-        val = first_number_near_label(lines, "Customer Complaints", span=10, kind="integer")
+    # ── Shrink (typed; MOA can be money/KMB)
+    i_moa  = index_of_label(lines, "Morrisons Order Adjustments")
+    i_wv   = index_of_label(lines, "Waste Validation")
+    i_urw  = index_of_label(lines, "Unrecorded Waste")
+    i_svb  = index_of_label(lines, "Shrink vs Budget")
+    m["moa"]                  = nearest_num_of_type(lines, i_moa, window=12, kind="money")   if i_moa >= 0 else "—"
+    m["waste_validation"]     = nearest_num_of_type(lines, i_wv,  window=12, kind="percent") if i_wv  >= 0 else "—"
+    m["unrecorded_waste_pct"] = nearest_num_of_type(lines, i_urw, window=12, kind="percent") if i_urw >= 0 else "—"
+    m["shrink_vs_budget_pct"] = nearest_num_of_type(lines, i_svb, window=12, kind="percent") if i_svb >= 0 else "—"
+
+    # ── Complaints / My Reports / Weekly Activity
+    i_kcc = index_of_label(lines, "Key Customer Complaints")
+    i_cc  = index_of_label(lines, "Customer Complaints")
+    val = nearest_num_of_type(lines, i_kcc, window=10, kind="integer") if i_kcc >= 0 else "—"
+    if val == "—" and i_cc >= 0:
+        val = nearest_num_of_type(lines, i_cc, window=10, kind="integer")
     m["complaints_key"]  = val
-    m["my_reports"]      = first_number_near_label(lines, "My Reports",      span=10, kind="integer")
-    m["weekly_activity"] = first_number_near_label(lines, "Weekly Activity",  span=10)
+    i_mr = index_of_label(lines, "My Reports");      m["my_reports"]      = nearest_num_of_type(lines, i_mr, window=10, kind="integer") if i_mr >= 0 else "—"
+    i_wa = index_of_label(lines, "Weekly Activity"); m["weekly_activity"] = nearest_num_of_type(lines, i_wa, window=10, kind="any")      if i_wa >= 0 else "—"
 
-    # Gauges will be filled by ROI OCR
+    # Gauges via ROI OCR later
     for k in ["supermarket_nps","colleague_happiness","home_delivery_nps","cafe_nps","click_collect_nps","customer_toilet_nps"]:
         m.setdefault(k, "—")
 
@@ -681,7 +693,7 @@ def run_daily_scrape():
             lines = dump_numbered_lines(body_text)
             metrics = parse_from_lines(lines)
 
-            # Fill stubborn tiles with ROI OCR (esp. gauges / online if missing)
+            # Fill stubborn tiles with ROI OCR (esp. gauges / online wait)
             fill_missing_with_roi(metrics, screenshot)
 
         finally:
