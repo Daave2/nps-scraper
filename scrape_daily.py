@@ -8,7 +8,7 @@ Key points in this build:
 - Gemini Vision Integration: Uses Gemini Pro Vision for all difficult, visual-based metrics (NPS, Payroll, Shrink circles).
 - Robustness: Eliminates brittle ROI coordinates and traditional OCR misreads.
 - Efficiency: Retains fast, reliable line parsing for easy text-based metrics.
-- SYNTAX CORRECTED: Fixed the NameError for send_card/write_csv functions.
+- SCOPE CORRECTED: All functions are now correctly defined in the proper scope for the entry point.
 """
 
 import os
@@ -92,7 +92,7 @@ ALERT_WEBHOOK = config["DEFAULT"].get("ALERT_WEBHOOK",  os.getenv("ALERT_WEBHOOK
 CI_RUN_URL    = os.getenv("CI_RUN_URL", "")
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Helpers: Chat + file saves (Moved to top for NameError fix)
+# Helpers: Chat + file saves
 # ──────────────────────────────────────────────────────────────────────────────
 def _post_with_backoff(url: str, payload: dict) -> bool:
     backoff, max_backoff = 2.0, 30.0
@@ -139,7 +139,7 @@ def save_text(path: Path, text: str):
         pass
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Card + CSV (Moved to top for NameError fix)
+# Card + CSV
 # ──────────────────────────────────────────────────────────────────────────────
 def kv(label: str, val: str) -> dict:
     return {"decoratedText": {"topLabel": label, "text": (val or "—")}}
@@ -235,7 +235,6 @@ def send_card(metrics: Dict[str, str]) -> bool:
         return False
     return _post_with_backoff(MAIN_WEBHOOK, build_chat_card(metrics))
 
-
 # ──────────────────────────────────────────────────────────────────────────────
 # Browser automation
 # ──────────────────────────────────────────────────────────────────────────────
@@ -305,6 +304,186 @@ def open_and_prepare(page) -> bool:
         page.wait_for_timeout(1500)
 
     return True
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Text parsing (layout-by-lines) — Deterministic rules (SCOPED)
+# ──────────────────────────────────────────────────────────────────────────────
+NUM_ANY_RE   = re.compile(r"[£]?-?\d+(?:\.\d+)?(?:[KMB]|%)?", re.I)
+NUM_INT_RE   = re.compile(r"\b-?\d+\b")
+NUM_PCT_RE   = re.compile(r"-?\d+(?:\.\d+)?%")
+# allow both "£-8K" and "-£8K"
+NUM_MONEY_RE = re.compile(r"(?:-?\s*£|£\s*-?)\s*\d+(?:\.\d+)?[KMB]?", re.I)
+TIME_RE      = re.compile(r"\b\d{1,2}:\d{2}\b")
+
+EMAILLOC = re.compile(r"([A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}).*?\|\s*([^\|]+?)\s*\|\s*(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})", re.S)
+PERIOD_RE= re.compile(r"The data on this report is from:\s*([^\n]+)")
+STAMP_RE = re.compile(r"\b(\d{1,2}\s+[A-Za-z]{3}\s+\d{4},\s*\d{2}:\d{2}:\d{2})\b")
+
+def get_body_text(page) -> str:
+    best, best_len = "", 0
+    try:
+        t = page.inner_text("body")
+        if t and len(t) > best_len:
+            best, best_len = t, len(t)
+    except Exception:
+        pass
+    for fr in page.frames:
+        try:
+            fr.wait_for_selector("body", timeout=3000)
+            t = fr.locator("body").inner_text(timeout=5000)
+            if t and len(t) > best_len:
+                best, best_len = t, len(t)
+        except Exception:
+            continue
+    return best
+
+def dump_numbered_lines(txt: str) -> List[str]:
+    lines = [ln.rstrip() for ln in txt.splitlines()]
+    ts = int(time.time())
+    numbered = "\n".join(f"{i:04d} | {ln}" for i, ln in enumerate(lines))
+    save_text(SCREENS_DIR / f"{ts}_lines.txt", numbered)
+    return lines
+
+def _contains_num_of_type(s: str, kind: str) -> Optional[str]:
+    # --- TARGETED FIXES START: Enforce % if number found ---
+    if kind == "percent_format":
+        m = NUM_PCT_RE.search(s)
+        if m: return m.group(0)
+        # If it's a number that should be a percentage but lacks the %, add it if it's the only numeric content
+        m_num = NUM_ANY_RE.search(s)
+        if m_num and (m_num.group(0) == s.strip() or s.strip().endswith(m_num.group(0))):
+            # Exclude currency/K/M/B symbols from getting a % added
+            if not re.search(r"[£KMB]", m_num.group(0), re.I):
+                return m_num.group(0) + "%"
+        return None
+    # --- TARGETED FIXES END ---
+    
+    if kind == "time":
+        m = TIME_RE.search(s); return m.group(0) if m else None
+    if kind == "percent":
+        m = NUM_PCT_RE.search(s); return m.group(0) if m else None
+    if kind == "integer":
+        m = NUM_INT_RE.search(s); return m.group(0) if m else None
+    if kind == "money":
+        m = NUM_MONEY_RE.search(s)
+        if m: return re.sub(r"\s+", "", m.group(0))  # tidy spaces
+        m2 = re.search(r"-?\d+(?:\.\d+)?[KMB]?", s, re.I); return m2.group(0) if m2 else None
+    m = NUM_ANY_RE.search(s); return m.group(0) if m else None
+
+def _idx(lines: List[str], needle: str, start=0, end=None) -> int:
+    end = len(lines) if end is None else end
+    nl = needle.lower()
+    for i in range(start, end):
+        if nl in lines[i].lower():
+            return i
+    return -1
+
+def _scope_end(lines: List[str], starts: List[int], fallback_end: int) -> int:
+    nxt = [i for i in starts if i >= 0]
+    return min(nxt) if nxt else fallback_end
+
+def section_bounds(lines: List[str], start_anchor: str, candidate_next: List[str]) -> Tuple[int,int]:
+    s = _idx(lines, start_anchor)
+    if s < 0: return -1, -1
+    next_idxs = [ _idx(lines, a, s+1) for a in candidate_next ]
+    e = _scope_end(lines, next_idxs, len(lines))
+    return s, e
+
+def value_near_scoped(lines: List[str], label: str, kind: str, scope: Tuple[int,int], *, near_before=6, near_after=6, prefer_before_first=0) -> str:
+    s, e = scope
+    if s < 0: return "—"
+    li = _idx(lines, label, s, e)
+    if li < 0: return "—"
+    
+    # Check for percentage format first if requested
+    target_kind = "percent" if "percent" in kind else kind
+
+    # bias: prefer hits just above the label (Availability 84%)
+    if prefer_before_first > 0:
+        for i in range(max(s, li - prefer_before_first), li):
+            v = _contains_num_of_type(lines[i], target_kind if target_kind != "percent" else "percent_format")
+            if v: return v
+    # after the label
+    for i in range(li+1, min(e, li+1+near_after)):
+        v = _contains_num_of_type(lines[i], target_kind if target_kind != "percent" else "percent_format")
+        if v: return v
+    # before the label
+    for i in range(max(s, li - near_before), li):
+        v = _contains_num_of_type(lines[i], target_kind if target_kind != "percent" else "percent_format")
+        if v: return v
+    return "—"
+
+def sales_three_after_total(lines: List[str]) -> Optional[Tuple[str,str,str]]:
+    """‘Sales’ → first ‘Total’ after → next 3 numeric tokens across following lines."""
+    i_sales = _idx(lines, "Sales", start=0)
+    if i_sales < 0:
+        return None
+    for i in range(i_sales + 1, min(len(lines), i_sales + 200)):
+        if lines[i].strip().lower() == "total":
+            collected: List[str] = []
+            for j in range(i + 1, min(len(lines), i + 40)):
+                toks = NUM_ANY_RE.findall(lines[j])
+                for t in toks:
+                    collected.append(t)
+                    if len(collected) == 3:
+                        return collected[0], collected[1], collected[2]
+            break
+    return None
+
+# NEW: safe "coalesce" to handle "—" being truthy
+def coalesce(*vals: str) -> str:
+    """Return the first value that isn't empty and isn't '—'."""
+    for v in vals:
+        if v and v != "—":
+            return v
+    return "—"
+
+# FES helpers (scoped KPI value + correctly paired vs Target)
+def _fes_value(lines: List[str], label: str, num_type: str, scope: Tuple[int,int]) -> str:
+    s, e = scope
+    if s < 0: return "—"
+    li = _idx(lines, label, s, e)
+    if li < 0: return "—"
+    kpi_labels = ["Sco Utilisation","SCO Utilisation","Efficiency","Scan Rate","Interventions","Mainbank Closed"]
+    next_labels = [ _idx(lines, l, li+1, e) for l in kpi_labels ]
+    bound = _scope_end(lines, next_labels, e)
+    vsi = _idx(lines, "vs Target", li+1, e)
+    limit = min([x for x in [bound, vsi if vsi >= 0 else e] if x > li], default=e)
+    # typed search right after label; if nothing, peek one line above (some tiles render above)
+    # after
+    for i in range(li+1, min(limit, li+1+8)):
+        v = _contains_num_of_type(lines[i], num_type)
+        if v: return v
+    # one line above fallback
+    if li-1 >= s:
+        v = _contains_num_of_type(lines[li-1], num_type)
+        if v: return v
+    # outward bounded
+    for i in range(li+1, limit):
+        v = _contains_num_of_type(lines[i], num_type)
+        if v: return v
+    for i in range(max(s, li-3), li):
+        v = _contains_num_of_type(lines[i], num_type)
+        if v: return v
+    return "—"
+
+def _fes_vs(lines: List[str], label: str, scope: Tuple[int,int]) -> str:
+    s, e = scope
+    if s < 0: return "—"
+    li = _idx(lines, label, s, e)
+    if li < 0: return "—"
+    vsi = _idx(lines, "vs Target", li+1, e)
+    if vsi < 0: return "—"
+    kpi_labels = ["Sco Utilisation","SCO Utilisation","Efficiency","Scan Rate","Interventions","Mainbank Closed"]
+    next_labels = [ _idx(lines, l, li+1, min(e, li+40)) for l in kpi_labels ]
+    bound = _scope_end(lines, next_labels, min(e, li+40))
+    if vsi >= bound:
+        return "—"
+    # limited window after vs Target
+    for i in range(vsi+1, min(vsi+3, bound)):
+        v = _contains_num_of_type(lines[i], "any")
+        if v: return v
+    return "—"
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Gemini Vision Extraction (For hard-to-read metrics)
