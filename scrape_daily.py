@@ -6,9 +6,7 @@ Retail Performance Dashboard → Daily Summary (layout-by-lines + GEMINI VISION)
 
 Key points in this build:
 - Gemini Vision Integration: Uses Gemini Pro Vision for all difficult, visual-based metrics (NPS, Payroll, Shrink circles).
-- Robustness: Eliminates brittle ROI coordinates and traditional OCR misreads.
-- Efficiency: Retains fast, reliable line parsing for easy text-based metrics.
-- SCOPE CORRECTED: All functions are now correctly defined in the proper scope for the entry point.
+- BUGFIX: Ensures the Gemini result for Key Complaints overwrites the incorrect line-parsed result (0).
 """
 
 import os
@@ -59,6 +57,7 @@ DASHBOARD_URL = (
 VIEWPORT = {"width": 1366, "height": 768}
 
 # --- METRICS REQUIRING GEMINI (The previously failing list) ---
+# Note: key_customer_complaints is NOT in this list, but handled explicitly below
 GEMINI_METRICS = [
     "supermarket_nps", "colleague_happiness", "home_delivery_nps", "cafe_nps", 
     "click_collect_nps", "customer_toilet_nps", "payroll_outturn", "absence_outturn", 
@@ -306,6 +305,85 @@ def open_and_prepare(page) -> bool:
     return True
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Gemini Vision Extraction (For hard-to-read metrics)
+# ──────────────────────────────────────────────────────────────────────────────
+def extract_gemini_metrics(metrics: Dict[str, str], image_path: Path) -> Dict[str, str]:
+    if not GEMINI_AVAILABLE or not GEMINI_API_KEY:
+        log.warning("Gemini API not available or key missing. Skipping AI extraction.")
+        return metrics
+
+    # 1. Determine which fields are missing or require AI validation
+    # Use GEMINI_METRICS plus the known problematic field (key_customer_complaints)
+    fields_to_query = [k for k in GEMINI_METRICS if metrics.get(k) in [None, "—"]]
+
+    # Key Complaints is manually added to the query regardless of line parse outcome, 
+    # as the line parser is known to be unreliable for this field ("0" vs "2")
+    fields_to_query.append("key_customer_complaints")
+    
+    # Add other key metrics for validation (Line parsing can be slow/error prone on long strings)
+    fields_to_query.extend(["swipe_rate", "swipes_wow_pct"])
+    fields_to_query = list(set(fields_to_query)) 
+
+    if not fields_to_query:
+        log.info("All high-value metrics were successfully line-parsed. Skipping Gemini call.")
+        return metrics
+
+    log.info(f"Querying Gemini for {len(fields_to_query)} fields: {', '.join(fields_to_query)}")
+    
+    # Clean up keys for the prompt (e.g., 'payroll_outturn' -> 'Payroll Outturn')
+    prompt_map = {k.replace('_', ' ').title(): k for k in fields_to_query}
+    
+    system_instruction = (
+        "You are a hyper-accurate retail dashboard data extraction engine. Your task is to extract "
+        "the exact numeric or short text values for the requested metrics from the provided image. "
+        "Return the output as a single, valid JSON object, using the requested keys exactly as provided. "
+        "For percentages, include the '%' symbol."
+    )
+    
+    user_prompt = (
+        f"Analyze the image and return the exact values for the following metrics as a single JSON object. "
+        f"For any NPS value, return the number. For Payroll/Finance, include K or M/B if present, and the negative sign if present. "
+        f"Metrics to extract: {list(prompt_map.keys())}"
+    )
+
+    try:
+        client = genai.Client(api_key=GEMINI_API_KEY)
+        
+        # Load the image
+        img = Image.open(image_path)
+        
+        # Configure model and send prompt
+        response = client.models.generate_content(
+            model='gemini-2.5-flash',
+            contents=[img, user_prompt],
+            config=types.GenerateContentConfig(
+                system_instruction=system_instruction,
+                response_mime_type="application/json",
+                response_schema=types.Schema(
+                    type=types.Type.OBJECT,
+                    properties={v: types.Schema(type=types.Type.STRING) for v in prompt_map.keys()}
+                )
+            )
+        )
+        
+        # Parse the AI's JSON response
+        ai_data = json.loads(response.text)
+        
+        updated_metrics = metrics.copy()
+        for ai_key, ai_val in ai_data.items():
+            python_key = prompt_map.get(ai_key)
+            if python_key and ai_val is not None:
+                # The AI's result is the definitive value, overwrite the metrics dict
+                updated_metrics[python_key] = str(ai_val).strip()
+                log.info(f"Gemini Success: {python_key} -> {updated_metrics[python_key]}")
+
+        return updated_metrics
+
+    except Exception as e:
+        log.error(f"Gemini API Error: Failed to extract metrics: {e}")
+        return metrics
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Text parsing (layout-by-lines) — Deterministic rules (SCOPED)
 # ──────────────────────────────────────────────────────────────────────────────
 NUM_ANY_RE   = re.compile(r"[£]?-?\d+(?:\.\d+)?(?:[KMB]|%)?", re.I)
@@ -496,11 +574,11 @@ def extract_gemini_metrics(metrics: Dict[str, str], image_path: Path) -> Dict[st
     # 1. Determine which fields are missing or require AI validation
     fields_to_query = [k for k in GEMINI_METRICS if metrics.get(k) in [None, "—"]]
 
-    # Also add key complaints to the AI query for robustness
-    if metrics.get("complaints_key") in [None, "—", "0"]:
-        fields_to_query.append("key_customer_complaints")
+    # Key Complaints is manually added to the query regardless of line parse outcome, 
+    # as the line parser is known to be unreliable for this field ("0" vs "2")
+    fields_to_query.append("key_customer_complaints")
     
-    # Add other key metrics to query Gemini for validation (can remove later if confident in line parsing)
+    # Add other key metrics for validation (Line parsing can be slow/error prone on long strings)
     fields_to_query.extend(["swipe_rate", "swipes_wow_pct"])
     fields_to_query = list(set(fields_to_query)) # Remove duplicates
 
@@ -511,7 +589,6 @@ def extract_gemini_metrics(metrics: Dict[str, str], image_path: Path) -> Dict[st
     log.info(f"Querying Gemini for {len(fields_to_query)} fields: {', '.join(fields_to_query)}")
     
     # Clean up keys for the prompt (e.g., 'payroll_outturn' -> 'Payroll Outturn')
-    # and map back to Python keys later.
     prompt_map = {k.replace('_', ' ').title(): k for k in fields_to_query}
     
     system_instruction = (
@@ -554,7 +631,7 @@ def extract_gemini_metrics(metrics: Dict[str, str], image_path: Path) -> Dict[st
         for ai_key, ai_val in ai_data.items():
             python_key = prompt_map.get(ai_key)
             if python_key and ai_val is not None:
-                # The AI's result is the definitive value
+                # The AI's result is the definitive value, overwrite the metrics dict
                 updated_metrics[python_key] = str(ai_val).strip()
                 log.info(f"Gemini Success: {python_key} -> {updated_metrics[python_key]}")
 
