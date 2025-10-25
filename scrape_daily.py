@@ -4,11 +4,11 @@
 """
 Retail Performance Dashboard → Daily Summary (layout-by-lines + ROI OCR) → Google Chat
 
-Updates:
+Key points in this build:
 - Sales 'Total' row: FIRST 'Total' AFTER the 'Sales' header → capture next 3 numeric tokens.
 - Front End Service: scoped values + correctly paired "vs Target" per KPI.
-- Online/Complaints/Payroll/Shrink/Card Engagement: nearest, bidirectional, typed extraction.
-- Availability: prefer a % within 3 lines ABOVE the label, else search nearby (prevents CE bleed).
+- Online/Complaints/Payroll/Shrink/Card Engagement: typed, bidirectional search LIMITED to their section.
+- Availability: prefer a % within 3 lines ABOVE the label, else search nearby (prevents bleed).
 - C&C average wait: nearest HH:MM to the label (wide window).
 - Waste & Markdowns: robust block regex (Total row with (+/-) and (+/-)%).
 - Keeps ROI OCR fallback and debug artifacts (full screenshot, numbered lines, ROI overlay).
@@ -209,13 +209,14 @@ def screenshot_full(page) -> Optional["Image.Image"]:
         return None
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Text parsing (layout-by-lines) — Deterministic rules
+# Text parsing (layout-by-lines) — Deterministic rules (SCOPED)
 # ──────────────────────────────────────────────────────────────────────────────
 NUM_ANY_RE   = re.compile(r"[£]?-?\d+(?:\.\d+)?(?:[KMB]|%)?", re.I)
 NUM_INT_RE   = re.compile(r"\b-?\d+\b")
 NUM_PCT_RE   = re.compile(r"-?\d+(?:\.\d+)?%")
-NUM_MONEY_RE = re.compile(r"[£]-?\d+(?:\.\d+)?[KMB]?", re.I)
-TIME_RE      = re.compile(r"\b\d{2}:\d{2}\b")
+# allow both "£-8K" and "-£8K"
+NUM_MONEY_RE = re.compile(r"(?:-?\s*£|£\s*-?)\s*\d+(?:\.\d+)?[KMB]?", re.I)
+TIME_RE      = re.compile(r"\b\d{1,2}:\d{2}\b")
 
 EMAILLOC = re.compile(r"([A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}).*?\|\s*([^\|]+?)\s*\|\s*(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})", re.S)
 PERIOD_RE= re.compile(r"The data on this report is from:\s*([^\n]+)")
@@ -246,13 +247,6 @@ def dump_numbered_lines(txt: str) -> List[str]:
     save_text(SCREENS_DIR / f"{ts}_lines.txt", numbered)
     return lines
 
-def index_of_label(lines: List[str], label: str, start: int = 0, end: Optional[int] = None) -> int:
-    end = len(lines) if end is None else end
-    for i in range(start, end):
-        if label.lower() in lines[i].lower():
-            return i
-    return -1
-
 def _contains_num_of_type(s: str, kind: str) -> Optional[str]:
     if kind == "time":
         m = TIME_RE.search(s); return m.group(0) if m else None
@@ -262,36 +256,52 @@ def _contains_num_of_type(s: str, kind: str) -> Optional[str]:
         m = NUM_INT_RE.search(s); return m.group(0) if m else None
     if kind == "money":
         m = NUM_MONEY_RE.search(s)
-        if m: return m.group(0)
+        if m: return re.sub(r"\s+", "", m.group(0))  # tidy spaces
         m2 = re.search(r"-?\d+(?:\.\d+)?[KMB]", s, re.I); return m2.group(0) if m2 else None
     m = NUM_ANY_RE.search(s); return m.group(0) if m else None
 
-def nearest_num_of_type(lines: List[str], idx: int, window: int, *, prefer_before_first: int = 0, kind: str = "any") -> str:
-    """
-    Scan symmetrically outward from idx within ±window, optionally first try up to
-    `prefer_before_first` lines above the label (useful for Availability 84% sitting above).
-    """
-    # First, a small bias search above the label
+def _idx(lines: List[str], needle: str, start=0, end=None) -> int:
+    end = len(lines) if end is None else end
+    nl = needle.lower()
+    for i in range(start, end):
+        if nl in lines[i].lower():
+            return i
+    return -1
+
+def _scope_end(lines: List[str], starts: List[int], fallback_end: int) -> int:
+    nxt = [i for i in starts if i >= 0]
+    return min(nxt) if nxt else fallback_end
+
+def section_bounds(lines: List[str], start_anchor: str, candidate_next: List[str]) -> Tuple[int,int]:
+    s = _idx(lines, start_anchor)
+    if s < 0: return -1, -1
+    next_idxs = [ _idx(lines, a, s+1) for a in candidate_next ]
+    e = _scope_end(lines, next_idxs, len(lines))
+    return s, e
+
+def value_near_scoped(lines: List[str], label: str, kind: str, scope: Tuple[int,int], *, near_before=6, near_after=6, prefer_before_first=0) -> str:
+    s, e = scope
+    if s < 0: return "—"
+    li = _idx(lines, label, s, e)
+    if li < 0: return "—"
+    # bias: prefer hits just above the label (Availability 84%)
     if prefer_before_first > 0:
-        for i in range(max(0, idx - prefer_before_first), idx):
+        for i in range(max(s, li - prefer_before_first), li):
             v = _contains_num_of_type(lines[i], kind)
-            if v:
-                return v
-    # Then symmetric outward search
-    for d in range(1, window + 1):
-        j = idx + d
-        if j < len(lines):
-            v = _contains_num_of_type(lines[j], kind)
             if v: return v
-        k = idx - d
-        if k >= 0:
-            v = _contains_num_of_type(lines[k], kind)
-            if v: return v
+    # after the label
+    for i in range(li+1, min(e, li+1+near_after)):
+        v = _contains_num_of_type(lines[i], kind)
+        if v: return v
+    # before the label
+    for i in range(max(s, li - near_before), li):
+        v = _contains_num_of_type(lines[i], kind)
+        if v: return v
     return "—"
 
 def sales_three_after_total(lines: List[str]) -> Optional[Tuple[str,str,str]]:
     """‘Sales’ → first ‘Total’ after → next 3 numeric tokens across following lines."""
-    i_sales = index_of_label(lines, "Sales", start=0)
+    i_sales = _idx(lines, "Sales", start=0)
     if i_sales < 0:
         return None
     for i in range(i_sales + 1, min(len(lines), i_sales + 200)):
@@ -306,26 +316,92 @@ def sales_three_after_total(lines: List[str]) -> Optional[Tuple[str,str,str]]:
             break
     return None
 
+# FES helpers (scoped KPI value + correctly paired vs Target)
+def _fes_value(lines: List[str], label: str, num_type: str, scope: Tuple[int,int]) -> str:
+    s, e = scope
+    if s < 0: return "—"
+    li = _idx(lines, label, s, e)
+    if li < 0: return "—"
+    kpi_labels = ["Sco Utilisation","SCO Utilisation","Efficiency","Scan Rate","Interventions","Mainbank Closed"]
+    next_labels = [ _idx(lines, l, li+1, e) for l in kpi_labels ]
+    bound = _scope_end(lines, next_labels, e)
+    vsi = _idx(lines, "vs Target", li+1, e)
+    limit = min([x for x in [bound, vsi if vsi >= 0 else e] if x > li], default=e)
+    # typed search right after label; if nothing, peek one line above (some tiles render above)
+    # then do a bounded outward search inside KPI area
+    # after
+    for i in range(li+1, min(limit, li+1+8)):
+        v = _contains_num_of_type(lines[i], num_type)
+        if v: return v
+    # one line above fallback
+    if li-1 >= s:
+        v = _contains_num_of_type(lines[li-1], num_type)
+        if v: return v
+    # outward bounded
+    for i in range(li+1, limit):
+        v = _contains_num_of_type(lines[i], num_type)
+        if v: return v
+    for i in range(max(s, li-3), li):
+        v = _contains_num_of_type(lines[i], num_type)
+        if v: return v
+    return "—"
+
+def _fes_vs(lines: List[str], label: str, scope: Tuple[int,int]) -> str:
+    s, e = scope
+    if s < 0: return "—"
+    li = _idx(lines, label, s, e)
+    if li < 0: return "—"
+    vsi = _idx(lines, "vs Target", li+1, e)
+    if vsi < 0: return "—"
+    kpi_labels = ["Sco Utilisation","SCO Utilisation","Efficiency","Scan Rate","Interventions","Mainbank Closed"]
+    next_labels = [ _idx(lines, l, li+1, min(e, li+40)) for l in kpi_labels ]
+    bound = _scope_end(lines, next_labels, min(e, li+40))
+    if vsi >= bound:
+        return "—"
+    # limited window after vs Target
+    for i in range(vsi+1, min(vsi+3, bound)):
+        v = _contains_num_of_type(lines[i], "any")
+        if v: return v
+    return "—"
+
 def parse_from_lines(lines: List[str]) -> Dict[str, str]:
     m: Dict[str, str] = {}
 
     # Context
     joined = "\n".join(lines)
-    z = EMAILLOC.search(joined); m["store_line"]   = z.group(0).strip() if z else ""
+    z = EMAILLOC.search(joined); m["store_line"]    = z.group(0).strip() if z else ""
     y = PERIOD_RE.search(joined); m["period_range"] = y.group(1).strip() if y else "—"
     x = STAMP_RE.search(joined);  m["page_timestamp"]= x.group(1) if x else "—"
 
-    # Sales
+    # ── Section scopes ────────────────────────────────────────────────────────
+    FES_SCOPE     = section_bounds(lines, "Front End Service",
+                                   ["More Card Engagement","Card Engagement","Production Planning","Online","Waste & Markdowns","Shrink","Payroll","Privacy"])
+    ONLINE_SCOPE  = section_bounds(lines, "Online",
+                                   ["Front End Service","More Card Engagement","Card Engagement","Waste & Markdowns","Shrink","Payroll","Privacy"])
+    PAYROLL_SCOPE = section_bounds(lines, "Payroll",
+                                   ["Online","Front End Service","More Card Engagement","Card Engagement","Waste & Markdowns","Shrink","Privacy"])
+    SHRINK_SCOPE  = section_bounds(lines, "Shrink",
+                                   ["Waste & Markdowns","My Reports","Payroll","Online","Front End Service","More Card Engagement","Card Engagement","Privacy"])
+    CARD_SCOPE    = section_bounds(lines, "More Card Engagement",
+                                   ["Payroll","Online","Front End Service","Waste & Markdowns","Shrink","Privacy"])
+    PP_SCOPE      = section_bounds(lines, "Production Planning",
+                                   ["More Card Engagement","Card Engagement","Payroll","Shrink","Privacy"])
+    COMPLAINTS_SCOPE = section_bounds(lines, "Customer Complaints",
+                                   ["Production Planning","More Card Engagement","Card Engagement","Payroll","Shrink","Privacy"])
+    CLEAN_ROTATE_SCOPE = section_bounds(lines, "Clean & Rotate",
+                                   ["My Reports","More Card Engagement","Card Engagement","Payroll","Privacy"])
+
+    # ── Sales (triple after 'Total') ──────────────────────────────────────────
     res = sales_three_after_total(lines)
     if res:
         m["sales_total"], m["sales_lfl"], m["sales_vs_target"] = res
     else:
         m["sales_total"] = m["sales_lfl"] = m["sales_vs_target"] = "—"
 
-    # Waste & Markdowns (Total row around (+/-)% or section header)
-    pivot = index_of_label(lines, "(+/-)%")
+    # ── Waste & Markdowns (robust Total row regex) ───────────────────────────
+    pivot = _idx(lines, "(+/-)%")
     if pivot < 0:
-        pivot = index_of_label(lines, "Waste & Markdowns")
+        pivot = _idx(lines, "Waste & Markdowns")
     if pivot >= 0:
         s = max(0, pivot - 60); e = min(len(lines), pivot + 80)
         window = "\n".join(lines[s:e])
@@ -341,112 +417,64 @@ def parse_from_lines(lines: List[str]) -> Dict[str, str]:
     else:
         m.update({k: "—" for k in ["waste_total","markdowns_total","wm_total","wm_delta","wm_delta_pct"]})
 
-    # ── Front End Service (scoped to its block; correct KPI ↔ vs Target)
-    fes_start = index_of_label(lines, "Front End Service")
-    anchors = []
-    if fes_start >= 0:
-        for a in ["More Card Engagement", "Privacy", "Stock Record NPS", "Production Planning", "Online"]:
-            anchors.append(index_of_label(lines, a, start=fes_start+1))
-    fes_end = min([i for i in anchors if i >= 0], default=len(lines)) if fes_start >= 0 else len(lines)
+    # ── Front End Service (scoped) ───────────────────────────────────────────
+    # Support both "Sco" and "SCO"
+    m["sco_utilisation"]         = _fes_value(lines, "Sco Utilisation", "percent", FES_SCOPE) or _fes_value(lines, "SCO Utilisation", "percent", FES_SCOPE)
+    m["efficiency"]              = _fes_value(lines, "Efficiency",      "percent", FES_SCOPE)
+    m["scan_rate"]               = _fes_value(lines, "Scan Rate",       "integer", FES_SCOPE)
+    m["interventions"]           = _fes_value(lines, "Interventions",   "integer", FES_SCOPE)
+    m["mainbank_closed"]         = _fes_value(lines, "Mainbank Closed", "integer", FES_SCOPE)
+    m["scan_vs_target"]          = _fes_vs(lines, "Scan Rate",       FES_SCOPE)
+    m["interventions_vs_target"] = _fes_vs(lines, "Interventions",   FES_SCOPE)
+    m["mainbank_vs_target"]      = _fes_vs(lines, "Mainbank Closed", FES_SCOPE)
 
-    def _fes_value(label: str, num_type: str) -> str:
-        if fes_start < 0: return "—"
-        li = index_of_label(lines, label, start=fes_start, end=fes_end)
-        if li < 0: return "—"
-        # search up to the local "vs Target" or next KPI label (whichever comes first)
-        kpi_labels = ["Sco Utilisation","Efficiency","Scan Rate","Interventions","Mainbank Closed"]
-        next_labels = [index_of_label(lines, l, start=li+1, end=fes_end) for l in kpi_labels]
-        bound = min([i for i in next_labels if i >= 0], default=fes_end)
-        vsi = index_of_label(lines, "vs Target", start=li+1, end=fes_end)
-        limit = min([x for x in [bound, vsi if vsi >= 0 else fes_end] if x > li], default=fes_end)
-        # try just after label; if blank (some UIs render above), try one line before
-        v = nearest_num_of_type(lines, li, window=max(1, limit - li), kind=num_type)
-        if v == "—":
-            v = _contains_num_of_type(lines[li-1], num_type) if li-1 >= fes_start else None
-            v = v or "—"
-        return v
+    # ── Online (scoped; Availability prefers 3 lines above) ──────────────────
+    m["availability_pct"]   = value_near_scoped(lines, "Availability",       "percent", ONLINE_SCOPE, near_before=6,  near_after=10, prefer_before_first=3)
+    m["despatched_on_time"] = value_near_scoped(lines, "Despatched on Time", "percent", ONLINE_SCOPE, near_before=8,  near_after=12)
+    m["delivered_on_time"]  = value_near_scoped(lines, "Delivered on Time",  "percent", ONLINE_SCOPE, near_before=8,  near_after=12)
+    m["cc_avg_wait"]        = value_near_scoped(lines, "average wait",       "time",    ONLINE_SCOPE, near_before=10, near_after=14)
 
-    def _fes_vs(label: str) -> str:
-        if fes_start < 0: return "—"
-        li = index_of_label(lines, label, start=fes_start, end=fes_end)
-        if li < 0: return "—"
-        vsi = index_of_label(lines, "vs Target", start=li+1, end=fes_end)
-        if vsi < 0: return "—"
-        kpi_labels = ["Sco Utilisation","Efficiency","Scan Rate","Interventions","Mainbank Closed"]
-        next_labels = [index_of_label(lines, l, start=li+1, end=fes_end) for l in kpi_labels]
-        bound = min([i for i in next_labels if i >= 0], default=fes_end)
-        if vsi >= bound:
-            return "—"
-        return nearest_num_of_type(lines, vsi, window=min(3, bound - vsi), kind="any")
+    # ── Payroll (scoped) ─────────────────────────────────────────────────────
+    m["payroll_outturn"]    = value_near_scoped(lines, "Payroll Outturn",    "any", PAYROLL_SCOPE, near_before=4, near_after=6)
+    m["absence_outturn"]    = value_near_scoped(lines, "Absence Outturn",    "any", PAYROLL_SCOPE, near_before=4, near_after=6)
+    m["productive_outturn"] = value_near_scoped(lines, "Productive Outturn", "any", PAYROLL_SCOPE, near_before=4, near_after=6)
+    m["holiday_outturn"]    = value_near_scoped(lines, "Holiday Outturn",    "any", PAYROLL_SCOPE, near_before=4, near_after=6)
+    m["current_base_cost"]  = value_near_scoped(lines, "Current Base Cost",  "any", PAYROLL_SCOPE, near_before=4, near_after=6)
 
-    m["sco_utilisation"]        = _fes_value("Sco Utilisation", "percent")
-    m["efficiency"]             = _fes_value("Efficiency",      "percent")
-    m["scan_rate"]              = _fes_value("Scan Rate",       "integer")
-    m["interventions"]          = _fes_value("Interventions",   "integer")
-    m["mainbank_closed"]        = _fes_value("Mainbank Closed", "integer")
-    m["scan_vs_target"]         = _fes_vs("Scan Rate")
-    m["interventions_vs_target"]= _fes_vs("Interventions")
-    m["mainbank_vs_target"]     = _fes_vs("Mainbank Closed")
+    # ── Card Engagement (scoped) ─────────────────────────────────────────────
+    m["swipe_rate"]      = value_near_scoped(lines, "Swipe Rate",    "percent", CARD_SCOPE, near_before=4, near_after=6)
+    m["swipes_wow_pct"]  = value_near_scoped(lines, "Swipes WOW",    "percent", CARD_SCOPE, near_before=4, near_after=6)
+    m["new_customers"]   = value_near_scoped(lines, "New Customers", "integer", CARD_SCOPE, near_before=6, near_after=8)
+    m["swipes_yoy_pct"]  = value_near_scoped(lines, "Swipes YOY",    "percent", CARD_SCOPE, near_before=6, near_after=8)
 
-    # ── Online (global nearest-with-type; Availability prefers above-the-label hit)
-    i_av  = index_of_label(lines, "Availability")
-    i_dsp = index_of_label(lines, "Despatched on Time")
-    i_del = index_of_label(lines, "Delivered on Time")
-    i_wait= index_of_label(lines, "average wait")
+    # ── Production Planning (scoped) ─────────────────────────────────────────
+    m["data_provided"] = value_near_scoped(lines, "Data Provided", "percent", PP_SCOPE, near_before=6, near_after=8)
+    m["trusted_data"]  = value_near_scoped(lines, "Trusted Data",  "percent", PP_SCOPE, near_before=6, near_after=8)
 
-    m["availability_pct"]   = nearest_num_of_type(lines, i_av,  window=30, prefer_before_first=3, kind="percent")  if i_av  >= 0 else "—"
-    m["despatched_on_time"] = nearest_num_of_type(lines, i_dsp, window=30, prefer_before_first=0, kind="percent")   if i_dsp >= 0 else "—"
-    m["delivered_on_time"]  = nearest_num_of_type(lines, i_del, window=30, prefer_before_first=0, kind="percent")   if i_del >= 0 else "—"
-    m["cc_avg_wait"]        = nearest_num_of_type(lines, i_wait,window=80, prefer_before_first=0, kind="time")      if i_wait>= 0 else "—"
+    # ── Shrink (scoped + strict types) ───────────────────────────────────────
+    m["moa"]                  = value_near_scoped(lines, "Morrisons Order Adjustments", "money",   SHRINK_SCOPE, near_before=8, near_after=10)
+    m["waste_validation"]     = value_near_scoped(lines, "Waste Validation",            "percent", SHRINK_SCOPE, near_before=8, near_after=10)
+    m["unrecorded_waste_pct"] = value_near_scoped(lines, "Unrecorded Waste",            "percent", SHRINK_SCOPE, near_before=8, near_after=10)
+    m["shrink_vs_budget_pct"] = value_near_scoped(lines, "Shrink vs Budget",            "percent", SHRINK_SCOPE, near_before=8, near_after=10)
 
-    # ── Payroll (nearest + types)
-    for lbl, key in [
-        ("Payroll Outturn", "payroll_outturn"),
-        ("Absence Outturn", "absence_outturn"),
-        ("Productive Outturn", "productive_outturn"),
-        ("Holiday Outturn", "holiday_outturn"),
-        ("Current Base Cost", "current_base_cost"),
-    ]:
-        i = index_of_label(lines, lbl)
-        m[key] = nearest_num_of_type(lines, i, window=12, kind="any") if i >= 0 else "—"
+    # ── Complaints / My Reports (scoped) ─────────────────────────────────────
+    comp_scope = COMPLAINTS_SCOPE if COMPLAINTS_SCOPE[0] >= 0 else (0, len(lines))
+    m["complaints_key"] = value_near_scoped(lines, "Key Customer Complaints", "integer", comp_scope, near_before=10, near_after=12)
+    m["my_reports"]     = value_near_scoped(lines, "My Reports", "integer",
+                         section_bounds(lines, "My Reports", ["Cafe NPS","Privacy","Payroll","Shrink","Waste & Markdowns"]),
+                         near_before=6, near_after=10)
 
-    # ── Card Engagement (nearest + types)
-    for lbl, key, kind in [
-        ("Swipe Rate", "swipe_rate", "percent"),
-        ("Swipes WOW", "swipes_wow_pct", "percent"),
-        ("New Customers", "new_customers", "integer"),
-        ("Swipes YOY", "swipes_yoy_pct", "percent"),
-    ]:
-        i = index_of_label(lines, lbl)
-        m[key] = nearest_num_of_type(lines, i, window=12, kind=kind) if i >= 0 else "—"
-
-    # ── Production Planning
-    for lbl, key in [
-        ("Data Provided", "data_provided"),
-        ("Trusted Data", "trusted_data"),
-    ]:
-        i = index_of_label(lines, lbl)
-        m[key] = nearest_num_of_type(lines, i, window=8, kind="percent") if i >= 0 else "—"
-
-    # ── Shrink (typed; MOA can be money/KMB)
-    i_moa  = index_of_label(lines, "Morrisons Order Adjustments")
-    i_wv   = index_of_label(lines, "Waste Validation")
-    i_urw  = index_of_label(lines, "Unrecorded Waste")
-    i_svb  = index_of_label(lines, "Shrink vs Budget")
-    m["moa"]                  = nearest_num_of_type(lines, i_moa, window=12, kind="money")   if i_moa >= 0 else "—"
-    m["waste_validation"]     = nearest_num_of_type(lines, i_wv,  window=12, kind="percent") if i_wv  >= 0 else "—"
-    m["unrecorded_waste_pct"] = nearest_num_of_type(lines, i_urw, window=12, kind="percent") if i_urw >= 0 else "—"
-    m["shrink_vs_budget_pct"] = nearest_num_of_type(lines, i_svb, window=12, kind="percent") if i_svb >= 0 else "—"
-
-    # ── Complaints / My Reports / Weekly Activity
-    i_kcc = index_of_label(lines, "Key Customer Complaints")
-    i_cc  = index_of_label(lines, "Customer Complaints")
-    val = nearest_num_of_type(lines, i_kcc, window=10, kind="integer") if i_kcc >= 0 else "—"
-    if val == "—" and i_cc >= 0:
-        val = nearest_num_of_type(lines, i_cc, window=10, kind="integer")
-    m["complaints_key"]  = val
-    i_mr = index_of_label(lines, "My Reports");      m["my_reports"]      = nearest_num_of_type(lines, i_mr, window=10, kind="integer") if i_mr >= 0 else "—"
-    i_wa = index_of_label(lines, "Weekly Activity"); m["weekly_activity"] = nearest_num_of_type(lines, i_wa, window=10, kind="any")      if i_wa >= 0 else "—"
+    # ── Weekly Activity — preserve literal “No data” in Clean & Rotate scope ─
+    m["weekly_activity"] = "—"
+    s,e = CLEAN_ROTATE_SCOPE
+    if s >= 0:
+        li = _idx(lines, "Weekly Activity", s, e)
+        if li >= 0:
+            window = lines[max(s, li-2):min(e, li+6)]
+            if any("No data" in w for w in window):
+                m["weekly_activity"] = "No data"
+            else:
+                m["weekly_activity"] = value_near_scoped(lines, "Weekly Activity", "any", (s,e), near_before=4, near_after=6)
 
     # Gauges via ROI OCR later
     for k in ["supermarket_nps","colleague_happiness","home_delivery_nps","cafe_nps","click_collect_nps","customer_toilet_nps"]:
