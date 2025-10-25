@@ -20,33 +20,32 @@ jobs:
         uses: actions/checkout@v4
 
       # ────────────────────────────────
-      # System deps (OCR)
+      # System deps (NO TESSERACT NEEDED)
       # ────────────────────────────────
-      - name: Install Tesseract OCR
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends tesseract-ocr
+      - name: Update apt-get (required for base system updates)
+        run: sudo apt-get update
       # ────────────────────────────────
-      # Python + Playwright
+      # Python + Playwright + GEMINI LIBS
       # ────────────────────────────────
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
 
-      - name: Install Python deps
+      - name: Install Python deps (Playwright + Gemini)
         run: |
           python -m pip install -U pip
-          pip install playwright requests pillow pytesseract schedule pytz
+          pip install playwright requests pillow google-genai schedule pytz
           python -m playwright install --with-deps chromium
       # ────────────────────────────────
       # Env vars
       # ────────────────────────────────
-      - name: Export TODAY, CI_RUN_URL, ROI_MAP_FILE
+      - name: Export ENV VARS (TODAY, CI_RUN_URL, ROI_MAP_FILE, GEMINI_API_KEY)
         run: |
           echo "TODAY=$(date -u +%Y%m%d)" >> $GITHUB_ENV
           echo "CI_RUN_URL=${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" >> $GITHUB_ENV
           echo "ROI_MAP_FILE=${{ github.workspace }}/roi_map.json" >> $GITHUB_ENV
+          echo "GEMINI_API_KEY=${{ secrets.GEMINI_API_KEY }}" >> $GITHUB_ENV
       # ────────────────────────────────
       # Restore scraper state (auth + CSV + ROI)
       # ────────────────────────────────
@@ -91,18 +90,15 @@ jobs:
             echo "ALERT_WEBHOOK=${{ secrets.ALERT_WEBHOOK }}"
             echo "COMPLAINTS_WEBHOOK=${{ secrets.COMPLAINTS_WEBHOOK }}"
             echo "DAILY_WEBHOOK=${{ secrets.DAILY_TEST_WEBHOOK || secrets.DAILY_WEBHOOK }}"
+            # Include API Key in config for non-GH Runner environments, though ENV takes precedence
+            echo "GEMINI_API_KEY=${{ secrets.GEMINI_API_KEY }}"
           } > config.ini
       
       # ────────────────────────────────
       # Run only Daily Report scraper
       # ────────────────────────────────
-      # NOTE: The explicit removal of roi_map.json is no longer needed 
-      # as load_roi_map() in scrape_daily.py now ignores the content of the local file.
 
-      - name: Run Daily Report Scraper (OCR + ROI)
-        env:
-          CI_RUN_URL: ${{ env.CI_RUN_URL }}
-          ROI_MAP_FILE: ${{ env.ROI_MAP_FILE }}
+      - name: Run Daily Report Scraper (GEMINI VISION)
         run: xvfb-run -a python scrape_daily.py || true
 
       # ────────────────────────────────
