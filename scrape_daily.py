@@ -166,7 +166,7 @@ def open_and_prepare(page) -> bool:
     log.info("Opening Retail Performance Dashboard…")
     try:
         page.goto(DASHBOARD_URL, wait_until="domcontentloaded", timeout=120_000)
-    except TimeoutError:
+    except PlaywrightTimeoutError:
         log.error("Timeout loading dashboard.")
         return False
 
@@ -192,7 +192,7 @@ def open_and_prepare(page) -> bool:
     return True
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Screenshot + OCR helpers
+# Screenshot helper
 # ──────────────────────────────────────────────────────────────────────────────
 def screenshot_full(page) -> Optional["Image.Image"]:
     try:
@@ -233,23 +233,24 @@ def dump_numbered_lines(txt: str) -> List[str]:
     save_text(SCREENS_DIR / f"{ts}_lines.txt", numbered)
     return lines
 
-# Patterns
-NUM      = r"[£]?-?\d+(?:\.\d+)?(?:[KMB]|%)?"
-NUM_RE   = re.compile(NUM, re.I)
-TIME_RE  = re.compile(r"\b\d{2}:\d{2}\b")
-EMAILLOC = re.compile(r"([A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}).*?\|\s*([^\|]+?)\s*\|\s*(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})", re.S)
-PERIOD_RE= re.compile(r"The data on this report is from:\s*([^\n]+)")
-STAMP_RE = re.compile(r"\b(\d{1,2}\s+[A-Za-z]{3}\s+\d{4},\s*\d{2}:\d{2}:\d{2})\b")
+# Patterns & helpers for robust parsing
+NUM       = r"[£]?-?\d+(?:\.\d+)?(?:[KMB]|%)?"
+NUM_RE    = re.compile(NUM, re.I)
+TIME_RE   = re.compile(r"\b\d{2}:\d{2}\b")
+EMAILLOC  = re.compile(r"([A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}).*?\|\s*([^\|]+?)\s*\|\s*(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})", re.S)
+PERIOD_RE = re.compile(r"The data on this report is from:\s*([^\n]+)")
+STAMP_RE  = re.compile(r"\b(\d{1,2}\s+[A-Za-z]{3}\s+\d{4},\s*\d{2}:\d{2}:\d{2})\b")
 
-def find_between(lines: List[str], start: str, end: str) -> List[str]:
-    try:
-        s = next(i for i, ln in enumerate(lines) if start.lower() in ln.lower())
-    except StopIteration:
+def find_indices(lines, needle):
+    return [i for i, ln in enumerate(lines) if needle.lower() in ln.lower()]
+
+def slice_between(lines: List[str], start_label: str, end_label: str) -> List[str]:
+    starts = find_indices(lines, start_label)
+    if not starts:
         return []
-    try:
-        e = next(i for i, ln in enumerate(lines[s+1:], start=s+1) if end.lower() in ln.lower())
-    except StopIteration:
-        e = len(lines)
+    s = starts[0]
+    ends = find_indices(lines, end_label)
+    e = next((i for i in ends if i > s), len(lines))
     return lines[s:e]
 
 def index_of_label(lines: List[str], label: str) -> int:
@@ -259,9 +260,6 @@ def index_of_label(lines: List[str], label: str) -> int:
     return -1
 
 def numbers_near(lines: List[str], idx: int, span: int = 6, want_time: bool = False) -> List[str]:
-    """
-    Return numeric tokens found within idx-span ... idx+span (both directions).
-    """
     if idx < 0:
         return []
     s = max(0, idx - span)
@@ -277,22 +275,51 @@ def first_number_near_label(lines: List[str], label: str, span: int = 6, want_ti
     vals = numbers_near(lines, idx, span=span, want_time=want_time)
     return vals[0] if vals else "—"
 
-def three_after_token(lines: List[str], anchor_label: str, token: str = "Total", lookahead_lines: int = 40) -> Optional[Tuple[str,str,str]]:
-    """
-    Find the first occurrence of `token` after the anchor_label, then capture the next 3 numeric tokens
-    within a limited window (skips intervening labels/noise).
-    """
+def next_numeric_lines(lines: List[str], start_idx: int, count: int = 3, span: int = 15) -> List[str]:
+    vals = []
+    for j in range(start_idx+1, min(len(lines), start_idx+1+span)):
+        m = NUM_RE.search(lines[j])
+        if m:
+            vals.append(m.group(0))
+            if len(vals) == count:
+                break
+    return vals
+
+def collect_percents_in_window(lines: List[str], anchor_idx: int, window: int = 8, want: int = 3) -> List[str]:
+    s = max(0, anchor_idx - window)
+    e = min(len(lines), anchor_idx + window + 1)
+    vals = []
+    for ln in lines[s:e]:
+        m = re.findall(r"-?\d+(?:\.\d+)?%", ln)
+        for v in m:
+            vals.append(v)
+            if len(vals) == want:
+                return vals
+    return vals
+
+def find_time_near(lines: List[str], anchor_idx: int, back: int = 10, fwd: int = 4) -> str:
+    s = max(0, anchor_idx - back)
+    e = min(len(lines), anchor_idx + fwd + 1)
+    for j in range(anchor_idx, s-1, -1):  # prefer backwards
+        m = TIME_RE.search(lines[j])
+        if m:
+            return m.group(0)
+    for j in range(anchor_idx+1, e):
+        m = TIME_RE.search(lines[j])
+        if m:
+            return m.group(0)
+    return "—"
+
+def three_after_token(lines: List[str], anchor_label: str, token: str = "Total", lookahead_lines: int = 80) -> Optional[Tuple[str,str,str]]:
     a = index_of_label(lines, anchor_label)
     if a < 0:
         return None
-    # search in the next window
     s = a
     e = min(len(lines), a + lookahead_lines)
     try:
         t_index = next(i for i in range(s, e) if token.lower() in lines[i].lower())
     except StopIteration:
         return None
-    # collect numeric tokens after the token line
     collected: List[str] = []
     for j in range(t_index + 1, e):
         toks = NUM_RE.findall(lines[j])
@@ -310,13 +337,12 @@ def parse_from_lines(lines: List[str]) -> Dict[str, str]:
     y = PERIOD_RE.search(joined); m["period_range"] = y.group(1).strip() if y else "—"
     x = STAMP_RE.search(joined);  m["page_timestamp"] = x.group(1) if x else "—"
 
-    # Sales (robust): find 'Total' row → next 3 numbers
+    # SALES: 'Total' → next 3 numeric tokens
     res = three_after_token(lines, anchor_label="Sales", token="Total", lookahead_lines=80)
     if res:
         m["sales_total"], m["sales_lfl"], m["sales_vs_target"] = res
     else:
-        # fallback to old regex inside Sales block
-        sb_lines = find_between(lines, "Sales", "Waste & Markdowns") or find_between(lines, "Sales", "Shrink")
+        sb_lines = slice_between(lines, "Sales", "Waste & Markdowns") or slice_between(lines, "Sales", "Shrink")
         sb = "\n".join(sb_lines[:160])
         r = re.search(r"Total\s*\n\s*(" + NUM + r")\s*\n\s*(" + NUM + r")\s*\n\s*(" + NUM + r")", sb, flags=re.I)
         if r:
@@ -324,8 +350,8 @@ def parse_from_lines(lines: List[str]) -> Dict[str, str]:
         else:
             m["sales_total"] = m["sales_lfl"] = m["sales_vs_target"] = "—"
 
-    # Waste & Markdowns totals
-    wm_block = find_between(lines, "Waste & Markdowns", "My Reports") or find_between(lines, "Waste & Markdowns", "Payroll")
+    # WASTE & MARKDOWNS: Total row → next 5 numbers
+    wm_block = slice_between(lines, "Waste & Markdowns", "My Reports") or slice_between(lines, "Waste & Markdowns", "Payroll")
     if wm_block:
         wb = "\n".join(wm_block[:120])
         r = re.search(
@@ -340,29 +366,37 @@ def parse_from_lines(lines: List[str]) -> Dict[str, str]:
     else:
         m.update({k: "—" for k in ["waste_total","markdowns_total","wm_total","wm_delta","wm_delta_pct"]})
 
-    # Payroll (numbers may be a few lines away but still after label)
-    pay_block = find_between(lines, "Payroll", "More Card Engagement") or find_between(lines, "Payroll", "Online") or lines
+    # PAYROLL
+    pay_block = slice_between(lines, "Payroll", "More Card Engagement") or slice_between(lines, "Payroll", "Online") or lines
     m["payroll_outturn"]    = first_number_near_label(pay_block, "Payroll Outturn", span=6)
     m["absence_outturn"]    = first_number_near_label(pay_block, "Absence Outturn", span=6)
     m["productive_outturn"] = first_number_near_label(pay_block, "Productive Outturn", span=6)
     m["holiday_outturn"]    = first_number_near_label(pay_block, "Holiday Outturn", span=6)
     m["current_base_cost"]  = first_number_near_label(pay_block, "Current Base Cost", span=6)
 
-    # Online (labels/values can be reversed in order)
-    online_block = find_between(lines, "Online", "Front End Service") or find_between(lines, "Online", "More Card Engagement") or lines
-    m["availability_pct"]   = first_number_near_label(online_block, "Availability", span=6)
-    m["despatched_on_time"] = first_number_near_label(online_block, "Despatched on Time", span=8)
-    m["delivered_on_time"]  = first_number_near_label(online_block, "Delivered on Time", span=8)
-    m["cc_avg_wait"]        = first_number_near_label(online_block, "average wait", span=10, want_time=True)
+    # ONLINE (values may appear before labels)
+    online_block = slice_between(lines, "Online", "Front End Service") or slice_between(lines, "Online", "More Card Engagement") or lines
+    # Availability/Despatched/Delivered: collect three percents near "Availability"
+    m["availability_pct"] = m["despatched_on_time"] = m["delivered_on_time"] = "—"
+    avail_idx = index_of_label(online_block, "Availability")
+    if avail_idx >= 0:
+        # translate to absolute index in original lines
+        base = index_of_label(lines, "Online")
+        anchor = base + avail_idx if base >= 0 else avail_idx
+        percs = collect_percents_in_window(lines, anchor, window=10, want=3)
+        if len(percs) >= 1: m["availability_pct"]   = percs[0]
+        if len(percs) >= 2: m["despatched_on_time"] = percs[1]
+        if len(percs) >= 3: m["delivered_on_time"]  = percs[2]
+    # C&C avg wait (time can be BEFORE the label)
+    cc_global_idx = index_of_label(lines, "Click & Collect average wait")
+    m["cc_avg_wait"] = find_time_near(lines, cc_global_idx, back=12, fwd=4) if cc_global_idx >= 0 else "—"
 
-    # Front End Service
-    fes_block = find_between(lines, "Front End Service", "Privacy") or \
-                find_between(lines, "Front End Service", "More Card Engagement") or lines
+    # FRONT END SERVICE
+    fes_block = slice_between(lines, "Front End Service", "Privacy") or \
+                slice_between(lines, "Front End Service", "More Card Engagement") or lines
     m["sco_utilisation"]        = first_number_near_label(fes_block, "Sco Utilisation", span=6)
     m["efficiency"]             = first_number_near_label(fes_block, "Efficiency", span=6)
     m["scan_rate"]              = first_number_near_label(fes_block, "Scan Rate", span=6)
-    # “vs Target” numbers often sit a couple of tokens after the first number
-    # We’ll grab the second number near the same label if available.
     scan_near = numbers_near(fes_block, index_of_label(fes_block, "Scan Rate"), span=10)
     m["scan_vs_target"]         = scan_near[1] if len(scan_near) >= 2 else "—"
 
@@ -374,31 +408,30 @@ def parse_from_lines(lines: List[str]) -> Dict[str, str]:
     mainbank_near = numbers_near(fes_block, index_of_label(fes_block, "Mainbank Closed"), span=10)
     m["mainbank_vs_target"]     = mainbank_near[1] if len(mainbank_near) >= 2 else "—"
 
-    # Card Engagement
-    ce_block = find_between(lines, "More Card Engagement", "Stock Record NPS") or \
-               find_between(lines, "More Card Engagement", "Production Planning") or lines
+    # CARD ENGAGEMENT
+    ce_block = slice_between(lines, "More Card Engagement", "Stock Record NPS") or \
+               slice_between(lines, "More Card Engagement", "Production Planning") or lines
     m["swipe_rate"]     = first_number_near_label(ce_block, "Swipe Rate", span=6)
     m["swipes_wow_pct"] = first_number_near_label(ce_block, "Swipes WOW", span=6)
     m["new_customers"]  = first_number_near_label(ce_block, "New Customers", span=6)
     m["swipes_yoy_pct"] = first_number_near_label(ce_block, "Swipes YOY", span=6)
 
-    # Production Planning
-    pp_block = find_between(lines, "Production Planning", "Shrink") or \
-               find_between(lines, "Production Planning", "Online") or lines
+    # PRODUCTION PLANNING
+    pp_block = slice_between(lines, "Production Planning", "Shrink") or \
+               slice_between(lines, "Production Planning", "Online") or lines
     m["data_provided"] = first_number_near_label(pp_block, "Data Provided", span=6)
     m["trusted_data"]  = first_number_near_label(pp_block, "Trusted Data", span=6)
 
-    # Shrink
-    sh_block = find_between(lines, "Shrink", "Online") or \
-               find_between(lines, "Shrink", "Front End Service") or \
-               find_between(lines, "Shrink", "Privacy") or lines
+    # SHRINK
+    sh_block = slice_between(lines, "Shrink", "Online") or \
+               slice_between(lines, "Shrink", "Front End Service") or \
+               slice_between(lines, "Shrink", "Privacy") or lines
     m["moa"]                  = first_number_near_label(sh_block, "Order Adjustments", span=8)
     m["waste_validation"]     = first_number_near_label(sh_block, "Waste Validation", span=8)
     m["unrecorded_waste_pct"] = first_number_near_label(sh_block, "Unrecorded Waste", span=8)
     m["shrink_vs_budget_pct"] = first_number_near_label(sh_block, "Shrink vs Budget", span=8)
 
-    # Complaints, My Reports, Weekly Activity (look both ways)
-    # Prefer “Key Customer Complaints”, else “Customer Complaints”
+    # MISC
     val = first_number_near_label(lines, "Key Customer Complaints", span=6)
     if val == "—":
         val = first_number_near_label(lines, "Customer Complaints", span=6)
@@ -406,7 +439,7 @@ def parse_from_lines(lines: List[str]) -> Dict[str, str]:
     m["my_reports"]      = first_number_near_label(lines, "My Reports", span=6)
     m["weekly_activity"] = first_number_near_label(lines, "Weekly Activity", span=6)
 
-    # Community-visualisation gauges default to "—" (filled by ROI OCR)
+    # Community-visualisation gauges default to "—" (filled by ROI OCR later)
     for k in ["supermarket_nps","colleague_happiness","home_delivery_nps","cafe_nps","click_collect_nps","customer_toilet_nps"]:
         m.setdefault(k, "—")
 
