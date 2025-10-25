@@ -10,45 +10,37 @@ on:
 
 concurrency:
   group: looker-scrape
-  cancel-in-progress: true # Changed to true for cleaner operation
+  cancel-in-progress: true 
 
 jobs:
   # ----------------------------------------------------------------------
-  # JOB 1: Daily Report (Runs once at 8:30 AM GMT)
+  # Shared Setup (for all runs)
   # ----------------------------------------------------------------------
-  daily_report:
+  setup_and_cache:
     runs-on: ubuntu-latest
-    timeout-minutes: 40
-    if: github.event_name == 'workflow_dispatch' || github.event.schedule == '30 8 * * *'
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-
-      # ────────────────────────────────
-      # Install Dependencies for Gemini/Playwright/Python
-      # ────────────────────────────────
+      
       - name: Setup Python & Install Dependencies (Gemini Ready)
+        id: install_deps
         run: |
           sudo apt-get update
+          # Install core packages + Gemini/Playwright
           python -m pip install -U pip
           pip install playwright requests pillow google-genai schedule pytz
           python -m playwright install --with-deps chromium
 
-      # ────────────────────────────────
-      # Export Env Vars (Including GEMINI_API_KEY)
-      # ────────────────────────────────
       - name: Export ENV VARS
+        id: export_vars
         run: |
           echo "TODAY=$(date -u +%Y%m%d)" >> $GITHUB_ENV
           echo "CI_RUN_URL=${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" >> $GITHUB_ENV
           echo "ROI_MAP_FILE=${{ github.workspace }}/roi_map.json" >> $GITHUB_ENV
-          echo "GEMINI_API_KEY=${{ secrets.GEMINI_API_KEY }}" >> $GITHUB_ENV # Export Gemini Key
+          echo "GEMINI_API_KEY=${{ secrets.GEMINI_API_KEY }}" >> $GITHUB_ENV
 
-      # ────────────────────────────────
-      # Restore State
-      # ────────────────────────────────
       - name: Restore scraper state (auth + logs)
+        id: cache-restore
         uses: actions/cache/restore@v4
         with:
           path: |
@@ -61,10 +53,69 @@ jobs:
           restore-keys: |
             scraper-state-${{ runner.os }}-v1-${{ github.ref_name }}-
 
-      # ────────────────────────────────
-      # Create config.ini (Updated with GEMINI_API_KEY)
-      # ────────────────────────────────
-      - name: Create/Update config.ini from secrets
+      - name: Create config.ini from secrets
+        id: create_config
+        run: |
+          {
+            echo "[DEFAULT]"
+            echo "GOOGLE_EMAIL=${{ secrets.GOOGLE_EMAIL }}"
+            echo "GOOGLE_PASSWORD=${{ secrets.GOOGLE_PASSWORD }}"
+            echo "MAIN_WEBHOOK=${{ secrets.MAIN_WEBHOOK }}"
+            echo "ALERT_WEBHOOK=${{ secrets.ALERT_WEBHOOK }}"
+            echo "COMPLAINTS_WEBHOOK=${{ secrets.COMPLAINTS_WEBHOOK }}"
+            echo "DAILY_WEBHOOK=${{ secrets.DAILY_WEBHOOK }}"
+            echo "GEMINI_API_KEY=${{ secrets.GEMINI_API_KEY }}"
+          } > config.ini
+
+      - name: Save Cache Artifacts
+        id: save_artifacts
+        if: always()
+        run: |
+          # The next jobs will use the output files, so no need to save cache now.
+          # The final cache save will be done after the scrape jobs run.
+          echo "SETUP COMPLETE"
+
+
+  # ----------------------------------------------------------------------
+  # JOB 2: Daily Report (Runs once at 8:30 AM GMT)
+  # ----------------------------------------------------------------------
+  daily_report:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    needs: setup_and_cache
+    if: github.event_name == 'workflow_dispatch' || github.event.schedule == '30 8 * * *'
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      
+      # Use the same setup steps as before, but only for this job's needs (faster execution)
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Re-install Core Deps (minimal, already pulled by cache)
+        run: pip install playwright requests pillow google-genai schedule pytz
+
+      - name: Export ENV VARS (Required for script access)
+        run: |
+          echo "CI_RUN_URL=${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" >> $GITHUB_ENV
+          echo "GEMINI_API_KEY=${{ secrets.GEMINI_API_KEY }}" >> $GITHUB_ENV
+
+      # Restore state again (The full state is only restored/saved *here* for correct file persistence)
+      - name: Restore scraper state for job (Auth/Logs)
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            auth_state.json
+            comments_log.csv
+            complaints_log.csv
+            daily_report_log.csv
+            roi_map.json
+          key: scraper-state-${{ runner.os }}-v1-${{ github.ref_name }}-${{ env.TODAY }}
+          restore-keys: |
+            scraper-state-${{ runner.os }}-v1-${{ github.ref_name }}-
+
+      - name: Create config.ini from secrets
         run: |
           {
             echo "[DEFAULT]"
@@ -78,7 +129,7 @@ jobs:
           } > config.ini
 
       # ────────────────────────────────
-      # Run ALL 3 Scrapers (NPS -> Complaints -> Daily)
+      # Run ALL 3 Scrapers
       # ────────────────────────────────
       - name: Run NPS scraper
         run: xvfb-run -a python scrape.py now || true
@@ -90,7 +141,7 @@ jobs:
         run: xvfb-run -a python scrape_daily.py || true
 
       # ────────────────────────────────
-      # Upload/Save Cache
+      # Upload/Save Cache (Final State Save)
       # ────────────────────────────────
       - name: Upload logs and state as artifact
         if: always()
@@ -122,20 +173,20 @@ jobs:
 
 
   # ----------------------------------------------------------------------
-  # JOB 2: Periodic Scrapes (Runs every 2 hours after the daily report)
+  # JOB 3: Periodic Scrapes (Runs every 2 hours after the daily report)
   # ----------------------------------------------------------------------
   periodic_scrapes:
     runs-on: ubuntu-latest
     timeout-minutes: 40
     # Runs ONLY if the event is a schedule and the cron time does NOT match the daily report time
-    if: github.event.schedule == '30 10/2 * * *' || github.event.schedule == '30 12/2 * * *' || github.event.schedule == '30 14/2 * * *' || github.event.schedule == '30 16/2 * * *' || github.event.schedule == '30 18/2 * * *' || github.event.schedule == '30 20/2 * * *'
+    if: github.event.schedule != '30 8 * * *'
     
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
       # ────────────────────────────────
-      # Install Dependencies for Python/Playwright (Simplified as no Gemini needed)
+      # Install Dependencies (Minimal for periodic runs)
       # ────────────────────────────────
       - name: Setup Python & Install Dependencies
         run: |
@@ -144,12 +195,8 @@ jobs:
           pip install playwright requests pillow pytesseract schedule pytz
           python -m playwright install --with-deps chromium
 
-      # ────────────────────────────────
-      # Export Env Vars (Simplified)
-      # ────────────────────────────────
       - name: Export ENV VARS
         run: |
-          echo "TODAY=$(date -u +%Y%m%d)" >> $GITHUB_ENV
           echo "CI_RUN_URL=${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" >> $GITHUB_ENV
 
       # ────────────────────────────────
@@ -168,10 +215,7 @@ jobs:
           restore-keys: |
             scraper-state-${{ runner.os }}-v1-${{ github.ref_name }}-
 
-      # ────────────────────────────────
-      # Create config.ini (Standard)
-      # ────────────────────────────────
-      - name: Create/Update config.ini from secrets
+      - name: Create config.ini (Standard)
         run: |
           {
             echo "[DEFAULT]"
