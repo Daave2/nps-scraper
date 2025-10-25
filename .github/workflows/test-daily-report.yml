@@ -1,0 +1,118 @@
+name: 🧪 Test Daily Report Scraper
+
+on:
+  workflow_dispatch: {}   # Manual trigger only
+  # you can uncomment below if you want automatic test runs
+  # schedule:
+  #   - cron: "0 8 * * *"  # 8:00 AM UTC → 9:00 AM London
+
+concurrency:
+  group: daily-report-test
+  cancel-in-progress: true
+
+jobs:
+  test-daily:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      # ────────────────────────────────
+      # Checkout
+      # ────────────────────────────────
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      # ────────────────────────────────
+      # Setup Python + Playwright + OCR
+      # ────────────────────────────────
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Python deps
+        run: |
+          python -m pip install -U pip
+          pip install playwright requests pillow pytesseract
+          python -m playwright install --with-deps chromium
+
+      - name: Install Tesseract OCR
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y tesseract-ocr
+
+      # ────────────────────────────────
+      # Environment setup
+      # ────────────────────────────────
+      - name: Export environment info
+        run: |
+          echo "CI_RUN_URL=${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" >> $GITHUB_ENV
+
+      - name: Restore auth + log cache
+        id: cache-restore
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            auth_state.json
+            daily_report_log.csv
+          key: daily-test-cache-${{ runner.os }}-${{ github.ref_name }}
+          restore-keys: |
+            daily-test-cache-${{ runner.os }}-
+
+      - name: Fallback decode auth_state.json
+        run: |
+          if [ -n "${AUTH_STATE_B64}" ]; then
+            echo "${AUTH_STATE_B64}" | base64 --decode > auth_state.json
+            echo "Decoded auth_state.json from secret"
+          else
+            echo "No AUTH_STATE_B64 secret — run login manually first."
+          fi
+        env:
+          AUTH_STATE_B64: ${{ secrets.AUTH_STATE_B64 }}
+
+      - name: Create config.ini
+        run: |
+          {
+            echo "[DEFAULT]"
+            echo "GOOGLE_EMAIL=${{ secrets.GOOGLE_EMAIL }}"
+            echo "GOOGLE_PASSWORD=${{ secrets.GOOGLE_PASSWORD }}"
+            echo "MAIN_WEBHOOK=${{ secrets.MAIN_WEBHOOK }}"
+            echo "ALERT_WEBHOOK=${{ secrets.ALERT_WEBHOOK }}"
+            echo "DAILY_WEBHOOK=${{ secrets.DAILY_WEBHOOK }}"
+          } > config.ini
+
+      # ────────────────────────────────
+      # Run the Daily Report scraper
+      # ────────────────────────────────
+      - name: Run Daily Report Scraper
+        env:
+          CI_RUN_URL: ${{ env.CI_RUN_URL }}
+        run: xvfb-run -a python scrape_daily.py || true
+
+      # ────────────────────────────────
+      # Show outputs for debugging
+      # ────────────────────────────────
+      - name: Show debug files
+        run: |
+          echo "::group::Screenshots"
+          ls -lah screens || true
+          echo "::endgroup::"
+
+          echo "::group::CSV tail"
+          tail -n 10 daily_report_log.csv || true
+          echo "::endgroup::"
+
+      # ────────────────────────────────
+      # Upload artifacts
+      # ────────────────────────────────
+      - name: Upload debug artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: daily-report-test-${{ github.run_id }}
+          path: |
+            auth_state.json
+            scrape_daily.log
+            daily_report_log.csv
+            screens/
+          if-no-files-found: ignore
