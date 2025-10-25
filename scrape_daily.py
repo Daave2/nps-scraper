@@ -4,16 +4,11 @@
 """
 Retail Performance Dashboard → Daily Summary (layout-by-lines + ROI OCR) → Google Chat
 
-Strategy
-- Prefer fast, stable parsing from the BODY TEXT (assumed near-fixed line order).
-- Use anchors to carve subsections and regex within each sub-block.
-- Fill missing metrics (esp. community viz tiles) with ROI OCR from a normalised map.
-- Emit debug artefacts: full screenshot, numbered lines dump, and ROI overlay when used.
-
-Requires:
-  pip install playwright requests pillow pytesseract
-  python -m playwright install --with-deps chromium
-  (Ubuntu runners typically have tesseract-ocr; locally install it if needed.)
+Updates:
+- Robust "near label" extraction (values may appear before or after labels).
+- Sales "Total" row parsed as first 3 numeric tokens after "Total" within a window.
+- Online metrics and Customer Complaints look both directions.
+- Keeps ROI OCR fallback and debug artifacts.
 """
 
 import os
@@ -47,7 +42,6 @@ LOG_FILE       = BASE_DIR / "scrape_daily.log"
 DAILY_LOG_CSV  = BASE_DIR / "daily_report_log.csv"
 SCREENS_DIR    = BASE_DIR / "screens"
 
-# Optional external map path (env takes precedence)
 ENV_ROI_MAP    = os.getenv("ROI_MAP_FILE", "").strip()
 ROI_MAP_FILE   = Path(ENV_ROI_MAP) if ENV_ROI_MAP else (BASE_DIR / "roi_map.json")
 
@@ -57,7 +51,6 @@ DASHBOARD_URL = (
     "?params=%7B%22f20f0n9kld%22:%22include%25EE%2580%25803%25EE%2580%2580T%22%7D"
 )
 
-# Fixed viewport helps screenshots be consistent (normalised ROIs still work if different)
 VIEWPORT = {"width": 1366, "height": 768}
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -132,7 +125,6 @@ def save_text(path: Path, text: str):
 # Browser automation
 # ──────────────────────────────────────────────────────────────────────────────
 def click_this_week(page):
-    # Try a few heuristics to hit "This Week"
     try:
         el = page.get_by_role("button", name=re.compile(r"^This Week$", re.I))
         if el.count():
@@ -174,7 +166,7 @@ def open_and_prepare(page) -> bool:
     log.info("Opening Retail Performance Dashboard…")
     try:
         page.goto(DASHBOARD_URL, wait_until="domcontentloaded", timeout=120_000)
-    except PlaywrightTimeoutError:
+    except TimeoutError:
         log.error("Timeout loading dashboard.")
         return False
 
@@ -188,7 +180,6 @@ def open_and_prepare(page) -> bool:
     click_this_week(page)
     click_proceed_overlays(page)
 
-    # Retry if community viz disclaimer text still present
     try:
         body = page.inner_text("body")
     except Exception:
@@ -203,35 +194,21 @@ def open_and_prepare(page) -> bool:
 # ──────────────────────────────────────────────────────────────────────────────
 # Screenshot + OCR helpers
 # ──────────────────────────────────────────────────────────────────────────────
-def screenshot_full(page) -> Optional[Image.Image]:
+def screenshot_full(page) -> Optional["Image.Image"]:
     try:
         img_bytes = page.screenshot(full_page=True, type="png")
         ts = int(time.time())
         save_bytes(SCREENS_DIR / f"{ts}_fullpage.png", img_bytes)
+        from PIL import Image  # lazy import for types
         return Image.open(BytesIO(img_bytes))
     except Exception as e:
         log.error(f"Full-page screenshot failed: {e}")
         return None
 
-def ocr_image(img: Image.Image, *, psm: int = 6) -> str:
-    if not OCR_AVAILABLE or img is None:
-        return ""
-    try:
-        # Upscale a little to help with small UI text
-        w, h = img.size
-        if max(w, h) < 1400:
-            scale = 1400 / max(w, h)
-            img = img.resize((int(w * scale), int(h * scale)))
-        txt = pytesseract.image_to_string(img, config=f"--psm {psm}")
-        return txt or ""
-    except Exception:
-        return ""
-
 # ──────────────────────────────────────────────────────────────────────────────
 # Text parsing (layout-by-lines)
 # ──────────────────────────────────────────────────────────────────────────────
 def get_body_text(page) -> str:
-    """Get the longest body text (page or frames)."""
     best, best_len = "", 0
     try:
         t = page.inner_text("body")
@@ -256,12 +233,15 @@ def dump_numbered_lines(txt: str) -> List[str]:
     save_text(SCREENS_DIR / f"{ts}_lines.txt", numbered)
     return lines
 
-# regex helpers
-NUM = r"[£]?-?\d+(?:\.\d+)?(?:[KMB]|%)?"
-TIME_RE = re.compile(r"\b\d{2}:\d{2}\b")
+# Patterns
+NUM      = r"[£]?-?\d+(?:\.\d+)?(?:[KMB]|%)?"
+NUM_RE   = re.compile(NUM, re.I)
+TIME_RE  = re.compile(r"\b\d{2}:\d{2}\b")
+EMAILLOC = re.compile(r"([A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}).*?\|\s*([^\|]+?)\s*\|\s*(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})", re.S)
+PERIOD_RE= re.compile(r"The data on this report is from:\s*([^\n]+)")
+STAMP_RE = re.compile(r"\b(\d{1,2}\s+[A-Za-z]{3}\s+\d{4},\s*\d{2}:\d{2}:\d{2})\b")
 
 def find_between(lines: List[str], start: str, end: str) -> List[str]:
-    """Slice lines between first 'start' and next 'end' anchors (inclusive start, exclusive end)."""
     try:
         s = next(i for i, ln in enumerate(lines) if start.lower() in ln.lower())
     except StopIteration:
@@ -272,50 +252,82 @@ def find_between(lines: List[str], start: str, end: str) -> List[str]:
         e = len(lines)
     return lines[s:e]
 
-def value_after_label(lines: List[str], label: str, lookahead: int = 5, accept_time=False) -> str:
-    """Look for label, then pick first numeric token within the next few lines."""
+def index_of_label(lines: List[str], label: str) -> int:
     for i, ln in enumerate(lines):
         if label.lower() in ln.lower():
-            window = " ".join(lines[i+1:i+1+lookahead])
-            if accept_time:
-                m = TIME_RE.search(window)
-                if m:
-                    return m.group(0)
-            m = re.search(NUM, window, flags=re.I)
-            if m:
-                return m.group(0)
-            return "—"
-    return "—"
+            return i
+    return -1
+
+def numbers_near(lines: List[str], idx: int, span: int = 6, want_time: bool = False) -> List[str]:
+    """
+    Return numeric tokens found within idx-span ... idx+span (both directions).
+    """
+    if idx < 0:
+        return []
+    s = max(0, idx - span)
+    e = min(len(lines), idx + span + 1)
+    window = " ".join(lines[s:e])
+    if want_time:
+        t = TIME_RE.findall(window)
+        return t if t else []
+    return NUM_RE.findall(window)
+
+def first_number_near_label(lines: List[str], label: str, span: int = 6, want_time: bool = False) -> str:
+    idx = index_of_label(lines, label)
+    vals = numbers_near(lines, idx, span=span, want_time=want_time)
+    return vals[0] if vals else "—"
+
+def three_after_token(lines: List[str], anchor_label: str, token: str = "Total", lookahead_lines: int = 40) -> Optional[Tuple[str,str,str]]:
+    """
+    Find the first occurrence of `token` after the anchor_label, then capture the next 3 numeric tokens
+    within a limited window (skips intervening labels/noise).
+    """
+    a = index_of_label(lines, anchor_label)
+    if a < 0:
+        return None
+    # search in the next window
+    s = a
+    e = min(len(lines), a + lookahead_lines)
+    try:
+        t_index = next(i for i in range(s, e) if token.lower() in lines[i].lower())
+    except StopIteration:
+        return None
+    # collect numeric tokens after the token line
+    collected: List[str] = []
+    for j in range(t_index + 1, e):
+        toks = NUM_RE.findall(lines[j])
+        for t in toks:
+            collected.append(t)
+            if len(collected) == 3:
+                return collected[0], collected[1], collected[2]
+    return None
 
 def parse_from_lines(lines: List[str]) -> Dict[str, str]:
     m: Dict[str, str] = {}
 
-    # Context
     joined = "\n".join(lines)
-    z = re.search(r"([A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}).*?\|\s*([^\|]+?)\s*\|\s*(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})", joined, flags=re.S)
-    m["store_line"] = z.group(0).strip() if z else ""
-    y = re.search(r"The data on this report is from:\s*([^\n]+)", joined)
-    m["period_range"] = y.group(1).strip() if y else "—"
-    x = re.search(r"\b(\d{1,2}\s+[A-Za-z]{3}\s+\d{4},\s*\d{2}:\d{2}:\d{2})\b", joined)
-    m["page_timestamp"] = x.group(1) if x else "—"
+    z = EMAILLOC.search(joined); m["store_line"] = z.group(0).strip() if z else ""
+    y = PERIOD_RE.search(joined); m["period_range"] = y.group(1).strip() if y else "—"
+    x = STAMP_RE.search(joined);  m["page_timestamp"] = x.group(1) if x else "—"
 
-    # Sales block
-    sales_block = find_between(lines, "Sales", "Waste & Markdowns") or find_between(lines, "Sales", "Shrink")
-    if sales_block:
-        # Find the "Total" line of the sales table: Total, <value>, <LFL>, <vs Target>
-        sb = "\n".join(sales_block[:120])
+    # Sales (robust): find 'Total' row → next 3 numbers
+    res = three_after_token(lines, anchor_label="Sales", token="Total", lookahead_lines=80)
+    if res:
+        m["sales_total"], m["sales_lfl"], m["sales_vs_target"] = res
+    else:
+        # fallback to old regex inside Sales block
+        sb_lines = find_between(lines, "Sales", "Waste & Markdowns") or find_between(lines, "Sales", "Shrink")
+        sb = "\n".join(sb_lines[:160])
         r = re.search(r"Total\s*\n\s*(" + NUM + r")\s*\n\s*(" + NUM + r")\s*\n\s*(" + NUM + r")", sb, flags=re.I)
         if r:
             m["sales_total"], m["sales_lfl"], m["sales_vs_target"] = r.group(1), r.group(2), r.group(3)
         else:
             m["sales_total"] = m["sales_lfl"] = m["sales_vs_target"] = "—"
-    else:
-        m["sales_total"] = m["sales_lfl"] = m["sales_vs_target"] = "—"
 
     # Waste & Markdowns totals
     wm_block = find_between(lines, "Waste & Markdowns", "My Reports") or find_between(lines, "Waste & Markdowns", "Payroll")
     if wm_block:
-        wb = "\n".join(wm_block[:100])
+        wb = "\n".join(wm_block[:120])
         r = re.search(
             r"Total\s*\n\s*(" + NUM + r")\s*\n\s*(" + NUM + r")\s*\n\s*(" + NUM + r")\s*\n\s*(" + NUM + r")\s*\n\s*(" + NUM + r")",
             wb, flags=re.I
@@ -328,80 +340,73 @@ def parse_from_lines(lines: List[str]) -> Dict[str, str]:
     else:
         m.update({k: "—" for k in ["waste_total","markdowns_total","wm_total","wm_delta","wm_delta_pct"]})
 
-    # Payroll
-    pay_block = find_between(lines, "Payroll", "More Card Engagement") or find_between(lines, "Payroll", "Online")
-    if pay_block:
-        m["payroll_outturn"]    = value_after_label(pay_block, "Payroll Outturn")
-        m["absence_outturn"]    = value_after_label(pay_block, "Absence Outturn")
-        m["productive_outturn"] = value_after_label(pay_block, "Productive Outturn")
-        m["holiday_outturn"]    = value_after_label(pay_block, "Holiday Outturn")
-        m["current_base_cost"]  = value_after_label(pay_block, "Current Base Cost")
-    else:
-        for k in ["payroll_outturn","absence_outturn","productive_outturn","holiday_outturn","current_base_cost"]:
-            m[k] = "—"
+    # Payroll (numbers may be a few lines away but still after label)
+    pay_block = find_between(lines, "Payroll", "More Card Engagement") or find_between(lines, "Payroll", "Online") or lines
+    m["payroll_outturn"]    = first_number_near_label(pay_block, "Payroll Outturn", span=6)
+    m["absence_outturn"]    = first_number_near_label(pay_block, "Absence Outturn", span=6)
+    m["productive_outturn"] = first_number_near_label(pay_block, "Productive Outturn", span=6)
+    m["holiday_outturn"]    = first_number_near_label(pay_block, "Holiday Outturn", span=6)
+    m["current_base_cost"]  = first_number_near_label(pay_block, "Current Base Cost", span=6)
 
-    # Online
-    online_block = find_between(lines, "Online", "Front End Service") or find_between(lines, "Online", "More Card Engagement")
-    if online_block:
-        m["availability_pct"]   = value_after_label(online_block, "Availability")
-        m["despatched_on_time"] = value_after_label(online_block, "Despatched on Time")
-        m["delivered_on_time"]  = value_after_label(online_block, "Delivered on Time")
-        m["cc_avg_wait"]        = value_after_label(online_block, "average wait", accept_time=True)
-    else:
-        for k in ["availability_pct","despatched_on_time","delivered_on_time","cc_avg_wait"]:
-            m[k] = "—"
+    # Online (labels/values can be reversed in order)
+    online_block = find_between(lines, "Online", "Front End Service") or find_between(lines, "Online", "More Card Engagement") or lines
+    m["availability_pct"]   = first_number_near_label(online_block, "Availability", span=6)
+    m["despatched_on_time"] = first_number_near_label(online_block, "Despatched on Time", span=8)
+    m["delivered_on_time"]  = first_number_near_label(online_block, "Delivered on Time", span=8)
+    m["cc_avg_wait"]        = first_number_near_label(online_block, "average wait", span=10, want_time=True)
 
     # Front End Service
-    fes_block = find_between(lines, "Front End Service", "Privacy") or find_between(lines, "Front End Service", "More Card Engagement")
-    if fes_block:
-        m["sco_utilisation"]     = value_after_label(fes_block, "Sco Utilisation")
-        m["efficiency"]          = value_after_label(fes_block, "Efficiency")
-        m["scan_rate"]           = value_after_label(fes_block, "Scan Rate")
-        m["scan_vs_target"]      = value_after_label(fes_block, "Scan Rate", lookahead=6)  # may remain "—" if absent
-        m["interventions"]       = value_after_label(fes_block, "Interventions")
-        m["interventions_vs_target"] = value_after_label(fes_block, "Interventions", lookahead=6)
-        m["mainbank_closed"]     = value_after_label(fes_block, "Mainbank Closed")
-        m["mainbank_vs_target"]  = value_after_label(fes_block, "Mainbank Closed", lookahead=6)
-    else:
-        for k in ["sco_utilisation","efficiency","scan_rate","scan_vs_target","interventions","interventions_vs_target","mainbank_closed","mainbank_vs_target"]:
-            m[k] = "—"
+    fes_block = find_between(lines, "Front End Service", "Privacy") or \
+                find_between(lines, "Front End Service", "More Card Engagement") or lines
+    m["sco_utilisation"]        = first_number_near_label(fes_block, "Sco Utilisation", span=6)
+    m["efficiency"]             = first_number_near_label(fes_block, "Efficiency", span=6)
+    m["scan_rate"]              = first_number_near_label(fes_block, "Scan Rate", span=6)
+    # “vs Target” numbers often sit a couple of tokens after the first number
+    # We’ll grab the second number near the same label if available.
+    scan_near = numbers_near(fes_block, index_of_label(fes_block, "Scan Rate"), span=10)
+    m["scan_vs_target"]         = scan_near[1] if len(scan_near) >= 2 else "—"
+
+    m["interventions"]          = first_number_near_label(fes_block, "Interventions", span=6)
+    interv_near = numbers_near(fes_block, index_of_label(fes_block, "Interventions"), span=10)
+    m["interventions_vs_target"]= interv_near[1] if len(interv_near) >= 2 else "—"
+
+    m["mainbank_closed"]        = first_number_near_label(fes_block, "Mainbank Closed", span=6)
+    mainbank_near = numbers_near(fes_block, index_of_label(fes_block, "Mainbank Closed"), span=10)
+    m["mainbank_vs_target"]     = mainbank_near[1] if len(mainbank_near) >= 2 else "—"
 
     # Card Engagement
-    ce_block = find_between(lines, "More Card Engagement", "Stock Record NPS") or find_between(lines, "More Card Engagement", "Production Planning")
-    if ce_block:
-        m["swipe_rate"]     = value_after_label(ce_block, "Swipe Rate")
-        m["swipes_wow_pct"] = value_after_label(ce_block, "Swipes WOW")
-        m["new_customers"]  = value_after_label(ce_block, "New Customers")
-        m["swipes_yoy_pct"] = value_after_label(ce_block, "Swipes YOY")
-    else:
-        for k in ["swipe_rate","swipes_wow_pct","new_customers","swipes_yoy_pct"]:
-            m[k] = "—"
+    ce_block = find_between(lines, "More Card Engagement", "Stock Record NPS") or \
+               find_between(lines, "More Card Engagement", "Production Planning") or lines
+    m["swipe_rate"]     = first_number_near_label(ce_block, "Swipe Rate", span=6)
+    m["swipes_wow_pct"] = first_number_near_label(ce_block, "Swipes WOW", span=6)
+    m["new_customers"]  = first_number_near_label(ce_block, "New Customers", span=6)
+    m["swipes_yoy_pct"] = first_number_near_label(ce_block, "Swipes YOY", span=6)
 
-    # Production Planning & misc tiles
-    pp_block = find_between(lines, "Production Planning", "Shrink") or find_between(lines, "Production Planning", "Online")
-    if pp_block:
-        m["data_provided"] = value_after_label(pp_block, "Data Provided")
-        m["trusted_data"]  = value_after_label(pp_block, "Trusted Data")
-    else:
-        m["data_provided"] = m["trusted_data"] = "—"
+    # Production Planning
+    pp_block = find_between(lines, "Production Planning", "Shrink") or \
+               find_between(lines, "Production Planning", "Online") or lines
+    m["data_provided"] = first_number_near_label(pp_block, "Data Provided", span=6)
+    m["trusted_data"]  = first_number_near_label(pp_block, "Trusted Data", span=6)
 
-    # Shrink (row of circles)
-    sh_block = find_between(lines, "Shrink", "Online") or find_between(lines, "Shrink", "Front End Service") or find_between(lines, "Shrink", "Privacy")
-    if sh_block:
-        m["moa"]                  = value_after_label(sh_block, "Order Adjustments")
-        m["waste_validation"]     = value_after_label(sh_block, "Waste Validation")
-        m["unrecorded_waste_pct"] = value_after_label(sh_block, "Unrecorded Waste")
-        m["shrink_vs_budget_pct"] = value_after_label(sh_block, "Shrink vs Budget")
-    else:
-        for k in ["moa","waste_validation","unrecorded_waste_pct","shrink_vs_budget_pct"]:
-            m[k] = "—"
+    # Shrink
+    sh_block = find_between(lines, "Shrink", "Online") or \
+               find_between(lines, "Shrink", "Front End Service") or \
+               find_between(lines, "Shrink", "Privacy") or lines
+    m["moa"]                  = first_number_near_label(sh_block, "Order Adjustments", span=8)
+    m["waste_validation"]     = first_number_near_label(sh_block, "Waste Validation", span=8)
+    m["unrecorded_waste_pct"] = first_number_near_label(sh_block, "Unrecorded Waste", span=8)
+    m["shrink_vs_budget_pct"] = first_number_near_label(sh_block, "Shrink vs Budget", span=8)
 
-    # Complaints + My Reports + Weekly Activity
-    m["complaints_key"]  = value_after_label(lines, "Key Customer Complaints")
-    m["my_reports"]      = value_after_label(lines, "My Reports")
-    m["weekly_activity"] = value_after_label(lines, "Weekly Activity", lookahead=3)
+    # Complaints, My Reports, Weekly Activity (look both ways)
+    # Prefer “Key Customer Complaints”, else “Customer Complaints”
+    val = first_number_near_label(lines, "Key Customer Complaints", span=6)
+    if val == "—":
+        val = first_number_near_label(lines, "Customer Complaints", span=6)
+    m["complaints_key"]  = val
+    m["my_reports"]      = first_number_near_label(lines, "My Reports", span=6)
+    m["weekly_activity"] = first_number_near_label(lines, "Weekly Activity", span=6)
 
-    # NPS gauges (usually missing in text if community viz): initialise to "—"
+    # Community-visualisation gauges default to "—" (filled by ROI OCR)
     for k in ["supermarket_nps","colleague_happiness","home_delivery_nps","cafe_nps","click_collect_nps","customer_toilet_nps"]:
         m.setdefault(k, "—")
 
@@ -411,7 +416,6 @@ def parse_from_lines(lines: List[str]) -> Dict[str, str]:
 # ROI OCR fallback
 # ──────────────────────────────────────────────────────────────────────────────
 DEFAULT_ROI_MAP = {
-    # Gauges row (rough defaults; override in roi_map.json)
     "colleague_happiness": (0.235, 0.205, 0.095, 0.135),
     "supermarket_nps":     (0.385, 0.205, 0.095, 0.135),
     "cafe_nps":            (0.535, 0.205, 0.095, 0.135),
@@ -419,20 +423,17 @@ DEFAULT_ROI_MAP = {
     "home_delivery_nps":   (0.835, 0.205, 0.095, 0.135),
     "customer_toilet_nps": (0.955, 0.205, 0.095, 0.135),
 
-    # Waste & Markdowns TOTAL row cells
     "waste_total":     (0.105, 0.415, 0.065, 0.035),
     "markdowns_total": (0.170, 0.415, 0.065, 0.035),
     "wm_total":        (0.235, 0.415, 0.065, 0.035),
     "wm_delta":        (0.300, 0.415, 0.065, 0.035),
     "wm_delta_pct":    (0.365, 0.415, 0.065, 0.035),
 
-    # Online
     "availability_pct":   (0.455, 0.605, 0.065, 0.085),
     "despatched_on_time": (0.515, 0.585, 0.085, 0.055),
     "delivered_on_time":  (0.585, 0.585, 0.085, 0.055),
     "cc_avg_wait":        (0.615, 0.650, 0.065, 0.085),
 
-    # Front End Service
     "sco_utilisation": (0.680, 0.590, 0.065, 0.060),
     "efficiency":      (0.940, 0.585, 0.090, 0.120),
     "scan_rate":       (0.680, 0.655, 0.065, 0.050),
@@ -442,7 +443,6 @@ DEFAULT_ROI_MAP = {
 
 def load_roi_map() -> Dict[str, Tuple[float,float,float,float]]:
     roi = DEFAULT_ROI_MAP.copy()
-    # allow external map override
     try:
         if ROI_MAP_FILE and Path(ROI_MAP_FILE).exists():
             overrides = json.loads(Path(ROI_MAP_FILE).read_text(encoding="utf-8"))
@@ -452,13 +452,14 @@ def load_roi_map() -> Dict[str, Tuple[float,float,float,float]]:
         log.warning(f"Could not read roi_map.json: {e}")
     return roi
 
-def crop_norm(img: Image.Image, roi: Tuple[float,float,float,float]) -> Image.Image:
+def crop_norm(img: "Image.Image", roi: Tuple[float,float,float,float]) -> "Image.Image":
+    from PIL import Image  # type: ignore
     W, H = img.size
     x, y, w, h = roi
     box = (int(x*W), int(y*H), int((x+w)*W), int((y+h)*H))
     return img.crop(box)
 
-def ocr_cell(img: Image.Image, want_time=False, allow_percent=True) -> str:
+def ocr_cell(img: "Image.Image", want_time=False, allow_percent=True) -> str:
     if not OCR_AVAILABLE:
         return "—"
     try:
@@ -480,8 +481,9 @@ def ocr_cell(img: Image.Image, want_time=False, allow_percent=True) -> str:
         pass
     return "—"
 
-def draw_overlay(img: Image.Image, roi_map: Dict[str, Tuple[float,float,float,float]]):
+def draw_overlay(img: "Image.Image", roi_map: Dict[str, Tuple[float,float,float,float]]):
     try:
+        from PIL import ImageDraw  # type: ignore
         dbg = img.copy()
         draw = ImageDraw.Draw(dbg)
         W, H = dbg.size
@@ -496,7 +498,7 @@ def draw_overlay(img: Image.Image, roi_map: Dict[str, Tuple[float,float,float,fl
     except Exception:
         pass
 
-def fill_missing_with_roi(metrics: Dict[str, str], img: Optional[Image.Image]):
+def fill_missing_with_roi(metrics: Dict[str, str], img: Optional["Image.Image"]):
     if img is None:
         return
     roi_map = load_roi_map()
@@ -620,6 +622,7 @@ def run_daily_scrape():
         log.error("auth_state.json not found.")
         return
 
+    from PIL import Image  # ensure PIL available for type refs
     with sync_playwright() as p:
         browser = context = page = None
         metrics: Dict[str,str] = {}
@@ -636,15 +639,12 @@ def run_daily_scrape():
                 alert(["⚠️ Daily scrape blocked by login or load failure — please re-login."])
                 return
 
-            # Full screenshot (for ROI + debugging)
             screenshot = screenshot_full(page)
 
-            # BODY TEXT → numbered lines → layout parser
             body_text = get_body_text(page)
             lines = dump_numbered_lines(body_text)
             metrics = parse_from_lines(lines)
 
-            # Fill stubborn tiles with ROI OCR (esp. the NPS dials / pills)
             fill_missing_with_roi(metrics, screenshot)
 
         finally:
