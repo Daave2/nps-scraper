@@ -7,11 +7,11 @@ Retail Performance Dashboard → Daily Summary (layout-by-lines + ROI OCR) → G
 Key points in this build:
 - Sales 'Total' row: FIRST 'Total' AFTER the 'Sales' header → capture next 3 numeric tokens.
 - Front End Service: scoped values + correctly paired "vs Target" per KPI.
-- Online/Complaints/Payroll/Shrink/Card Engagement: typed, bidirectional search LIMITED to their section.
-- Availability: prefer a % within 3 lines ABOVE the label, else search nearby (prevents bleed).
-- C&C average wait: nearest HH:MM to the label (wide window).
+- Online/Complaints/Payroll/Shrink/Card Engagement: tuned line parsing search windows.
+- Availability: prefer a % within 3 lines ABOVE the label.
+- C&C average wait: expanded search window for time.
 - Waste & Markdowns: robust block regex (Total row with (+/-) and (+/-)%).
-- Updated ROI map for accurate OCR fallback on gauges and key tiles.
+- Updated and CORRECTED DEFAULT_ROI_MAP for accurate OCR fallback on gauges and key tiles.
 """
 
 import os
@@ -442,30 +442,34 @@ def parse_from_lines(lines: List[str]) -> Dict[str, str]:
     m["availability_pct"]   = value_near_scoped(lines, "Availability",       "percent", ONLINE_SCOPE, near_before=6,  near_after=10, prefer_before_first=3)
     m["despatched_on_time"] = value_near_scoped(lines, "Despatched on Time", "percent", ONLINE_SCOPE, near_before=8,  near_after=12)
     m["delivered_on_time"]  = value_near_scoped(lines, "Delivered on Time",  "percent", ONLINE_SCOPE, near_before=8,  near_after=12)
-    m["cc_avg_wait"]        = value_near_scoped(lines, "average wait",       "time",    ONLINE_SCOPE, near_before=10, near_after=14)
+    # Increased search window slightly as '15:12' is far from the label
+    m["cc_avg_wait"]        = value_near_scoped(lines, "average wait",       "time",    ONLINE_SCOPE, near_before=15, near_after=20)
 
     # ── Payroll (scoped) ─────────────────────────────────────────────────────
-    m["payroll_outturn"]    = value_near_scoped(lines, "Payroll Outturn",    "any", PAYROLL_SCOPE, near_before=4, near_after=6)
-    m["absence_outturn"]    = value_near_scoped(lines, "Absence Outturn",    "any", PAYROLL_SCOPE, near_before=4, near_after=6)
-    m["productive_outturn"] = value_near_scoped(lines, "Productive Outturn", "any", PAYROLL_SCOPE, near_before=4, near_after=6)
-    m["holiday_outturn"]    = value_near_scoped(lines, "Holiday Outturn",    "any", PAYROLL_SCOPE, near_before=4, near_after=6)
-    m["current_base_cost"]  = value_near_scoped(lines, "Current Base Cost",  "any", PAYROLL_SCOPE, near_before=4, near_after=6)
+    # Increased 'near_after' window to catch values if the label is at the top of the scope
+    m["payroll_outturn"]    = value_near_scoped(lines, "Payroll Outturn",    "any", PAYROLL_SCOPE, near_before=4, near_after=8)
+    m["absence_outturn"]    = value_near_scoped(lines, "Absence Outturn",    "any", PAYROLL_SCOPE, near_before=4, near_after=8)
+    m["productive_outturn"] = value_near_scoped(lines, "Productive Outturn", "any", PAYROLL_SCOPE, near_before=4, near_after=8)
+    m["holiday_outturn"]    = value_near_scoped(lines, "Holiday Outturn",    "any", PAYROLL_SCOPE, near_before=4, near_after=8)
+    m["current_base_cost"]  = value_near_scoped(lines, "Current Base Cost",  "any", PAYROLL_SCOPE, near_before=4, near_after=8)
 
     # ── Card Engagement (scoped) ─────────────────────────────────────────────
-    m["swipe_rate"]      = value_near_scoped(lines, "Swipe Rate",    "percent", CARD_SCOPE, near_before=4, near_after=6)
-    m["swipes_wow_pct"]  = value_near_scoped(lines, "Swipes WOW",    "percent", CARD_SCOPE, near_before=4, near_after=6)
-    m["new_customers"]   = value_near_scoped(lines, "New Customers", "integer", CARD_SCOPE, near_before=6, near_after=8)
-    m["swipes_yoy_pct"]  = value_near_scoped(lines, "Swipes YOY",    "percent", CARD_SCOPE, near_before=6, near_after=8)
+    # Increased 'near_after' window to catch values if the label is at the top of the scope
+    m["swipe_rate"]      = value_near_scoped(lines, "Swipe Rate",    "percent", CARD_SCOPE, near_before=4, near_after=8)
+    m["swipes_wow_pct"]  = value_near_scoped(lines, "Swipes WOW",    "percent", CARD_SCOPE, near_before=4, near_after=8)
+    m["new_customers"]   = value_near_scoped(lines, "New Customers", "integer", CARD_SCOPE, near_before=6, near_after=10)
+    m["swipes_yoy_pct"]  = value_near_scoped(lines, "Swipes YOY",    "percent", CARD_SCOPE, near_before=6, near_after=10)
 
     # ── Production Planning (scoped) ─────────────────────────────────────────
     m["data_provided"] = value_near_scoped(lines, "Data Provided", "percent", PP_SCOPE, near_before=6, near_after=8)
     m["trusted_data"]  = value_near_scoped(lines, "Trusted Data",  "percent", PP_SCOPE, near_before=6, near_after=8)
 
     # ── Shrink (scoped + strict types) ───────────────────────────────────────
-    m["moa"]                  = value_near_scoped(lines, "Morrisons Order Adjustments", "money",   SHRINK_SCOPE, near_before=8, near_after=10)
-    m["waste_validation"]     = value_near_scoped(lines, "Waste Validation",            "percent", SHRINK_SCOPE, near_before=8, near_after=10)
-    m["unrecorded_waste_pct"] = value_near_scoped(lines, "Unrecorded Waste",            "percent", SHRINK_SCOPE, near_before=8, near_after=10)
-    m["shrink_vs_budget_pct"] = value_near_scoped(lines, "Shrink vs Budget",            "percent", SHRINK_SCOPE, near_before=8, near_after=10)
+    # Values appear near the bottom of the section, so increased 'near_after' slightly
+    m["moa"]                  = value_near_scoped(lines, "Morrisons Order Adjustments", "money",   SHRINK_SCOPE, near_before=10, near_after=12)
+    m["waste_validation"]     = value_near_scoped(lines, "Waste Validation",            "percent", SHRINK_SCOPE, near_before=10, near_after=12)
+    m["unrecorded_waste_pct"] = value_near_scoped(lines, "Unrecorded Waste",            "percent", SHRINK_SCOPE, near_before=10, near_after=12)
+    m["shrink_vs_budget_pct"] = value_near_scoped(lines, "Shrink vs Budget",            "percent", SHRINK_SCOPE, near_before=10, near_after=12)
 
     # ── Complaints / My Reports (scoped) ─────────────────────────────────────
     comp_scope = COMPLAINTS_SCOPE if COMPLAINTS_SCOPE[0] >= 0 else (0, len(lines))
@@ -493,10 +497,10 @@ def parse_from_lines(lines: List[str]) -> Dict[str, str]:
     return m
 
 # ──────────────────────────────────────────────────────────────────────────────
-# ROI OCR fallback (UPDATED with corrected coordinates)
+# ROI OCR fallback (UPDATED with CORRECTED coordinates)
 # ──────────────────────────────────────────────────────────────────────────────
 DEFAULT_ROI_MAP = {
-    # Gauges row (UPDATED)
+    # Gauges row (CORRECTED)
     "colleague_happiness": (0.252, 0.230, 0.060, 0.040),
     "supermarket_nps":     (0.402, 0.230, 0.050, 0.040),
     "cafe_nps":            (0.552, 0.230, 0.050, 0.040),
@@ -511,18 +515,24 @@ DEFAULT_ROI_MAP = {
     "wm_delta":        (0.300, 0.415, 0.065, 0.035),
     "wm_delta_pct":    (0.365, 0.415, 0.065, 0.035),
 
-    # Online (UPDATED for better accuracy)
+    # Online (CORRECTED)
     "availability_pct":   (0.480, 0.770, 0.050, 0.040),
-    "despatched_on_time": (0.515, 0.585, 0.085, 0.055), # Still targets blank area
-    "delivered_on_time":  (0.585, 0.585, 0.085, 0.055), # Still targets blank area
+    "despatched_on_time": (0.515, 0.585, 0.085, 0.055), 
+    "delivered_on_time":  (0.585, 0.585, 0.085, 0.055),
     "cc_avg_wait":        (0.620, 0.770, 0.065, 0.040),
     
-    # Payroll (ADDED for robust fallback, line-parsing usually gets these)
+    # Payroll (ADDED for robust fallback)
     "payroll_outturn":    (0.457, 0.485, 0.065, 0.040),
     "absence_outturn":    (0.535, 0.485, 0.065, 0.040),
     "productive_outturn": (0.535, 0.540, 0.065, 0.040),
     "holiday_outturn":    (0.615, 0.485, 0.065, 0.040),
     "current_base_cost":  (0.615, 0.540, 0.065, 0.040),
+    
+    # Shrink (ADDED for robust fallback)
+    "moa":                  (0.250, 0.785, 0.085, 0.040),
+    "waste_validation":     (0.375, 0.785, 0.060, 0.040),
+    "unrecorded_waste_pct": (0.435, 0.785, 0.060, 0.040),
+    "shrink_vs_budget_pct": (0.495, 0.785, 0.060, 0.040),
 
     # Front End Service (Original, kept as backup)
     "sco_utilisation": (0.680, 0.590, 0.065, 0.060),
@@ -530,15 +540,22 @@ DEFAULT_ROI_MAP = {
     "scan_rate":       (0.680, 0.655, 0.065, 0.050),
     "interventions":   (0.810, 0.590, 0.065, 0.060),
     "mainbank_closed": (0.810, 0.655, 0.065, 0.050),
+
+    # Card Engagement (ADDED for robust fallback)
+    "new_customers": (0.742, 0.538, 0.060, 0.035),
 }
 
 def load_roi_map() -> Dict[str, Tuple[float,float,float,float]]:
     roi = DEFAULT_ROI_MAP.copy()
     try:
+        # NOTE: If roi_map.json exists, it OVERRIDES the DEFAULT_ROI_MAP.
+        # Ensure it is either EMPTY, deleted, or contains ONLY the required entries 
+        # (like "sales_lfl") to avoid overriding the corrected coordinates above.
         if ROI_MAP_FILE and Path(ROI_MAP_FILE).exists():
             overrides = json.loads(Path(ROI_MAP_FILE).read_text(encoding="utf-8"))
-            roi.update(overrides)
-            log.info(f"Loaded ROI overrides from roi_map.json: {len(overrides)} entrie(s).")
+            if overrides:
+                roi.update(overrides)
+                log.info(f"Loaded ROI overrides from roi_map.json: {len(overrides)} entrie(s).")
     except Exception as e:
         log.warning(f"Could not read roi_map.json: {e}")
     return roi
