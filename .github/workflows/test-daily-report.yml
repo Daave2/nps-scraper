@@ -26,7 +26,6 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends tesseract-ocr
-
       # ────────────────────────────────
       # Python + Playwright
       # ────────────────────────────────
@@ -40,7 +39,6 @@ jobs:
           python -m pip install -U pip
           pip install playwright requests pillow pytesseract schedule pytz
           python -m playwright install --with-deps chromium
-
       # ────────────────────────────────
       # Env vars
       # ────────────────────────────────
@@ -49,7 +47,6 @@ jobs:
           echo "TODAY=$(date -u +%Y%m%d)" >> $GITHUB_ENV
           echo "CI_RUN_URL=${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" >> $GITHUB_ENV
           echo "ROI_MAP_FILE=${{ github.workspace }}/roi_map.json" >> $GITHUB_ENV
-
       # ────────────────────────────────
       # Restore scraper state (auth + CSV + ROI)
       # ────────────────────────────────
@@ -67,7 +64,6 @@ jobs:
           restore-keys: |
             scraper-state-${{ runner.os }}-v1-${{ github.ref_name }}-
             scraper-state-${{ runner.os }}-v1-
-
       # ────────────────────────────────
       # Fallback: decode auth_state.json from secret
       # ────────────────────────────────
@@ -96,10 +92,17 @@ jobs:
             echo "COMPLAINTS_WEBHOOK=${{ secrets.COMPLAINTS_WEBHOOK }}"
             echo "DAILY_WEBHOOK=${{ secrets.DAILY_TEST_WEBHOOK || secrets.DAILY_WEBHOOK }}"
           } > config.ini
-
+      
       # ────────────────────────────────
       # Run only Daily Report scraper
       # ────────────────────────────────
+      - name: Remove cached/old roi_map.json to use script default
+        run: |
+          if [ -f ${{ env.ROI_MAP_FILE }} ]; then
+            echo "Deleting cached/old roi_map.json to force script's embedded DEFAULT_ROI_MAP."
+            rm ${{ env.ROI_MAP_FILE }}
+          fi
+
       - name: Run Daily Report Scraper (OCR + ROI)
         env:
           CI_RUN_URL: ${{ env.CI_RUN_URL }}
@@ -120,11 +123,9 @@ jobs:
             fi
           done
           echo "::endgroup::"
-
           echo "::group::Last 5 log lines"
           tail -n 5 scrape_daily.log || true
           echo "::endgroup::"
-
       # ────────────────────────────────
       # Upload artifacts
       # ────────────────────────────────
