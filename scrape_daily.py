@@ -63,7 +63,7 @@ GEMINI_METRICS = [
     "click_collect_nps", "customer_toilet_nps", "payroll_outturn", "absence_outturn", 
     "productive_outturn", "holiday_outturn", "current_base_cost", "moa", 
     "waste_validation", "unrecorded_waste_pct", "shrink_vs_budget_pct", "availability_pct",
-    "cc_avg_wait"
+    "cc_avg_wait","key Complaints"
 ]
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -640,7 +640,7 @@ def parse_from_lines(lines: List[str]) -> Dict[str, str]:
     m["my_reports"]    = value_near_scoped(lines, "My Reports", "integer", section_bounds(lines, "My Reports", ["Cafe NPS","Privacy","Payroll","Shrink","Waste & Markdowns"]), near_before=6, near_after=10)
     
     # ── Key Complaints (Line Parse - UNRELIABLE, will be overwritten by Gemini) ────────────────
-    m["complaints_key"] = value_near_scoped(lines, "Key Customer Complaints", "integer", COMPLAINTS_SCOPE, near_before=10, near_after=12)
+    m["complaints_key"] = value_near_scoped(lines, "Key Customer Complaints", "integer", COMPLAINTS_SCOPE, near_before=1, near_after=0)
     # ──────────────────────────────────────────────────────────────────────────────────────────
 
     m["weekly_activity"] = "No data" if "No data" in "\n".join(lines[CLEAN_ROTATE_SCOPE[0]:CLEAN_ROTATE_SCOPE[1]]) else "—"
