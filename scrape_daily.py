@@ -513,12 +513,12 @@ DEFAULT_ROI_MAP = {
     # 💥 FINAL WORKING COORDINATES - Derived EXACTLY from user-generated map 
     
     # NPS Gauges (ANCHOR Y=0.1615/0.1563 and W/H from user map)
-    "colleague_happiness": (0.2233, 0.1615, 0.0849, 0.1198), # -34 (User's Coords)
-    "supermarket_nps":     (0.3250, 0.1563, 0.0857, 0.1198), # 54 (User's Coords)
-    "cafe_nps":            (0.5700, 0.1563, 0.0857, 0.1198), # - (Relative to SH NPS)
-    "click_collect_nps":   (0.7180, 0.1563, 0.0857, 0.1198), # - (Relative to SH NPS)
-    "home_delivery_nps":   (0.8650, 0.1563, 0.0857, 0.1198), # - (Relative to SH NPS)
-    "customer_toilet_nps": (0.9150, 0.1563, 0.0857, 0.1198), # - (Relative to SH NPS)
+    "colleague_happiness": (0.2233, 0.2201, 0.0849, 0.1458), # -34 (User's Coords)
+    "supermarket_nps":     (0.3258, 0.2253, 0.0930, 0.1341), # 54 (User's Coords)
+    "cafe_nps":            (0.4290, 0.2279, 0.0915, 0.1354), # - (User's Coords)
+    "click_collect_nps":   (0.5329, 0.2266, 0.0900, 0.1302), # - (User's Coords)
+    "home_delivery_nps":   (0.6391, 0.2318, 0.0922, 0.1224), # - (User's Coords)
+    "customer_toilet_nps": (0.7504, 0.2305, 0.0849, 0.1172), # - (User's Coords)
 
     # Waste & Markdowns TOTAL row cells (Vertical alignment corrected based on visual inspection)
     "waste_total":     (0.105, 0.575, 0.065, 0.035),
@@ -527,27 +527,29 @@ DEFAULT_ROI_MAP = {
     "wm_delta":        (0.300, 0.575, 0.065, 0.035),
     "wm_delta_pct":    (0.365, 0.575, 0.065, 0.035),
 
-    # Online (ANCHOR Y=0.7318 for C&C, Y=0.9034 for Availability)
-    "availability_pct":   (0.9034, 0.6706, 0.0878, 0.0846), # 84% (User's Coords - will be rotated to X,Y,W,H below)
+    # Online (ANCHOR Y=0.7318 for C&C, Y=0.7253 for Availability)
+    "availability_pct":   (0.3997, 0.7253, 0.0593, 0.1120), # 84% (User's Coords)
     "despatched_on_time": (0.515, 0.585, 0.085, 0.055), # Placeholder (not displayed)
     "delivered_on_time":  (0.585, 0.585, 0.085, 0.055), # Placeholder (not displayed)
-    "cc_avg_wait":        (0.5849, 0.7318, 0.0659, 0.0547), # 15:12 (User's Coords)
+    "cc_avg_wait":        (0.5842, 0.7292, 0.0688, 0.1081), # 15:12 (User's Coords)
     
     # Payroll (ANCHOR Y=0.4818/0.5400)
-    "payroll_outturn":    (0.4605, 0.4818, 0.0761, 0.0833), # -753.6 (User's Coords)
-    "absence_outturn":    (0.5300, 0.4818, 0.0761, 0.0833), # 652.4 (Relative to payroll_outturn)
-    "productive_outturn": (0.5300, 0.5400, 0.0761, 0.0833), # -1.4K (Relative to absence_outturn, moved down)
-    "holiday_outturn":    (0.6000, 0.4818, 0.0761, 0.0833), # -354.8 (Relative to absence_outturn)
-    "current_base_cost":  (0.6000, 0.5400, 0.0761, 0.0833), # 45.1K (Relative to holiday_outturn, moved down)
+    "payroll_outturn":    (0.4619, 0.4948, 0.0725, 0.0898), # -753.6 (User's Coords)
+    "absence_outturn":    (0.5425, 0.4727, 0.0630, 0.0573), # 652.4 (User's Coords)
+    "productive_outturn": (0.5395, 0.5378, 0.0710, 0.0690), # -1.4K (User's Coords)
+    "holiday_outturn":    (0.6091, 0.4714, 0.0666, 0.0612), # -354.8 (User's Coords)
+    "current_base_cost":  (0.6120, 0.5365, 0.0637, 0.0690), # 45.1K (User's Coords)
     
     # Shrink (ANCHOR Y=0.7292)
-    "moa":                  (0.1325, 0.7227, 0.0556, 0.0469), # £-8K (User's Coords)
-    "waste_validation":     (0.2555, 0.7292, 0.0571, 0.0417), # 100% (User's Coords)
-    "unrecorded_waste_pct": (0.3170, 0.7292, 0.0615, 0.0625), # 9.73% (User's Coords)
-    "shrink_vs_budget_pct": (0.4300, 0.7292, 0.0615, 0.0625), # -0.05% (Relative to unrecorded waste)
+    "moa":                  (0.1340, 0.7487, 0.0542, 0.0664), # £-8K (User's Coords)
+    "waste_validation":     (0.1955, 0.7526, 0.0564, 0.0716), # 100% (User's Coords)
+    "unrecorded_waste_pct": (0.2577, 0.7370, 0.0571, 0.0924), # 9.73% (User's Coords)
+    "shrink_vs_budget_pct": (0.3163, 0.7253, 0.0637, 0.1068), # -0.05% (User's Coords)
 
     # Card Engagement (Final)
-    "new_customers": (0.750, 0.680, 0.050, 0.040),
+    "new_customers": (0.7079, 0.5365, 0.0659, 0.0625), # 63 (User's Coords)
+    "swipes_yoy_pct": (0.7870, 0.5378, 0.0666, 0.0625), # 16% (User's Coords)
+    "efficiency": (0.9114, 0.7083, 0.0769, 0.1159), # 86% (User's Coords - added for completeness)
 }
 
 
