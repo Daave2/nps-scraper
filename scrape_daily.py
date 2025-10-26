@@ -7,6 +7,7 @@ Retail Performance Dashboard → Daily Summary (layout-by-lines + GEMINI VISION)
 Key points in this build:
 - Gemini Vision Integration: Uses Gemini Pro Vision for all difficult, visual-based metrics.
 - NEW: Target-based Chat Card formatting using **<font color='...'>** for visual distinction.
+- UPDATE: Increased waiting time for dashboard stability before capture.
 """
 
 import os
@@ -37,7 +38,7 @@ except ImportError:
 OCR_AVAILABLE = False 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Paths / constants (Unmodified)
+# Paths / constants
 # ──────────────────────────────────────────────────────────────────────────────
 BASE_DIR       = Path(__file__).resolve().parent
 AUTH_STATE     = BASE_DIR / "auth_state.json"
@@ -65,7 +66,7 @@ GEMINI_METRICS = [
 ]
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Logging (Unmodified)
+# Logging
 # ──────────────────────────────────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
@@ -76,7 +77,7 @@ log = logging.getLogger("daily")
 log.addHandler(logging.StreamHandler())
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Config (Unmodified)
+# Config
 # ──────────────────────────────────────────────────────────────────────────────
 config = configparser.ConfigParser()
 config.read(BASE_DIR / "config.ini")
@@ -91,7 +92,6 @@ CI_RUN_URL    = os.getenv("CI_RUN_URL", "")
 # Targets / Formatting (FIXED: Status mapping and lookup logic)
 # ──────────────────────────────────────────────────────────────────────────────
 # Target values and comparison rules for Google Chat Card formatting.
-# Format: (Target Value, Rule String)
 # Rules: 'A>X G, A<Y R', 'A>X R', 'A<X R', 'A<X G, A>Y R', 
 # 'A>X O, A>Y R, A>Z BR' (O=Orange, R=Red, G=Green, BR=Bold Red, M=Minutes)
 METRIC_TARGETS = {
@@ -254,7 +254,7 @@ def format_metric_value(key: str, value: str) -> str:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Helpers: Chat + file saves (Unmodified, but relies on new format_metric_value)
+# Helpers: Chat + file saves
 # ──────────────────────────────────────────────────────────────────────────────
 def _post_with_backoff(url: str, payload: dict) -> bool:
     backoff, max_backoff = 2.0, 30.0
@@ -301,7 +301,7 @@ def save_text(path: Path, text: str):
         pass
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Card + CSV (Unmodified, relies on new format_metric_value)
+# Card + CSV
 # ──────────────────────────────────────────────────────────────────────────────
 def kv(label: str, val: str, key: Optional[str] = None) -> dict:
     """Creates a decoratedText widget, optionally applying target-based formatting."""
@@ -402,7 +402,7 @@ def send_card(metrics: Dict[str, str]) -> bool:
     return _post_with_backoff(MAIN_WEBHOOK, build_chat_card(metrics))
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Browser automation (Unmodified)
+# Browser automation (UPDATED: Increased wait times)
 # ──────────────────────────────────────────────────────────────────────────────
 def click_this_week(page):
     try:
@@ -454,8 +454,9 @@ def open_and_prepare(page) -> bool:
         log.warning("Redirected to login — auth state missing/invalid.")
         return False
 
-    log.info("Waiting 12s for dynamic content…")
-    page.wait_for_timeout(12_000)
+    # INCREASED WAIT: Gave 12s, now giving 20s for general content load
+    log.info("Waiting 20s for dynamic content…")
+    page.wait_for_timeout(20_000)
 
     click_this_week(page)
     click_proceed_overlays(page)
@@ -826,7 +827,7 @@ def parse_from_lines(lines: List[str]) -> Dict[str, str]:
     return m
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Main (Unmodified)
+# Main (UPDATED: Added extra wait before capture)
 # ──────────────────────────────────────────────────────────────────────────────
 def run_daily_scrape():
     if not AUTH_STATE.exists():
@@ -857,6 +858,10 @@ def run_daily_scrape():
                 alert(["⚠️ Daily scrape blocked by login or load failure — please re-login."])
                 return
 
+            # --- NEW: Final buffer wait to ensure all elements have stabilized ---
+            log.info("Adding 5s final buffer wait before screenshot and capture…")
+            page.wait_for_timeout(5_000)
+            
             # Screenshot for GEMINI and debugging
             img_bytes = page.screenshot(full_page=True, type="png")
             ts = int(time.time())
