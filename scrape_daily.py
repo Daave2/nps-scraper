@@ -5,8 +5,8 @@
 Retail Performance Dashboard → Daily Summary (layout-by-lines + GEMINI VISION) → Google Chat
 
 Key points in this build:
-- Gemini Vision Integration: Uses Gemini Pro Vision for all difficult, visual-based metrics (NPS, Payroll, Shrink circles).
-- BUGFIX: Key Complaints is now FORCED to be handled by Gemini Vision to resolve the "0" vs "2" misread.
+- Gemini Vision Integration: Uses Gemini Pro Vision for all difficult, visual-based metrics.
+- NEW: Target-based Chat Card formatting using **<font color='...'>** for visual distinction.
 """
 
 import os
@@ -37,7 +37,7 @@ except ImportError:
 OCR_AVAILABLE = False 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Paths / constants
+# Paths / constants (Unmodified)
 # ──────────────────────────────────────────────────────────────────────────────
 BASE_DIR       = Path(__file__).resolve().parent
 AUTH_STATE     = BASE_DIR / "auth_state.json"
@@ -56,8 +56,6 @@ DASHBOARD_URL = (
 
 VIEWPORT = {"width": 1366, "height": 768}
 
-# --- METRICS REQUIRING GEMINI (The previously failing list) ---
-# Note: key_customer_complaints is NOT in this list, but handled explicitly in the main flow
 GEMINI_METRICS = [
     "supermarket_nps", "colleague_happiness", "home_delivery_nps", "cafe_nps", 
     "click_collect_nps", "customer_toilet_nps", "payroll_outturn", "absence_outturn", 
@@ -67,7 +65,7 @@ GEMINI_METRICS = [
 ]
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Logging
+# Logging (Unmodified)
 # ──────────────────────────────────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
@@ -78,12 +76,11 @@ log = logging.getLogger("daily")
 log.addHandler(logging.StreamHandler())
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Config
+# Config (Unmodified)
 # ──────────────────────────────────────────────────────────────────────────────
 config = configparser.ConfigParser()
 config.read(BASE_DIR / "config.ini")
 
-# Safely retrieve GEMINI_API_KEY
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", config["DEFAULT"].get("GEMINI_API_KEY"))
 
 MAIN_WEBHOOK  = config["DEFAULT"].get("DAILY_WEBHOOK") or config["DEFAULT"].get("MAIN_WEBHOOK", os.getenv("MAIN_WEBHOOK", ""))
@@ -91,7 +88,163 @@ ALERT_WEBHOOK = config["DEFAULT"].get("ALERT_WEBHOOK",  os.getenv("ALERT_WEBHOOK
 CI_RUN_URL    = os.getenv("CI_RUN_URL", "")
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Helpers: Chat + file saves
+# Targets / Formatting (UPDATED FOR COLOR)
+# ──────────────────────────────────────────────────────────────────────────────
+# Target values and comparison rules for Google Chat Card formatting.
+# Format: (Target Value, Rule String)
+# Rules: 'A>X G, A<Y R', 'A>X R', 'A<X R', 'A<X G, A>Y R', 
+# 'A>X O, A>Y R, A>Z BR' (O=Orange, R=Red, G=Green, BR=Bold Red, M=Minutes)
+METRIC_TARGETS = {
+    # Sales
+    "sales_lfl":           ("0",     "A>2 G, A<-2 R"),
+    "sales_vs_target":     ("0",     "A>2K G, A<-2K R"),
+    # NPS
+    "supermarket_nps":     ("65",    "A>65 G, A<50 R"),
+    "colleague_happiness": ("40",    "A>40 G, A<0 R"),
+    "home_delivery_nps":   ("75",    "A>75 G, A<65 R"),
+    "cafe_nps":            ("65",    "A>65 G, A<50 R"), 
+    "click_collect_nps":   ("40",    "A>40 G, A<30 R"),
+    "customer_toilet_nps": ("40",    "A>40 G, A<30 R"), 
+    # FES
+    "sco_utilisation":     ("67%",   "A>67% G, A<65% R"),
+    "efficiency":          ("100%",  "A>99% G, A<90% R"),
+    "scan_rate":           ("21.3",  "A>21.3 G, A<20.1 R"),
+    "interventions":       ("20",    "A<20.1 G, A>25 R"),
+    "mainbank_closed":     ("0",     "A<1 G, A>2 R"),
+    # Online
+    "availability_pct":    ("96%",   "A>96% G, A<92% R"),
+    "cc_avg_wait":         ("4:30",  "A<4.5M G, A>5M R"), # M = Minutes
+    # Waste/Shrink 
+    "shrink_vs_budget_pct":("0%",    "A>6% R, A<-0% G"),
+    # Payroll (Outturn metrics)
+    "payroll_outturn":     ("0",     "A<0 R"),
+    "absence_outturn":     ("0",     "A<0 R"),
+    "productive_outturn":  ("0",     "A<0 R"),
+    "holiday_outturn":     ("0",     "A<0 R"),
+    # Card
+    "swipe_rate":          ("75%",   "A<65% R, A>80% G"),
+    # Misc
+    "complaints_key":      ("0",     "A>0 O, A>1 R, A>2 BR"),
+    "trusted_data":        ("49%",   "A>49% G"),
+}
+
+# --- Color Definitions for Unofficial <font> Tag ---
+COLOR_RED = "#FF0000"   # Critical/Bad 
+COLOR_AMBER = "#FFA500" # Warning/Orange
+
+# Mapping status to HTML tags (using font color for poor performance, plain for good)
+STATUS_FORMAT = {
+    "GREEN":  ("", ""),                                 # Good/Green is plain text
+    "RED":    (f"<font color='{COLOR_RED}'>", "</font>"),      # Deviation is red
+    "ORANGE": (f"<font color='{COLOR_AMBER}'>", "</font>"),    # Warning is amber
+    "BOLD_RED": (f"<font color='{COLOR_RED}'><b>", "</b></font>"), # Critical is bold and red
+    "NONE":   ("", ""),                                 # No rule/data is plain text
+}
+
+def _clean_numeric_value(val: str, is_time_min: bool = False) -> Optional[float]:
+    """Converts a metric string (e.g., '3.43%', '£-8K', '4:30') to a comparable float."""
+    if not val or val == "—":
+        return None
+    
+    val = str(val).strip().replace(',', '')
+    
+    # Time (M:SS to total minutes for CC Avg Wait)
+    if is_time_min:
+        parts = val.split(':')
+        if len(parts) == 2:
+            try:
+                minutes = float(parts[0])
+                seconds = float(parts[1])
+                return minutes + (seconds / 60.0)
+            except ValueError:
+                return None
+        try:
+            return float(val)
+        except ValueError:
+            return None
+
+    # General numeric cleanup
+    val = re.sub(r'[£$€]', '', val).strip()
+    
+    multiplier = 1.0
+    val_clean = val.rstrip('%')
+    
+    if val.endswith('K'):
+        multiplier = 1000.0
+        val_clean = val_clean.rstrip('K')
+    elif val.endswith('M'):
+        multiplier = 1_000_000.0
+        val_clean = val_clean.rstrip('M')
+    elif val.endswith('B'):
+        multiplier = 1_000_000_000.0
+        val_clean = val_clean.rstrip('B')
+
+    try:
+        return float(val_clean) * multiplier
+    except ValueError:
+        return None
+
+def get_status_formatting(key: str, value: str) -> Tuple[str, str]:
+    """
+    Determines the status (color/bolding) for a metric based on its value and rules.
+    Returns: (prefix_html, suffix_html)
+    """
+    if key not in METRIC_TARGETS or value in [None, "—"]:
+        return (STATUS_FORMAT["NONE"][0], STATUS_FORMAT["NONE"][1])
+
+    _, rule_str = METRIC_TARGETS[key]
+    is_time = "M" in rule_str # Flag for minute conversion
+
+    # Clean the actual value
+    comp_value = _clean_numeric_value(value, is_time_min=is_time)
+    if comp_value is None:
+        return (STATUS_FORMAT["NONE"][0], STATUS_FORMAT["NONE"][1])
+
+    # Parse the rule string (e.g., 'A>65 G, A<50 R')
+    rules = [r.strip() for r in rule_str.split(',')]
+    
+    # Function to check a single rule segment
+    def check_rule(rule_segment, value, is_time):
+        # Matches patterns like 'A>2 BR', 'A<-2K R', 'A<4.5M G'
+        m = re.match(r"A([<>])(-?[\d.]+)([KMB%]?|[M])?\s*(R|G|O|BR)", rule_segment, re.I)
+        if m:
+            op, str_val, unit, status = m.groups()
+            is_min_target = (unit == 'M')
+            comp_target = _clean_numeric_value(str_val + (unit if unit != 'M' else ''), is_time_min=is_min_target)
+            
+            if comp_target is not None:
+                is_match = False
+                if op == '>' and value > comp_target:
+                    is_match = True
+                elif op == '<' and value < comp_target:
+                    is_match = True
+                
+                if is_match:
+                    return status.upper()
+        return None
+
+    # Process rules in a priority order: BOLD_RED > RED > ORANGE > GREEN
+    priority_statuses = ["BR", "R", "O", "G"]
+    
+    for status_code in priority_statuses:
+        for rule in rules:
+            status = check_rule(rule, comp_value, is_time)
+            if status == status_code:
+                # Return the formatting for the highest priority status matched
+                prefix, suffix = STATUS_FORMAT[status]
+                return (prefix, suffix)
+
+    # No rule match
+    return (STATUS_FORMAT["NONE"][0], STATUS_FORMAT["NONE"][1])
+
+def format_metric_value(key: str, value: str) -> str:
+    """Applies status formatting (color/bold) to the metric value string."""
+    prefix, suffix = get_status_formatting(key, value)
+    return f"{prefix}{value}{suffix}"
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Helpers: Chat + file saves (Unmodified, but relies on new format_metric_value)
 # ──────────────────────────────────────────────────────────────────────────────
 def _post_with_backoff(url: str, payload: dict) -> bool:
     backoff, max_backoff = 2.0, 30.0
@@ -138,10 +291,13 @@ def save_text(path: Path, text: str):
         pass
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Card + CSV
+# Card + CSV (Unmodified, relies on new format_metric_value)
 # ──────────────────────────────────────────────────────────────────────────────
-def kv(label: str, val: str) -> dict:
-    return {"decoratedText": {"topLabel": label, "text": (val or "—")}}
+def kv(label: str, val: str, key: Optional[str] = None) -> dict:
+    """Creates a decoratedText widget, optionally applying target-based formatting."""
+    # Apply color/bolding if the metric key is provided and a rule is matched
+    formatted_val = format_metric_value(key, val) if key else (val or "—")
+    return {"decoratedText": {"topLabel": label, "text": formatted_val}}
 
 def title_widget(text: str) -> dict:
     return {"textParagraph": {"text": f"<b>{text}</b>"}}
@@ -156,25 +312,26 @@ def build_chat_card(metrics: Dict[str, str]) -> dict:
                      kv("Period",      metrics.get("period_range","—"))]},
         {"widgets": [title_widget("Sales & NPS"),
                      kv("Sales Total", metrics.get("sales_total","—")),
-                     kv("LFL",         metrics.get("sales_lfl","—")),
-                     kv("vs Target",   metrics.get("sales_vs_target","—")),
-                     kv("Supermarket NPS",     metrics.get("supermarket_nps","—")),
-                     kv("Colleague Happiness", metrics.get("colleague_happiness","—")),
-                     kv("Home Delivery NPS",   metrics.get("home_delivery_nps","—")),
-                     kv("Cafe NPS",            metrics.get("cafe_nps","—")),
-                     kv("Click & Collect NPS", metrics.get("click_collect_nps","—")),
-                     kv("Customer Toilet NPS", metrics.get("customer_toilet_nps","—"))]},
+                     kv("LFL",         metrics.get("sales_lfl","—"), key="sales_lfl"),
+                     kv("vs Target",   metrics.get("sales_vs_target","—"), key="sales_vs_target"),
+                     kv("Supermarket NPS",     metrics.get("supermarket_nps","—"), key="supermarket_nps"),
+                     kv("Colleague Happiness", metrics.get("colleague_happiness","—"), key="colleague_happiness"),
+                     kv("Home Delivery NPS",   metrics.get("home_delivery_nps","—"), key="home_delivery_nps"),
+                     kv("Cafe NPS",            metrics.get("cafe_nps","—"), key="cafe_nps"),
+                     kv("Click & Collect NPS", metrics.get("click_collect_nps","—"), key="click_collect_nps"),
+                     kv("Customer Toilet NPS", metrics.get("customer_toilet_nps","—"), key="customer_toilet_nps")]},
         {"widgets": [title_widget("Front End Service"),
-                     kv("SCO Utilisation", metrics.get("sco_utilisation","—")),
-                     kv("Efficiency",      metrics.get("efficiency","—")),
-                     kv("Scan Rate",       f"{metrics.get('scan_rate','—')} (vs {metrics.get('scan_vs_target','—')})"),
-                     kv("Interventions",   f"{metrics.get('interventions','—')} (vs {metrics.get('interventions_vs_target','—')})"),
-                     kv("Mainbank Closed", f"{metrics.get('mainbank_closed','—')} (vs {metrics.get('mainbank_vs_target','—')})")]},
+                     kv("SCO Utilisation", metrics.get("sco_utilisation","—"), key="sco_utilisation"),
+                     kv("Efficiency",      metrics.get("efficiency","—"), key="efficiency"),
+                     # FES values are formatted internally within the f-string for the value part
+                     kv("Scan Rate",       f"{format_metric_value('scan_rate', metrics.get('scan_rate','—'))} (vs {metrics.get('scan_vs_target','—')})"),
+                     kv("Interventions",   f"{format_metric_value('interventions', metrics.get('interventions','—'))} (vs {metrics.get('interventions_vs_target','—')})"),
+                     kv("Mainbank Closed", f"{format_metric_value('mainbank_closed', metrics.get('mainbank_closed','—'))} (vs {metrics.get('mainbank_vs_target','—')})")]},
         {"widgets": [title_widget("Online"),
-                     kv("Availability",              metrics.get("availability_pct","—")),
+                     kv("Availability",              metrics.get("availability_pct","—"), key="availability_pct"),
                      kv("Despatched on Time",        metrics.get("despatched_on_time","—")),
                      kv("Delivered on Time",         metrics.get("delivered_on_time","—")),
-                     kv("Click & Collect Avg Wait",  metrics.get("cc_avg_wait","—"))]},
+                     kv("Click & Collect Avg Wait",  metrics.get("cc_avg_wait","—"), key="cc_avg_wait")]},
         {"widgets": [title_widget("Waste & Markdowns (Total)"),
                      kv("Waste",     metrics.get("waste_total","—")),
                      kv("Markdowns", metrics.get("markdowns_total","—")),
@@ -182,24 +339,24 @@ def build_chat_card(metrics: Dict[str, str]) -> dict:
                      kv("+/−",       metrics.get("wm_delta","—")),
                      kv("+/− %",     metrics.get("wm_delta_pct","—"))]},
         {"widgets": [title_widget("Payroll"),
-                     kv("Payroll Outturn",    metrics.get("payroll_outturn","—")),
-                     kv("Absence Outturn",    metrics.get("absence_outturn","—")),
-                     kv("Productive Outturn", metrics.get("productive_outturn","—")),
-                     kv("Holiday Outturn",    metrics.get("holiday_outturn","—")),
+                     kv("Payroll Outturn",    metrics.get("payroll_outturn","—"), key="payroll_outturn"),
+                     kv("Absence Outturn",    metrics.get("absence_outturn","—"), key="absence_outturn"),
+                     kv("Productive Outturn", metrics.get("productive_outturn","—"), key="productive_outturn"),
+                     kv("Holiday Outturn",    metrics.get("holiday_outturn","—"), key="holiday_outturn"),
                      kv("Current Base Cost",  metrics.get("current_base_cost","—"))]},
         {"widgets": [title_widget("Shrink"),
                      kv("Morrisons Order Adjustments", metrics.get("moa","—")),
                      kv("Waste Validation",            metrics.get("waste_validation","—")),
                      kv("Unrecorded Waste %",          metrics.get("unrecorded_waste_pct","—")),
-                     kv("Shrink vs Budget %",          metrics.get("shrink_vs_budget_pct","—"))]},
+                     kv("Shrink vs Budget %",          metrics.get("shrink_vs_budget_pct","—"), key="shrink_vs_budget_pct")]},
         {"widgets": [title_widget("Card Engagement & Misc"),
-                     kv("Swipe Rate",      metrics.get("swipe_rate","—")),
+                     kv("Swipe Rate",      metrics.get("swipe_rate","—"), key="swipe_rate"),
                      kv("Swipes WOW %",    metrics.get("swipes_wow_pct","—")),
                      kv("New Customers",   metrics.get("new_customers","—")),
                      kv("Swipes YOY %",    metrics.get("swipes_yoy_pct","—")),
-                     kv("Key Complaints",  metrics.get("complaints_key","—")),
+                     kv("Key Complaints",  metrics.get("complaints_key","—"), key="complaints_key"),
                      kv("Data Provided",   metrics.get("data_provided","—")),
-                     kv("Trusted Data",    metrics.get("trusted_data","—")),
+                     kv("Trusted Data",    metrics.get("trusted_data","—"), key="trusted_data"),
                      kv("My Reports",      metrics.get("my_reports","—")),
                      kv("Weekly Activity %",metrics.get("weekly_activity","—"))]},
     ]
@@ -235,7 +392,7 @@ def send_card(metrics: Dict[str, str]) -> bool:
     return _post_with_backoff(MAIN_WEBHOOK, build_chat_card(metrics))
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Browser automation
+# Browser automation (Unmodified)
 # ──────────────────────────────────────────────────────────────────────────────
 def click_this_week(page):
     try:
@@ -305,7 +462,7 @@ def open_and_prepare(page) -> bool:
     return True
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Text parsing (layout-by-lines) — Deterministic rules (SCOPED)
+# Text parsing (Unmodified)
 # ──────────────────────────────────────────────────────────────────────────────
 NUM_ANY_RE   = re.compile(r"[£]?-?\d+(?:\.\d+)?(?:[KMB]|%)?", re.I)
 NUM_INT_RE   = re.compile(r"\b-?\d+\b")
@@ -485,7 +642,7 @@ def _fes_vs(lines: List[str], label: str, scope: Tuple[int,int]) -> str:
     return "—"
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Gemini Vision Extraction (For hard-to-read metrics)
+# Gemini Vision Extraction (Unmodified)
 # ──────────────────────────────────────────────────────────────────────────────
 def extract_gemini_metrics(metrics: Dict[str, str], image_path: Path) -> Dict[str, str]:
     if not GEMINI_AVAILABLE or not GEMINI_API_KEY:
@@ -564,7 +721,7 @@ def extract_gemini_metrics(metrics: Dict[str, str], image_path: Path) -> Dict[st
         return metrics
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Main Parser
+# Main Parser (Unmodified)
 # ──────────────────────────────────────────────────────────────────────────────
 
 def parse_from_lines(lines: List[str]) -> Dict[str, str]:
@@ -659,7 +816,7 @@ def parse_from_lines(lines: List[str]) -> Dict[str, str]:
     return m
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Main
+# Main (Unmodified)
 # ──────────────────────────────────────────────────────────────────────────────
 def run_daily_scrape():
     if not AUTH_STATE.exists():
