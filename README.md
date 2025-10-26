@@ -1,57 +1,98 @@
-Looker Studio Scraper Suite: Technical Manual
-This repository contains a robust, multi-script Python and GitHub Actions solution for extracting business-critical data from Google Looker Studio reports and delivering formatted, actionable alerts to Google Chat.
-🚀 Features at a Glance
-Script	Purpose	Execution	Key Technology
-scrape_daily.py	Retail Daily Summary (Comprehensive dashboard card)	Once Daily (8:30 AM UTC)	Gemini Pro Vision (for visual metrics), Conditional Card Filtering, Custom Color/Target Formatting.
-scrape.py	NPS Comment Scraper (Batched customer feedback)	Multiple Times Daily	2FA Handling, Rate Limiting, Deduplication (using comment/timestamp/store).
-scrape_complaints.py	Customer Complaints Scraper (New case alerts)	Multiple Times Daily	State-Machine Parsing, Deduplication (using case number), Per-Complaint Card Alerting.
-⚙️ 1. Configuration: GitHub Secrets
-The system is configured entirely via GitHub Secrets. These secrets are injected into the runtime environment and stored in a temporary config.ini for the scripts.
-Secret Name	Purpose & Script Usage
-GOOGLE_EMAIL	Google account email used to access the Looker Studio reports.
-GOOGLE_PASSWORD	The password for the Google account (used only for re-login).
-GEMINI_API_KEY	Critical for scrape_daily.py. Provides access to the Gemini API for visual metric extraction.
-MAIN_WEBHOOK	Target URL for general alerts and batched NPS comments (scrape.py).
-ALERT_WEBHOOK	Target URL for high-priority alerts: login failures, 2FA codes, and critical script errors.
-DAILY_WEBHOOK	Target URL for the comprehensive daily summary card (scrape_daily.py).
-COMPLAINTS_WEBHOOK	Target URL for new complaint notifications (scrape_complaints.py).
-AUTH_STATE_B64	(Optional) Base64-encoded content of a successful auth_state.json file. Used for immediate setup or cache failure recovery.
-🔑 2. Manual Operational Guide: Initial Login & 2FA
-The first successful run is a manual, non-headless process. It is required to create and cache the shared authenticated session file (auth_state.json).
-Initial Authentication Procedure
-Set Secrets: Verify all required credentials (GOOGLE_EMAIL, GOOGLE_PASSWORD, and all *WEBHOOKs) are configured in GitHub Secrets.
-Trigger Login: Navigate to the Actions tab, select the primary workflow, and click Run workflow (using workflow_dispatch).
-Wait for Alert: The scrape.py script will run and detect the necessary Google sign-in flow.
-2FA Intervention (Critical Step):
-The script pauses and uses screen-scraping logic to identify the number displayed on the Google "Match the number" screen.
-It immediately sends an alert to your ALERT_WEBHOOK containing the verification code (e.g., 🔐 Tap this number on your phone: **42**).
-Action Required: You must quickly approve the sign-in request on your mobile device and tap the matching number shown in the alert.
-Completion: Once approved, the Playwright session saves the state to auth_state.json, which the workflow then caches and uses for all subsequent automated runs.
-3. Detailed Script Logic and Mechanisms
-A. scrape_daily.py (Daily Report)
-The primary goal is robustness and clarity of the final Chat Card.
-Feature	Logic Explanation
-Gemini Vision Extraction	Metrics listed in GEMINI_METRICS (e.g., NPS scores, payroll/shrink dials) that fail initial text scraping are sent to Gemini Pro Vision for re-extraction from a full-page screenshot. This bypasses common visual parsing failures.
-Data Stabilization	The script uses a combined waiting time of 20 seconds after initial navigation, plus a 5-second buffer just before screenshot and text extraction, ensuring all dynamic dashboard components are fully loaded.
-Conditional Widget Filtering (_create_metric_widget)	Logic: A metric widget is only created if its value is not None, empty (""), the placeholder ("—"), or the literal hyphen ("-"). NPS metrics returning "NPS" (meaning data is missing) are also filtered out.
-Dynamic Section Filtering	The build_chat_card function iterates over the pre-defined sections and only includes a section in the final card if it contains at least one non-filtered metric widget.
-Custom Color Formatting	Performance status rules (G, R, O, BR) are translated into <font color='...'> HTML tags (Red: #FF0000, Amber: #FFA500) for visual flagging on the Chat Card text.
-B. scrape_complaints.py (Complaints)
-Feature	Logic Explanation
-State-Machine Parsing	The parse_complaints_from_lines function uses sequential logic based on expected line patterns (FOUND_DATE, FOUND_CASE, READING_DESC, READING_RESPONSE) to correctly group unstructured raw text lines into cohesive complaint records.
-Case Deduplication	New complaints are identified by comparing the extracted case_number against all entries in the persistent complaints_log.csv. Only unique, new cases are processed and sent.
-Alert Formatting	Each new complaint triggers an individual, richly formatted Google Chat Card, including truncated description and store response text for immediate review.
-C. scrape.py (NPS Comments)
-Feature	Logic Explanation
-Robust Parsing	The parse_comments_from_lines function uses a multi-step process that looks for DATE, STORE, and SCORE markers relative to the "Submission via:" line to ensure comments are correctly associated with their metadata, while filtering out common dashboard noise lines.
-Rate Limiting / Batching	New comments are capped at MAX_COMMENTS_PER_RUN and sent in batches of BATCH_SIZE (10 widgets per card) using the send_comments_batched_to_chat function to prevent API overload.
-Lock Management	The _acquire_lock function uses a physical scrape.lock file to prevent concurrent runs. It includes logic to clean up stale locks older than 20 minutes, ensuring a failed run does not permanently block the scheduler.
-4. GitHub Actions Workflow Logic
-The workflow is set up for high availability and efficient resource usage.
-Workflow Step	Logic Explanation
-Scheduling	Uses cron expressions to trigger the workflow multiple times a day. The 8:30 AM UTC run is specially flagged to execute the resource-intensive scrape_daily.py.
-Caching	Uses actions/cache to persist auth_state.json and the CSV logs (comments_log.csv, complaints_log.csv, etc.). Cache key structure ensures the most recent authentication state is always restored.
-Authentication Fallback	If the cache miss is complete, the workflow checks the AUTH_STATE_B64 secret to decode a base64 string directly to auth_state.json for a quick recovery.
-Conditional Runs	The script scrape_daily.py is executed only if the run originated from the daily schedule (if: steps.determine_run_type.outputs.IS_DAILY_REPORT == 'true'). All other runs are partial (NPS and Complaints only).
-Virtual Display	All Python executions use xvfb-run -a python.... This provides a necessary virtual X server environment for Playwright's Chromium browser, allowing it to run in a seemingly headed mode within a headless CI environment.
-Artifacts	Logs, screenshots (screens/), and state files are uploaded on completion (even on failure) for detailed post-mortem debugging.
+# 📖 Looker Studio Scraper Suite: Full Technical Manual
+
+This repository contains a multi-script, scheduled scraping solution designed to extract business-critical data from Google Looker Studio reports and deliver formatted, actionable alerts to Google Chat. It leverages headless browsing (Playwright) and AI-powered image analysis (Gemini Vision) to ensure robust data capture.
+
+## 1. Overview and Architecture
+
+### File Manifest
+
+| File | Role | Execution | Logic Focus |
+| :--- | :--- | :--- | :--- |
+| **`scrape_daily.py`** | **Daily Summary Report Generator** | Daily (8:30 AM UTC) | Gemini Vision for visual metrics, Conditional Card Filtering, Custom Color/Target Formatting. |
+| **`scrape.py`** | **NPS Comment Scraper** | Multiple Times Daily | 2FA Handling, Comment Parsing, Batched Chat Sending, Deduplication. |
+| **`scrape_complaints.py`** | **Customer Complaints Scraper** | Multiple Times Daily | State-Machine Parsing, Case Number Deduplication, Per-Complaint Card Alerting. |
+| **`.github/workflows/...`** | **GitHub Actions Workflow** | Scheduled / Manual | Caching, Authentication Fallback, Conditional Runs. |
+| **`auth_state.json`** | **Shared Resource** | Stores authenticated browser session cookie. | |
+| **`comments_log.csv`** | **Shared Resource** | Logs unique NPS comments. | |
+| **`complaints_log.csv`** | **Shared Resource** | Logs unique complaint case numbers. | |
+
+---
+
+## 2. Configuration: GitHub Secrets
+
+The system is configured entirely via **GitHub Secrets**. These secrets are injected into the runtime environment and stored in a temporary `config.ini` for the scripts.
+
+| Secret Name | Purpose & Script Usage |
+| :--- | :--- |
+| `GOOGLE_EMAIL` | The credential for accessing the Looker Studio reports. |
+| `GOOGLE_PASSWORD` | The password for the Google account (used only for re-login). |
+| `GEMINI_API_KEY` | **Critical for `scrape_daily.py`**. Provides access to the Gemini API for visual metric extraction. |
+| `MAIN_WEBHOOK` | Target URL for general alerts and batched NPS comments. |
+| `ALERT_WEBHOOK` | Target URL for high-priority alerts: login failures, 2FA codes, and critical script errors. |
+| `DAILY_WEBHOOK` | Target URL for the comprehensive daily summary card. |
+| `COMPLAINTS_WEBHOOK` | Target URL for new complaint notifications. |
+| `AUTH_STATE_B64` | **(Optional)** Base64-encoded string of a successful `auth_state.json` file for recovery. |
+
+---
+
+## 3. Manual Operational Guide: Initial Login & 2FA
+
+**The first successful run is a required manual process** to handle Google's 2FA and create the shared authenticated session file (`auth_state.json`).
+
+### Initial Authentication Procedure
+
+1.  **Set Secrets:** Verify all required credentials are set in GitHub Secrets.
+2.  **Trigger Login:** Navigate to the **Actions** tab, select the primary workflow, and click **Run workflow** (`workflow_dispatch`).
+3.  **Wait for Alert:** The `scrape.py` process will detect the need for 2FA and pause.
+4.  **2FA Intervention (Critical Step):**
+    *   The script uses screen-scraping logic to identify the verification number on the Google sign-in screen.
+    *   It sends an alert to the **`ALERT_WEBHOOK`** (e.g., `🔐 Tap this number on your phone: **42**`).
+    *   **Action Required:** You must immediately approve the sign-in request on your mobile device and tap the matching number.
+5.  **Completion:** Once approved, the session state is saved to `auth_state.json`, cached by the workflow, and used for all subsequent runs.
+
+---
+
+## 4. Deep Dive: Python Script Logic
+
+### A. `scrape_daily.py` (Retail Daily Summary)
+
+The focus is on accuracy through AI and clean output via filtering.
+
+| Feature | Logic Mechanism |
+| :--- | :--- |
+| **Gemini Vision Integration** | Metrics failing initial text parsing (`"—"`) and all items in `GEMINI_METRICS` (e.g., NPS dials, Payroll, Shrink) are sent with a full screenshot to **Gemini Pro Vision** for accurate visual data extraction. |
+| **Data Stabilization** | A mandatory **20-second wait** is executed after initial navigation, followed by a **5-second buffer** before taking the screenshot, ensuring dynamic content is fully rendered. |
+| **Conditional Widget Filtering** | The helper `_create_metric_widget` inspects the metric value. It returns `None` (and is thus excluded from the card) if the value is: `None`, empty (`""`), `"—"`, or the literal hyphen (`"-"`), or the placeholder `"NPS"`. |
+| **Dynamic Section Filtering** | The `build_chat_card` function only includes a section in the final output if that section's widget list is not empty, removing entire irrelevant blocks. |
+| **Custom Color Formatting** | Performance thresholds in `METRIC_TARGETS` are translated using an explicit `STATUS_FORMAT` mapping to the unofficial **`<font color='...'>`** HTML tag (Red: `#FF0000`, Amber: `#FFA500`) to visually flag deviations. |
+
+### B. `scrape_complaints.py` (Customer Complaints)
+
+| Feature | Logic Mechanism |
+| :--- | :--- |
+| **State-Machine Parsing** | `parse_complaints_from_lines` uses line-by-line sequential logic, progressing based on markers like `DATE_RE` and `CASE_NUM_RE`, to reconstruct unstructured data lines into complete, correctly grouped complaint records (Description, Response, Metadata). |
+| **Case Deduplication** | `read_existing_complaints` loads all historical `case_number`s from `complaints_log.csv` into a Python `set`. Only cases not present in this set are sent to Google Chat and appended to the log. |
+| **Lock Management** | Employs a physical `scrape.lock` file to prevent concurrent complaint scrapes. |
+
+### C. `scrape.py` (NPS Comments)
+
+| Feature | Logic Mechanism |
+| :--- | :--- |
+| **2FA Extraction** | The `wait_for_2fa_and_alert` function uses targeted regex and heuristic filtering (to ignore device model numbers like "14T") to reliably extract the 2- or 3-digit verification code from the screen text. |
+| **Batched Sending** | New comments are sent in batches (`BATCH_SIZE=10`) within the `_post_with_backoff` loop to respect Google Chat API rate limits. |
+| **Stale Lock Cleanup** | Includes checks to remove the `scrape.lock` file if it is older than `STALE_LOCK_MAX_AGE_S` (20 minutes), preventing a hard-fail from blocking the scheduler indefinitely. |
+
+---
+
+## 5. GitHub Actions Workflow (`.github/workflows/...`)
+
+The workflow ensures an organized, robust, and efficient schedule.
+
+| Component | Logic & Purpose |
+| :--- | :--- |
+| **Triggers** | **Scheduled (Cron):** Runs two types of jobs: Daily Full Run (`30 8 * * *`) and Hourly Partial Runs (e.g., `0 11,13...`). **Manual:** `workflow_dispatch` allows on-demand runs (always executes the Full Run). |
+| **Setup & Env** | Installs Python, Playwright, and `google-genai`. Exports all GitHub Secrets as environment variables (`$GITHUB_ENV`) for script access. |
+| **Caching** | Uses `actions/cache` on the shared state files (`auth_state.json`, `*log.csv`) across runs, minimizing re-login frequency and preserving data integrity. |
+| **Conditional Execution** | Uses the `determine_run_type` step to set the `IS_DAILY_REPORT` flag based on the schedule. The `scrape_daily.py` step is guarded by `if: steps.determine_run_type.outputs.IS_DAILY_REPORT == 'true'`. |
+| **Execution Command** | All Python scripts are run via `xvfb-run -a python...`. This is mandatory to provide the virtual display environment required by Playwright's Chromium browser when running on headless Linux runners. |
+| **Artifacts** | Logs, screenshots, and state files are uploaded on failure or success to the job artifacts for essential debugging and operational review. |
