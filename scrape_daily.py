@@ -90,7 +90,7 @@ ALERT_WEBHOOK = config["DEFAULT"].get("ALERT_WEBHOOK",  os.getenv("ALERT_WEBHOOK
 CI_RUN_URL    = os.getenv("CI_RUN_URL", "")
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Targets / Formatting (FIXED: Status mapping and lookup logic)
+# Targets / Formatting 
 # ──────────────────────────────────────────────────────────────────────────────
 # Target values and comparison rules for Google Chat Card formatting.
 # Rules: 'A>X G, A<Y R', 'A>X R', 'A<X R', 'A<X G, A>Y R', 
@@ -330,9 +330,13 @@ def _create_metric_widget(metrics: Dict[str, str], label: str, key: str, custom_
     
     # Special handling for FES metrics when they are compounded with "vs Target"
     if custom_val:
-        # Check the base metric's value for blankness, but use the custom_val if not blank.
-        # This is a good way to ensure a complex metric isn't shown if the core number is missing.
-        if is_blank:
+        # We need the base metric's value AND the vs_target's value to not be blank to show the complex widget
+        vs_target_key = f"{key}_vs_target"
+        val_vs = metrics.get(vs_target_key)
+        
+        is_complex_blank = is_blank or (val_vs is None or val_vs.strip() == "" or val_vs.strip() == "—")
+
+        if is_complex_blank:
             return None
         return {"decoratedText": {"topLabel": label, "text": custom_val}}
         
@@ -365,7 +369,6 @@ def build_chat_card(metrics: Dict[str, str]) -> dict:
             ("Key Complaints", "complaints_key"),
             ("Supermarket NPS", "supermarket_nps"),
             ("Colleague Happiness", "colleague_happiness"),
-            # Removed Home Delivery NPS based on recent card layout tweak
             ("Cafe NPS", "cafe_nps"),
             ("Click & Collect NPS", "click_collect_nps"),
             ("Customer Toilet NPS", "customer_toilet_nps"),
@@ -389,7 +392,7 @@ def build_chat_card(metrics: Dict[str, str]) -> dict:
             ("Markdowns", "markdowns_total"),
             ("Total", "wm_total"),
             ("+/−", "wm_delta"),
-            # Removed wm_delta_pct and replaced with Clean and rotate (weekly_activity is used for this)
+            # 'weekly_activity' is used for Clean and rotate
             ("Clean and rotate", "weekly_activity"),
         ]},
         {"title": "Payroll", "metrics": [
@@ -397,7 +400,6 @@ def build_chat_card(metrics: Dict[str, str]) -> dict:
             ("Absence Outturn", "absence_outturn"),
             ("Productive Outturn", "productive_outturn"),
             ("Holiday Outturn", "holiday_outturn"),
-            # Removed Current Base Cost
         ]},
         {"title": "Shrink", "metrics": [
             ("Morrisons Order Adjustments", "moa"),
@@ -408,8 +410,6 @@ def build_chat_card(metrics: Dict[str, str]) -> dict:
         {"title": "Production Plans", "metrics": [
             ("Data Provided", "data_provided"),
             ("Trusted Data", "trusted_data"),
-            # Retaining weekly_activity here as a temporary fix from previous logic
-            ("Weekly Activity %", "weekly_activity"),
         ]},
     ]
 
@@ -929,7 +929,7 @@ def run_daily_scrape():
                 alert(["⚠️ Daily scrape blocked by login or load failure — please re-login."])
                 return
 
-            # --- NEW: Final buffer wait to ensure all elements have stabilized ---
+            # --- Final buffer wait to ensure all elements have stabilized ---
             log.info("Adding 5s final buffer wait before screenshot and capture…")
             page.wait_for_timeout(5_000)
             
