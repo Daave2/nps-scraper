@@ -88,7 +88,7 @@ ALERT_WEBHOOK = config["DEFAULT"].get("ALERT_WEBHOOK",  os.getenv("ALERT_WEBHOOK
 CI_RUN_URL    = os.getenv("CI_RUN_URL", "")
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Targets / Formatting (UPDATED FOR COLOR)
+# Targets / Formatting (FIXED: Status mapping and lookup logic)
 # ──────────────────────────────────────────────────────────────────────────────
 # Target values and comparison rules for Google Chat Card formatting.
 # Format: (Target Value, Rule String)
@@ -141,6 +141,14 @@ STATUS_FORMAT = {
     "NONE":   ("", ""),                                 # No rule/data is plain text
 }
 
+# Mapping single-letter rule codes to full status keys for lookup
+STATUS_CODE_MAP = {
+    "G": "GREEN", 
+    "R": "RED", 
+    "O": "ORANGE", 
+    "BR": "BOLD_RED"
+}
+
 def _clean_numeric_value(val: str, is_time_min: bool = False) -> Optional[float]:
     """Converts a metric string (e.g., '3.43%', '£-8K', '4:30') to a comparable float."""
     if not val or val == "—":
@@ -190,7 +198,7 @@ def get_status_formatting(key: str, value: str) -> Tuple[str, str]:
     Returns: (prefix_html, suffix_html)
     """
     if key not in METRIC_TARGETS or value in [None, "—"]:
-        return (STATUS_FORMAT["NONE"][0], STATUS_FORMAT["NONE"][1])
+        return STATUS_FORMAT["NONE"] # Return tuple (prefix, suffix) directly
 
     _, rule_str = METRIC_TARGETS[key]
     is_time = "M" in rule_str # Flag for minute conversion
@@ -198,7 +206,7 @@ def get_status_formatting(key: str, value: str) -> Tuple[str, str]:
     # Clean the actual value
     comp_value = _clean_numeric_value(value, is_time_min=is_time)
     if comp_value is None:
-        return (STATUS_FORMAT["NONE"][0], STATUS_FORMAT["NONE"][1])
+        return STATUS_FORMAT["NONE"]
 
     # Parse the rule string (e.g., 'A>65 G, A<50 R')
     rules = [r.strip() for r in rule_str.split(',')]
@@ -220,22 +228,24 @@ def get_status_formatting(key: str, value: str) -> Tuple[str, str]:
                     is_match = True
                 
                 if is_match:
-                    return status.upper()
+                    return status.upper() # Returns single letter code (G, R, O, BR)
         return None
 
     # Process rules in a priority order: BOLD_RED > RED > ORANGE > GREEN
     priority_statuses = ["BR", "R", "O", "G"]
     
-    for status_code in priority_statuses:
+    for status_code_letter in priority_statuses:
         for rule in rules:
-            status = check_rule(rule, comp_value, is_time)
-            if status == status_code:
-                # Return the formatting for the highest priority status matched
-                prefix, suffix = STATUS_FORMAT[status]
-                return (prefix, suffix)
+            status_letter = check_rule(rule, comp_value, is_time)
+            if status_letter == status_code_letter:
+                # Look up the full status name from the code
+                full_status = STATUS_CODE_MAP.get(status_letter)
+                if full_status:
+                    # Return the formatting for the highest priority status matched
+                    return STATUS_FORMAT[full_status]
 
     # No rule match
-    return (STATUS_FORMAT["NONE"][0], STATUS_FORMAT["NONE"][1])
+    return STATUS_FORMAT["NONE"]
 
 def format_metric_value(key: str, value: str) -> str:
     """Applies status formatting (color/bold) to the metric value string."""
