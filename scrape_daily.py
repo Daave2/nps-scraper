@@ -8,6 +8,7 @@ Key points in this build:
 - Gemini Vision Integration: Uses Gemini Pro Vision for all difficult, visual-based metrics.
 - NEW: Target-based Chat Card formatting using **<font color='...'>** for visual distinction.
 - UPDATE: Increased waiting time for dashboard stability before capture.
+- NEW: Blank/missing metrics are now excluded from the Chat Card.
 """
 
 import os
@@ -301,7 +302,7 @@ def save_text(path: Path, text: str):
         pass
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Card + CSV
+# Card + CSV (UPDATED: Added conditional metric function and logic in build_chat_card)
 # ──────────────────────────────────────────────────────────────────────────────
 def kv(label: str, val: str, key: Optional[str] = None) -> dict:
     """Creates a decoratedText widget, optionally applying target-based formatting."""
@@ -312,58 +313,135 @@ def kv(label: str, val: str, key: Optional[str] = None) -> dict:
 def title_widget(text: str) -> dict:
     return {"textParagraph": {"text": f"<b>{text}</b>"}}
 
+def _create_metric_widget(metrics: Dict[str, str], label: str, key: str, custom_val: Optional[str] = None) -> Optional[dict]:
+    """
+    Creates a decoratedText widget if the metric's value is not blank.
+    
+    :param metrics: The dictionary of all metrics.
+    :param label: The label for the widget.
+    :param key: The key in the metrics dict (and in METRIC_TARGETS).
+    :param custom_val: Optional pre-formatted value (used for Scan Rate/Interventions with vs Target).
+    :return: The widget dictionary or None if the value is blank/missing.
+    """
+    val = metrics.get(key)
+    
+    # Check if the value is effectively blank
+    is_blank = (val is None or val.strip() == "" or val.strip() == "—")
+    
+    # Special handling for FES metrics when they are compounded with "vs Target"
+    if custom_val:
+        # Check the base metric's value for blankness, but use the custom_val if not blank.
+        # This is a good way to ensure a complex metric isn't shown if the core number is missing.
+        if is_blank:
+            return None
+        return {"decoratedText": {"topLabel": label, "text": custom_val}}
+        
+    if is_blank:
+        return None
+    
+    # Check for metrics that often return 'NPS' as the value (e.g., when the number itself is missing)
+    if val.upper() == "NPS":
+        return None
+
+    # Create the standard widget using the kv helper
+    return kv(label, val, key=key)
+
 def build_chat_card(metrics: Dict[str, str]) -> dict:
     header = {
         "title": "📊 Retail Daily Summary",
         "subtitle": (metrics.get("store_line") or "").replace("\n", "  "),
     }
-    sections = [
-        {"widgets": [kv("Report Time", metrics.get("page_timestamp","—")),
-                     kv("Period",      metrics.get("period_range","—"))]},
-        {"widgets": [title_widget("Sales & NPS"),
-                     kv("Sales Total", metrics.get("sales_total","—")),
-                     kv("LFL",         metrics.get("sales_lfl","—"), key="sales_lfl"),
-                     kv("vs Target",   metrics.get("sales_vs_target","—"), key="sales_vs_target"),
-                     kv("Key Complaints",  metrics.get("complaints_key","—"), key="complaints_key"),
-                     kv("Supermarket NPS",     metrics.get("supermarket_nps","—"), key="supermarket_nps"),
-                     kv("Colleague Happiness", metrics.get("colleague_happiness","—"), key="colleague_happiness"),
-                     kv("Cafe NPS",            metrics.get("cafe_nps","—"), key="cafe_nps"),
-                     kv("Click & Collect NPS", metrics.get("click_collect_nps","—"), key="click_collect_nps"),
-                     kv("Customer Toilet NPS", metrics.get("customer_toilet_nps","—"), key="customer_toilet_nps")]},
-        {"widgets": [title_widget("Front End"),
-                     kv("SCO Utilisation", metrics.get("sco_utilisation","—"), key="sco_utilisation"),
-                     kv("Efficiency",      metrics.get("efficiency","—"), key="efficiency"),
-                     # FES values are formatted internally within the f-string for the value part
-                     kv("Scan Rate",       f"{format_metric_value('scan_rate', metrics.get('scan_rate','—'))} (vs {metrics.get('scan_vs_target','—')})"),
-                     kv("Interventions",   f"{format_metric_value('interventions', metrics.get('interventions','—'))} (vs {metrics.get('interventions_vs_target','—')})"),
-                     kv("Mainbank Closed", f"{format_metric_value('mainbank_closed', metrics.get('mainbank_closed','—'))} (vs {metrics.get('mainbank_vs_target','—')})")]},
-                     kv("More card Swipe Rate",      metrics.get("swipe_rate","—"), key="swipe_rate"),
-                     kv("More card Swipes WOW %",    metrics.get("swipes_wow_pct","—")),
-        {"widgets": [title_widget("Online"),
-                     kv("C&C Availability",              metrics.get("availability_pct","—"), key="availability_pct"),
-                     kv("Click & Collect Wait",  metrics.get("cc_avg_wait","—"), key="cc_avg_wait")]},
-        {"widgets": [title_widget("Waste & Markdowns (Total)"),
-                     kv("Waste",     metrics.get("waste_total","—")),
-                     kv("Markdowns", metrics.get("markdowns_total","—")),
-                     kv("Total",     metrics.get("wm_total","—")),
-                     kv("+/−",       metrics.get("wm_delta","—")),
-                     kv("Clean and rotate",metrics.get("weekly_activity","—"))]},
-        {"widgets": [title_widget("Payroll"),
-                     kv("Payroll Outturn",    metrics.get("payroll_outturn","—"), key="payroll_outturn"),
-                     kv("Absence Outturn",    metrics.get("absence_outturn","—"), key="absence_outturn"),
-                     kv("Productive Outturn", metrics.get("productive_outturn","—"), key="productive_outturn"),
-                     kv("Holiday Outturn",    metrics.get("holiday_outturn","—"), key="holiday_outturn"),
-        {"widgets": [title_widget("Shrink"),
-                     kv("Morrisons Order Adjustments", metrics.get("moa","—")),
-                     kv("Waste Validation",            metrics.get("waste_validation","—")),
-                     kv("Unrecorded Waste %",          metrics.get("unrecorded_waste_pct","—")),
-                     kv("Shrink vs Budget %",          metrics.get("shrink_vs_budget_pct","—"), key="shrink_vs_budget_pct")]},
-        {"widgets": [title_widget("Production Plans"),
-                     kv("Data Provided",   metrics.get("data_provided","—")),
-                     kv("Trusted Data",    metrics.get("trusted_data","—"), key="trusted_data"),
-                     kv("Weekly Activity %",metrics.get("weekly_activity","—"))]},
+    
+    # Define the structure and metric keys for each section
+    section_data = [
+        {"title": None, "metrics": [
+            ("Report Time", "page_timestamp"),
+            ("Period", "period_range")
+        ]},
+        {"title": "Sales & NPS", "metrics": [
+            ("Sales Total", "sales_total"),
+            ("LFL", "sales_lfl"),
+            ("vs Target", "sales_vs_target"),
+            ("Key Complaints", "complaints_key"),
+            ("Supermarket NPS", "supermarket_nps"),
+            ("Colleague Happiness", "colleague_happiness"),
+            # Removed Home Delivery NPS based on recent card layout tweak
+            ("Cafe NPS", "cafe_nps"),
+            ("Click & Collect NPS", "click_collect_nps"),
+            ("Customer Toilet NPS", "customer_toilet_nps"),
+        ]},
+        {"title": "Front End", "metrics": [
+            ("SCO Utilisation", "sco_utilisation"),
+            ("Efficiency", "efficiency"),
+            # These FES metrics require custom assembly using the vs_target field
+            ("Scan Rate", "scan_rate", f"{format_metric_value('scan_rate', metrics.get('scan_rate','—'))} (vs {metrics.get('scan_vs_target','—')})"),
+            ("Interventions", "interventions", f"{format_metric_value('interventions', metrics.get('interventions','—'))} (vs {metrics.get('interventions_vs_target','—')})"),
+            ("Mainbank Closed", "mainbank_closed", f"{format_metric_value('mainbank_closed', metrics.get('mainbank_closed','—'))} (vs {metrics.get('mainbank_vs_target','—')})"),
+            ("More card Swipe Rate", "swipe_rate"),
+            ("More card Swipes WOW %", "swipes_wow_pct"),
+        ]},
+        {"title": "Online", "metrics": [
+            ("C&C Availability", "availability_pct"),
+            ("Click & Collect Wait", "cc_avg_wait"),
+        ]},
+        {"title": "Waste & Markdowns (Total)", "metrics": [
+            ("Waste", "waste_total"),
+            ("Markdowns", "markdowns_total"),
+            ("Total", "wm_total"),
+            ("+/−", "wm_delta"),
+            # Removed wm_delta_pct and replaced with Clean and rotate (weekly_activity is used for this)
+            ("Clean and rotate", "weekly_activity"),
+        ]},
+        {"title": "Payroll", "metrics": [
+            ("Payroll Outturn", "payroll_outturn"),
+            ("Absence Outturn", "absence_outturn"),
+            ("Productive Outturn", "productive_outturn"),
+            ("Holiday Outturn", "holiday_outturn"),
+            # Removed Current Base Cost
+        ]},
+        {"title": "Shrink", "metrics": [
+            ("Morrisons Order Adjustments", "moa"),
+            ("Waste Validation", "waste_validation"),
+            ("Unrecorded Waste %", "unrecorded_waste_pct"),
+            ("Shrink vs Budget %", "shrink_vs_budget_pct"),
+        ]},
+        {"title": "Production Plans", "metrics": [
+            ("Data Provided", "data_provided"),
+            ("Trusted Data", "trusted_data"),
+            # Retaining weekly_activity here as a temporary fix from previous logic
+            ("Weekly Activity %", "weekly_activity"),
+        ]},
     ]
-    return {"cardsV2": [{"cardId": f"daily_{int(time.time())}", "card": {"header": header, "sections": sections}}]}
+
+    final_sections = []
+    
+    # --- Process Sections ---
+    for section in section_data:
+        widgets = []
+        
+        # Build metric widgets, only adding if they are not blank
+        for metric_data in section["metrics"]:
+            label, key = metric_data[0], metric_data[1]
+            custom_val = metric_data[2] if len(metric_data) > 2 else None
+            
+            widget = _create_metric_widget(metrics, label, key, custom_val)
+            if widget:
+                widgets.append(widget)
+        
+        # Only create the section if there are metrics/widgets to display
+        if widgets:
+            section_dict = {"widgets": []}
+            
+            # Add title widget if specified
+            if section["title"]:
+                section_dict["widgets"].append(title_widget(section["title"]))
+            
+            # Add all non-title widgets
+            section_dict["widgets"].extend(widgets)
+            final_sections.append(section_dict)
+
+
+    return {"cardsV2": [{"cardId": f"daily_{int(time.time())}", "card": {"header": header, "sections": final_sections}}]}
 
 CSV_HEADERS = [
     "page_timestamp","period_range","store_line",
@@ -395,7 +473,7 @@ def send_card(metrics: Dict[str, str]) -> bool:
     return _post_with_backoff(MAIN_WEBHOOK, build_chat_card(metrics))
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Browser automation (UPDATED: Increased wait times)
+# Browser automation
 # ──────────────────────────────────────────────────────────────────────────────
 def click_this_week(page):
     try:
@@ -820,7 +898,7 @@ def parse_from_lines(lines: List[str]) -> Dict[str, str]:
     return m
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Main (UPDATED: Added extra wait before capture)
+# Main
 # ──────────────────────────────────────────────────────────────────────────────
 def run_daily_scrape():
     if not AUTH_STATE.exists():
