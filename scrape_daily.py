@@ -361,10 +361,12 @@ def build_chat_card(metrics: Dict[str, str]) -> dict:
         {"title": None, "metrics": [
             ("Period", "period_range")
         ]},
-        {"title": "Sales & NPS", "metrics": [
+        {"title": "Sales", "metrics": [
             ("Sales Total", "sales_total"),
             ("LFL", "sales_lfl"),
             ("vs Target", "sales_vs_target"),
+        ]},    
+        {"title": "Complaints & NPS", "metrics": [
             ("Key Complaints", "complaints_key"),
             ("Supermarket NPS", "supermarket_nps"),
             ("Colleague Happiness", "colleague_happiness"),
