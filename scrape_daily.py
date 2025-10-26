@@ -359,7 +359,6 @@ def build_chat_card(metrics: Dict[str, str]) -> dict:
     # Define the structure and metric keys for each section
     section_data = [
         {"title": None, "metrics": [
-            ("Report Time", "page_timestamp"),
             ("Period", "period_range")
         ]},
         {"title": "Sales & NPS", "metrics": [
