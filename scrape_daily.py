@@ -8,7 +8,7 @@ Key points in this build:
 - Gemini Vision Integration: Uses Gemini Pro Vision for all difficult, visual-based metrics.
 - NEW: Target-based Chat Card formatting using **<font color='...'>** for visual distinction.
 - UPDATE: Increased waiting time for dashboard stability before capture.
-- NEW: Blank/missing metrics are now excluded from the Chat Card.
+- NEW: Blank/missing metrics are now excluded from the Chat Card (FIXED: Explicitly checks for single hyphen '-').
 """
 
 import os
@@ -53,7 +53,7 @@ ROI_MAP_FILE   = Path(ENV_ROI_MAP) if ENV_ROI_MAP else (BASE_DIR / "roi_map.json
 DASHBOARD_URL = (
     "https://lookerstudio.google.com/embed/u/0/reporting/"
     "d93a03c7-25dc-439d-abaa-dd2f3780daa5/page/BLfDE"
-    "?params=%7B%22f20f0n9kld%22:%22include%25EE%2580%25803%25EE%2580%2580T%22%7D"
+    "?params=%7B%22f20f0n9kld%22:%22include%25EE%2580%25803%25EE%2580%2580T%2522%7D"
 )
 
 VIEWPORT = {"width": 1366, "height": 768}
@@ -302,7 +302,7 @@ def save_text(path: Path, text: str):
         pass
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Card + CSV (UPDATED: Added conditional metric function and logic in build_chat_card)
+# Card + CSV (Logic for metric filtering implemented here)
 # ──────────────────────────────────────────────────────────────────────────────
 def kv(label: str, val: str, key: Optional[str] = None) -> dict:
     """Creates a decoratedText widget, optionally applying target-based formatting."""
@@ -325,8 +325,8 @@ def _create_metric_widget(metrics: Dict[str, str], label: str, key: str, custom_
     """
     val = metrics.get(key)
     
-    # Check if the value is effectively blank
-    is_blank = (val is None or val.strip() == "" or val.strip() == "—")
+    # Check if the value is effectively blank - ADDED EXPLICIT CHECK FOR "-"
+    is_blank = (val is None or val.strip() == "" or val.strip() == "—" or val.strip() == "-")
     
     # Special handling for FES metrics when they are compounded with "vs Target"
     if custom_val:
@@ -334,7 +334,9 @@ def _create_metric_widget(metrics: Dict[str, str], label: str, key: str, custom_
         vs_target_key = f"{key}_vs_target"
         val_vs = metrics.get(vs_target_key)
         
-        is_complex_blank = is_blank or (val_vs is None or val_vs.strip() == "" or val_vs.strip() == "—")
+        # Check both the main value and the vs_target value
+        is_vs_blank = (val_vs is None or val_vs.strip() == "" or val_vs.strip() == "—" or val_vs.strip() == "-")
+        is_complex_blank = is_blank or is_vs_blank
 
         if is_complex_blank:
             return None
@@ -359,6 +361,7 @@ def build_chat_card(metrics: Dict[str, str]) -> dict:
     # Define the structure and metric keys for each section
     section_data = [
         {"title": None, "metrics": [
+            ("Report Time", "page_timestamp"), # Keeping Report Time here as a static context metric
             ("Period", "period_range")
         ]},
         {"title": "Sales", "metrics": [
@@ -373,6 +376,7 @@ def build_chat_card(metrics: Dict[str, str]) -> dict:
             ("Cafe NPS", "cafe_nps"),
             ("Click & Collect NPS", "click_collect_nps"),
             ("Customer Toilet NPS", "customer_toilet_nps"),
+            ("Home Delivery NPS", "home_delivery_nps"), 
         ]},
         {"title": "Front End", "metrics": [
             ("SCO Utilisation", "sco_utilisation"),
@@ -411,6 +415,7 @@ def build_chat_card(metrics: Dict[str, str]) -> dict:
         {"title": "Production Plans", "metrics": [
             ("Data Provided", "data_provided"),
             ("Trusted Data", "trusted_data"),
+            ("My Reports", "my_reports") 
         ]},
     ]
 
@@ -433,7 +438,7 @@ def build_chat_card(metrics: Dict[str, str]) -> dict:
         if widgets:
             section_dict = {"widgets": []}
             
-            # Add title widget if specified
+            # Add title widget if specified (or skip if no title and only generic widgets)
             if section["title"]:
                 section_dict["widgets"].append(title_widget(section["title"]))
             
