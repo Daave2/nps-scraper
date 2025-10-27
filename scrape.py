@@ -536,20 +536,40 @@ def run_scrape():
                 return
 
             if status == "OK":
-                # Dedupe + cap + send
-                seen = read_existing_comments()
-                new_comments = [c for c in comments if (c["store"], c["timestamp"], c["comment"]) not in seen]
+                # Deduplicate comments found within this single run, as the report
+                # shows the same comment in multiple sections (28-day vs 13-week).
+                unique_comments_in_run = []
+                seen_in_this_run = set()
+                for c in comments:
+                    # A unique comment is defined by its store, timestamp, and text
+                    comment_id = (c["store"], c["timestamp"], c["comment"])
+                    if comment_id not in seen_in_this_run:
+                        unique_comments_in_run.append(c)
+                        seen_in_this_run.add(comment_id)
+                
+                if len(comments) > len(unique_comments_in_run):
+                    logger.info(f"Deduplicated {len(comments) - len(unique_comments_in_run)} comments found in multiple report sections.")
+
+                # Now, use the deduplicated list to check against the persistent log
+                seen_in_log = read_existing_comments()
+                new_comments = [c for c in unique_comments_in_run if (c["store"], c["timestamp"], c["comment"]) not in seen_in_log]
+                
                 if not new_comments:
                     logger.info("No new comments to send.")
                     return
+                
                 capped = new_comments[:MAX_COMMENTS_PER_RUN]
                 leftover = max(0, len(new_comments) - len(capped))
+                
                 if leftover > 0:
                     logger.info(f"Rate safety: sending {len(capped)} now, deferring {leftover} later.")
+                
                 send_comments_batched_to_chat(capped)
                 append_new_comments(capped)
+                
                 if leftover > 0 and MAIN_WEBHOOK and "chat.googleapis.com" in MAIN_WEBHOOK:
                     _post_with_backoff(MAIN_WEBHOOK, {"text": f"ℹ️ {leftover} additional comments deferred to next runs (rate safety)."})
+                
                 logger.info("✅ Scrape complete.")
                 return
 
