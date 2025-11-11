@@ -8,6 +8,7 @@ Key points in this build:
 - CRITICAL UPDATE: Multi-page navigation (Wheel, NPS, Sales, Front End, Payroll) implemented.
 - Strategy: Capture initial wheel, click through relevant detail pages, run targeted 
   Gemini Vision extraction on each page, and combine results.
+- FIX: Modified open_and_prepare to handle GAS URL's iframe structure.
 """
 
 import os
@@ -142,11 +143,6 @@ STATUS_CODE_MAP = {
     "BR": "BOLD_RED"
 }
 
-# ... (omitted helper functions: _clean_numeric_value, get_status_formatting, format_metric_value) ...
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Helper Functions (Retained from previous steps, including fixes)
-# ──────────────────────────────────────────────────────────────────────────────
 def _clean_numeric_value(val: str, is_time_min: bool = False) -> Optional[float]:
     if not val or val == "—": return None
     val = str(val).strip().replace(',', '')
@@ -222,15 +218,12 @@ def _create_metric_widget(metrics: Dict[str, str], label: str, key: str, custom_
     if val.upper() == "NPS": return None
     return kv(label, val, key=key)
 
-# ... (omitted save_bytes, save_text, _post_with_backoff, alert functions) ...
-
 def build_chat_card(metrics: Dict[str, str]) -> dict:
     header = {
         "title": "📊 Retail Daily Summary",
         "subtitle": (metrics.get("store_line") or "").replace("\n", "  "),
     }
     
-    # Define the structure and metric keys for each section
     section_data = [
         {"title": None, "metrics": [
             ("Report Time", "page_timestamp"), 
@@ -253,7 +246,6 @@ def build_chat_card(metrics: Dict[str, str]) -> dict:
         {"title": "Front End", "metrics": [
             ("SCO Utilisation", "sco_utilisation"),
             ("Efficiency", "efficiency"),
-            # These FES metrics require custom assembly using the vs_target field
             ("Scan Rate", "scan_rate", f"{format_metric_value('scan_rate', metrics.get('scan_rate','—'))} (vs {metrics.get('scan_vs_target','—')})"),
             ("Interventions", "interventions", f"{format_metric_value('interventions', metrics.get('interventions','—'))} (vs {metrics.get('interventions_vs_target','—')})"),
             ("Mainbank Closed", "mainbank_closed", f"{format_metric_value('mainbank_closed', metrics.get('mainbank_closed','—'))} (vs {metrics.get('mainbank_vs_target','—')})"),
@@ -269,7 +261,6 @@ def build_chat_card(metrics: Dict[str, str]) -> dict:
             ("Markdowns", "markdowns_total"),
             ("Total", "wm_total"),
             ("+/−", "wm_delta"),
-            # 'weekly_activity' is used for Clean and rotate
             ("Clean and rotate", "weekly_activity"),
         ]},
         {"title": "Payroll", "metrics": [
@@ -407,10 +398,22 @@ def open_and_prepare(page) -> bool:
         log.warning("Redirected to login — auth state missing/invalid.")
         return False
     
-    if "script.google.com" in page.url:
-        log.info("GAS URL detected, waiting up to 30s for redirect/content load...")
-        page.wait_for_load_state("networkidle", timeout=30_000)
+    # --- FIX: Wait for the main content frame to load ---
+    log.info("Waiting for main sandboxFrame iframe to load...")
+    try:
+        # Wait for the main iframe to appear and load state to settle
+        iframe_locator = page.frame_locator("#sandboxFrame")
+        iframe_locator.locator("body").wait_for(state="attached", timeout=30000)
+        log.info("Iframe attached. Waiting for its 'networkidle' state.")
+        # This will wait for the content inside the iframe (the dashboard) to load
+        iframe_locator.wait_for_load_state("networkidle", timeout=45000) 
+    except PlaywrightTimeoutError as e:
+        log.error(f"Timeout waiting for iframe content to load: {e}")
+        return False
     
+    log.info("Iframe content loaded/idle.")
+    
+    # Now we operate on the loaded/stable page
     log.info("Waiting 20s for dynamic content…")
     page.wait_for_timeout(20_000)
 
@@ -495,7 +498,6 @@ def parse_context_from_lines(lines: List[str]) -> Dict[str, str]:
 # Main (UPDATED NAVIGATION FOR MULTI-PAGE EXTRACTION)
 # ──────────────────────────────────────────────────────────────────────────────
 def run_daily_scrape():
-    # ... (omitted initial setup and config checks) ...
     if not AUTH_STATE.exists():
         alert(["⚠️ Daily dashboard scrape needs login. Run `python scrape.py now` once to save auth_state.json."])
         log.error("auth_state.json not found.")
@@ -526,36 +528,9 @@ def run_daily_scrape():
             # Capture timestamp once for file naming
             ts = int(time.time())
             SCREENS_DIR.mkdir(parents=True, exist_ok=True)
-
-            # --- STEP 1: Capture and Extract Initial Wheel Data ---
-            log.info("Adding 5s final buffer wait before screenshot (Wheel)…")
-            page.wait_for_timeout(5_000)
-            
-            # 1a. Screenshot Wheel
-            screenshot_path_wheel = SCREENS_DIR / f"{ts}_wheel_page.png"
-            save_bytes(screenshot_path_wheel, page.screenshot(full_page=True, type="png"))
-            
-            # 1b. Extract Context (Time/Store)
-            body_text = page.inner_text("body")
-            lines = [ln.rstrip() for ln in body_text.splitlines()]
-            all_metrics.update(parse_context_from_lines(lines))
-            
-            # 1c. Extract Wheel Metrics (Initial Pass)
-            prompt_map_wheel = {
-                "Shrink": "shrink_wheel", "Retail Expenses": "retail_expenses", "Payroll": "payroll_outturn", 
-                "ISP": "isp", "Ambient WMD": "ambient_wmd", "Fresh WMD": "fresh_wmd", 
-                "Complaints": "complaints_key", "Safe & Legal": "safe_legal", 
-                "Taking to Plan": "taking_to_plan", "Take-up LFL": "sales_lfl", 
-                "NPS": "supermarket_nps", "Stock Record NPS": "stock_record"
-            }
-            system_inst_wheel = "Extract the main metric (number + unit/K/%) next to each label on the 'Retail Steering Wheel'. For items in parentheses like (2.3K) return the value as -2.3K."
-            wheel_metrics = _extract_gemini_vision(screenshot_path_wheel, prompt_map_wheel, system_inst_wheel)
-            all_metrics.update(wheel_metrics)
-
+            page_context = page # Start with the main page context (which now contains the iframe)
 
             # --- Multi-Page Extraction Setup ---
-            # Define which tabs to visit and what to extract from them
-            # Format: (Tab Name, Output File Suffix, {Label: Metric Key}, System Prompt)
             pages_to_extract = [
                 # NPS Detail Page
                 ("NPS", "nps_detail", {
@@ -587,35 +562,59 @@ def run_daily_scrape():
                     "Current Base Cost": "current_base_cost"
                 }, "Extract the numeric value (e.g., '753.6', '-1.4K') for the titled payroll outturn metrics."),
             ]
+
+            # --- STEP 1: Extract Initial Context (Wheel Page) ---
+            log.info("Capturing screenshot of the initial Wheel page...")
+            screenshot_path_wheel = SCREENS_DIR / f"{ts}_wheel_page.png"
+            # Screenshot the whole page, including the menu/footer context
+            save_bytes(screenshot_path_wheel, page.screenshot(full_page=True, type="png"))
             
+            # Extract Context (Time/Store) from the whole page body
+            body_text = page.inner_text("body")
+            lines = [ln.rstrip() for ln in body_text.splitlines()]
+            all_metrics.update(parse_context_from_lines(lines))
+            
+            # Extract Wheel Metrics (Initial Pass - only keys on the wheel)
+            prompt_map_wheel = {
+                "Shrink": "shrink_wheel", "Retail Expenses": "retail_expenses", "Payroll": "payroll_outturn", 
+                "ISP": "isp", "Ambient WMD": "ambient_wmd", "Fresh WMD": "fresh_wmd", 
+                "Complaints": "complaints_key", "Safe & Legal": "safe_legal", 
+                "Taking to Plan": "taking_to_plan", "Take-up LFL": "sales_lfl", 
+                "NPS": "supermarket_nps", "Stock Record NPS": "stock_record"
+            }
+            system_inst_wheel = "You are a hyper-accurate retail dashboard data extractor. Extract the main metric (number + unit/K/%) next to each label on the 'Retail Steering Wheel'. For items in parentheses like (2.3K) return the value as -2.3K."
+            wheel_metrics = _extract_gemini_vision(screenshot_path_wheel, prompt_map_wheel, system_inst_wheel)
+            all_metrics.update(wheel_metrics)
+
             # --- STEP 2: Iterate through detail pages ---
+            # We assume the navigation buttons/tabs are available on the main page.
             for tab_name, suffix, prompt_map, system_inst in pages_to_extract:
                 log.info(f"Navigating to {tab_name} Detail page…")
                 
-                # 2a. Click the tab
+                # 2a. Click the tab - Now using the robust locator
                 try:
-                    # Find the button/tab with role="button" and name matching the tab_name (case-insensitive)
+                    # Target the button/tab with role="button" and name matching the tab_name (case-insensitive)
                     page.get_by_role("button", name=re.compile(tab_name, re.IGNORECASE)).last.click(timeout=10000) 
                     page.wait_for_timeout(6000) # Wait for content transition and loading
                 except Exception as e:
                     log.warning(f"Failed to click {tab_name} tab. Skipping detail extraction for this page: {e}")
-                    continue # Skip to the next page in the loop
+                    continue 
 
                 # 2b. Screenshot Detail Page
                 log.info(f"Capturing screenshot for {tab_name} Detail…")
-                page.wait_for_timeout(3000) # Additional small buffer for stability
+                page.wait_for_timeout(3000) # Small buffer for stability
                 screenshot_path = SCREENS_DIR / f"{ts}_{suffix}.png"
+                # Screenshot the whole page again to capture the new content
                 save_bytes(screenshot_path, page.screenshot(full_page=True, type="png"))
                 
                 # 2c. Extract Metrics and Merge
                 page_metrics = _extract_gemini_vision(screenshot_path, prompt_map, system_inst)
                 
-                # Special handling: Prioritize detail metrics over wheel/initial metrics
+                # Merge: Detail page metrics overwrite initial wheel metrics if they use the same key
                 all_metrics.update(page_metrics)
 
 
             # --- STEP 3: Combine with default values for unextracted metrics ---
-            # Ensure all keys required for the final CSV/Card are present, even if with '—'
             metrics_to_default = [key for key in CSV_HEADERS if key not in all_metrics]
             
             for key in metrics_to_default:
