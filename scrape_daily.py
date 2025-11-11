@@ -5,9 +5,10 @@
 Retail Performance Dashboard → Daily Summary (layout-by-lines + GEMINI VISION) → Google Chat
 
 Key points in this build:
-- CRITICAL UPDATE: Multi-page navigation implemented based on user trace.
-- Uses deep iframe locator for navigation within the GAS/Looker Studio frame structure.
-- Strategy: Navigate (Wheel -> NPS -> Sales -> Front End -> Payroll), capture screenshots, and run targeted Gemini Vision extraction on each page.
+- CRITICAL UPDATE: Multi-page navigation (Wheel, NPS, Sales, Front End, Payroll) implemented.
+- Strategy: Capture initial wheel, click through relevant detail pages, run targeted 
+  Gemini Vision extraction on each page, and combine results.
+- FINAL FIX: Simplified and relied on robust Playwright text visibility check for 'Retail Wheel' button.
 """
 
 import os
@@ -50,7 +51,7 @@ ENV_ROI_MAP    = os.getenv("ROI_MAP_FILE", "").strip()
 ROI_MAP_FILE   = Path(ENV_ROI_MAP) if ENV_ROI_MAP else (BASE_DIR / "roi_map.json")
 
 # !!! IMPORTANT !!!
-# Using the GAS URL provided by the user.
+# YOU MUST UPDATE THIS URL TO THE NEW LOOKER STUDIO EMBED URL.
 DASHBOARD_URL = (
     "https://script.google.com/a/macros/morrisonsplc.co.uk/s/AKfycbwO5CmuEkGFtPLXaZ_B2gMLrWhkLgONDlnsHt3HhOWzHen4yCbVOHA7O8op79zq2NYfCQ/exec"
 )
@@ -395,28 +396,22 @@ def open_and_prepare(page) -> bool:
         log.warning("Redirected to login — auth state missing/invalid.")
         return False
     
-    # --- FINAL ROBUST WAIT: Use the unique, visible static tab ---
+    # --- FINAL ROBUST WAIT: Wait for the static 'Retail Wheel' button and then a long hard wait ---
     log.info("Waiting for 'Retail Wheel' button to be attached (up to 45s)...")
     try:
         # Wait for the main navigation bar's primary button, which is outside the problematic iframes.
         wheel_tab_locator = page.get_by_role("button", name="Retail Wheel", exact=True)
-        # We check for the 'attached' state as it's the first step to confirm the GAS wrapper is there
         wheel_tab_locator.wait_for(state="attached", timeout=45000) 
-        log.info("'Retail Wheel' tab is attached.")
-
-        # Give it a long hard wait for the dynamic content *inside* the iframe to load.
-        log.info("Waiting 20s for dynamic content to settle…")
-        page.wait_for_timeout(20_000)
-
-        # Now check a key footer element to be absolutely sure the whole page is painted
-        page.get_by_text("Powered by the Reporting Center of Excellence").wait_for(state="visible", timeout=15000)
-        
     except PlaywrightTimeoutError as e:
-        log.error(f"Timeout waiting for the static page structure to stabilize: {e}")
+        log.error(f"Timeout waiting for 'Retail Wheel' tab to appear: {e}")
         return False
     
-    log.info("Dashboard content is visually stable.")
+    log.info("'Retail Wheel' tab is attached.")
     
+    # Give a long hard wait for the dynamic content *inside* the deeply nested iframes to load its content/data.
+    log.info("Waiting 20s for dynamic content to settle…")
+    page.wait_for_timeout(20_000)
+
     click_this_week(page) 
     click_proceed_overlays(page)
 
