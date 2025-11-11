@@ -8,7 +8,7 @@ Key points in this build:
 - CRITICAL UPDATE: Multi-page navigation (Wheel, NPS, Sales, Front End, Payroll) implemented.
 - Strategy: Capture initial wheel, click through relevant detail pages, run targeted 
   Gemini Vision extraction on each page, and combine results.
-- FIX: Improved robustness of navigation by adding explicit wait-for-selector and increasing click timeout.
+- FIX: Modified open_and_prepare to handle GAS URL's iframe structure and ensure stability.
 """
 
 import os
@@ -396,21 +396,18 @@ def open_and_prepare(page) -> bool:
         log.warning("Redirected to login — auth state missing/invalid.")
         return False
     
-    # --- FIX: Wait for the main content frame to load ---
-    log.info("Waiting for main sandboxFrame iframe to load...")
+    # --- FIX: Generalized wait for the main dashboard content element ---
+    log.info("Waiting for main dashboard content to load/stabilize inside any frame...")
     try:
-        # Wait for the main iframe to appear and load state to settle
-        # Using a direct locator for the frame's content to check load state
-        iframe_locator = page.frame_locator("#sandboxFrame").frame_locator("#content-frame") # Target the innermost dashboard iframe
-        iframe_locator.locator("body").wait_for(state="attached", timeout=30000)
-        log.info("Dashboard iframe content attached. Waiting for its 'networkidle' state.")
-        # This will wait for the content inside the iframe (the dashboard) to load
-        iframe_locator.wait_for_load_state("networkidle", timeout=45000) 
+        # Wait for the main wheel SVG element or its wrapper to be visible/attached
+        # This element only exists once the inner dashboard has loaded.
+        wheel_locator = page.locator("#steering-wheel-svg-wrapper")
+        wheel_locator.wait_for(state="attached", timeout=45000) # Wait up to 45s for the wheel to appear
     except PlaywrightTimeoutError as e:
-        log.error(f"Timeout waiting for iframe content to load: {e}")
+        log.error(f"Timeout waiting for the main dashboard element (#steering-wheel-svg-wrapper) to appear: {e}")
         return False
     
-    log.info("Dashboard iframe content loaded/idle.")
+    log.info("Main dashboard element (#steering-wheel-svg-wrapper) is attached.")
     
     # Now we operate on the stable page
     log.info("Waiting 20s for dynamic content…")
@@ -527,7 +524,28 @@ def run_daily_scrape():
             # Capture timestamp once for file naming
             ts = int(time.time())
             SCREENS_DIR.mkdir(parents=True, exist_ok=True)
-            page_context = page # Start with the main page context (which now contains the iframe)
+            
+            # --- STEP 1: Extract Initial Context (Wheel Page) ---
+            log.info("Capturing screenshot of the initial Wheel page...")
+            screenshot_path_wheel = SCREENS_DIR / f"{ts}_wheel_page.png"
+            save_bytes(screenshot_path_wheel, page.screenshot(full_page=True, type="png"))
+            
+            # Extract Context (Time/Store) from the whole page body
+            body_text = page.inner_text("body")
+            lines = [ln.rstrip() for ln in body_text.splitlines()]
+            all_metrics.update(parse_context_from_lines(lines))
+            
+            # Extract Wheel Metrics (Initial Pass - only keys on the wheel)
+            prompt_map_wheel = {
+                "Shrink": "shrink_wheel", "Retail Expenses": "retail_expenses", "Payroll": "payroll_outturn", 
+                "ISP": "isp", "Ambient WMD": "ambient_wmd", "Fresh WMD": "fresh_wmd", 
+                "Complaints": "complaints_key", "Safe & Legal": "safe_legal", 
+                "Taking to Plan": "taking_to_plan", "Take-up LFL": "sales_lfl", 
+                "NPS": "supermarket_nps", "Stock Record NPS": "stock_record"
+            }
+            system_inst_wheel = "You are a hyper-accurate retail dashboard data extractor. Extract the main metric (number + unit/K/%) next to each label on the 'Retail Steering Wheel'. For items in parentheses like (2.3K) return the value as -2.3K."
+            wheel_metrics = _extract_gemini_vision(screenshot_path_wheel, prompt_map_wheel, system_inst_wheel)
+            all_metrics.update(wheel_metrics)
 
             # --- Multi-Page Extraction Setup ---
             pages_to_extract = [
@@ -562,38 +580,15 @@ def run_daily_scrape():
                 }, "Extract the numeric value (e.g., '753.6', '-1.4K') for the titled payroll outturn metrics."),
             ]
 
-            # --- STEP 1: Extract Initial Context (Wheel Page) ---
-            log.info("Capturing screenshot of the initial Wheel page...")
-            screenshot_path_wheel = SCREENS_DIR / f"{ts}_wheel_page.png"
-            save_bytes(screenshot_path_wheel, page.screenshot(full_page=True, type="png"))
-            
-            # Extract Context (Time/Store) from the whole page body
-            body_text = page.inner_text("body")
-            lines = [ln.rstrip() for ln in body_text.splitlines()]
-            all_metrics.update(parse_context_from_lines(lines))
-            
-            # Extract Wheel Metrics (Initial Pass - only keys on the wheel)
-            prompt_map_wheel = {
-                "Shrink": "shrink_wheel", "Retail Expenses": "retail_expenses", "Payroll": "payroll_outturn", 
-                "ISP": "isp", "Ambient WMD": "ambient_wmd", "Fresh WMD": "fresh_wmd", 
-                "Complaints": "complaints_key", "Safe & Legal": "safe_legal", 
-                "Taking to Plan": "taking_to_plan", "Take-up LFL": "sales_lfl", 
-                "NPS": "supermarket_nps", "Stock Record NPS": "stock_record"
-            }
-            system_inst_wheel = "You are a hyper-accurate retail dashboard data extractor. Extract the main metric (number + unit/K/%) next to each label on the 'Retail Steering Wheel'. For items in parentheses like (2.3K) return the value as -2.3K."
-            wheel_metrics = _extract_gemini_vision(screenshot_path_wheel, prompt_map_wheel, system_inst_wheel)
-            all_metrics.update(wheel_metrics)
-
             # --- STEP 2: Iterate through detail pages ---
             for tab_name, suffix, prompt_map, system_inst in pages_to_extract:
                 log.info(f"Navigating to {tab_name} Detail page…")
                 
-                # 2a. Click the tab - Now using robust wait-for and increased click timeout
+                # 2a. Click the tab - Now using the robust locator and increased timeout
                 try:
-                    # Wait for the element to be visible before clicking
                     tab_locator = page.get_by_role("button", name=re.compile(tab_name, re.IGNORECASE)).last
-                    tab_locator.wait_for(state="visible", timeout=15000) # Wait up to 15s for the tab button
-                    tab_locator.click(timeout=10000) # Click with 10s timeout
+                    tab_locator.wait_for(state="visible", timeout=15000) 
+                    tab_locator.click(timeout=15000) 
                     page.wait_for_timeout(6000) # Wait for content transition and loading
                 except Exception as e:
                     log.warning(f"Failed to click {tab_name} tab. Skipping detail extraction for this page: {e}")
