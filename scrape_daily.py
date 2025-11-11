@@ -50,11 +50,16 @@ SCREENS_DIR    = BASE_DIR / "screens"
 ENV_ROI_MAP    = os.getenv("ROI_MAP_FILE", "").strip()
 ROI_MAP_FILE   = Path(ENV_ROI_MAP) if ENV_ROI_MAP else (BASE_DIR / "roi_map.json")
 
-# Using the old Looker Studio embed URL as a starting point. If the old
-# auth_state.json works, it should load the correct dashboard content.
+# !!! IMPORTANT !!!
+# YOU MUST UPDATE THIS URL TO THE NEW LOOKER STUDIO EMBED URL.
+# The GAS link provided (https://script.google.com/...) is unlikely to work
+# directly with the existing Playwright authentication state.
 DASHBOARD_URL = (
-    "https://script.google.com/a/macros/morrisonsplc.co.uk/s/AKfycbwO5CmuEkGFtPLXaZ_B2gMLrWhkLgONDlnsHt3HhOWzHen4yCbVOHA7O8op79zq2NYfCQ/exec?authuser=1"
+    "https://lookerstudio.google.com/embed/u/0/reporting/"
+    "d93a03c7-25dc-439d-abaa-dd2f3780daa5/page/BLfDE"
+    "?params=%7B%22f20f0n9kld%22:%22include%25EE%2580%25803%25EE%2580%2580T%2522%7D"
 )
+# !!! IMPORTANT !!!
 
 VIEWPORT = {"width": 1366, "height": 768}
 
@@ -103,7 +108,7 @@ ALERT_WEBHOOK = config["DEFAULT"].get("ALERT_WEBHOOK",  os.getenv("ALERT_WEBHOOK
 CI_RUN_URL    = os.getenv("CI_RUN_URL", "")
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Targets / Formatting (Unmodified)
+# Targets / Formatting 
 # ──────────────────────────────────────────────────────────────────────────────
 # Target values and comparison rules for Google Chat Card formatting.
 # Rules: 'A>X G, A<Y R', 'A>X R', 'A<X R', 'A<X G, A>Y R', 
@@ -163,13 +168,6 @@ STATUS_CODE_MAP = {
     "BR": "BOLD_RED"
 }
 
-# ... (rest of the metric parsing/formatting helpers remain the same) ...
-# (omitted for brevity, assume they are present and correct)
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Helper Functions (Retained from previous steps, including fixes)
-# ──────────────────────────────────────────────────────────────────────────────
-
 def _clean_numeric_value(val: str, is_time_min: bool = False) -> Optional[float]:
     """Converts a metric string (e.g., '3.43%', '£-8K', '4:30') to a comparable float."""
     if not val or val == "—":
@@ -219,18 +217,22 @@ def get_status_formatting(key: str, value: str) -> Tuple[str, str]:
     Returns: (prefix_html, suffix_html)
     """
     if key not in METRIC_TARGETS or value in [None, "—"]:
-        return STATUS_FORMAT["NONE"]
+        return STATUS_FORMAT["NONE"] # Return tuple (prefix, suffix) directly
 
     _, rule_str = METRIC_TARGETS[key]
-    is_time = "M" in rule_str
+    is_time = "M" in rule_str # Flag for minute conversion
 
+    # Clean the actual value
     comp_value = _clean_numeric_value(value, is_time_min=is_time)
     if comp_value is None:
         return STATUS_FORMAT["NONE"]
 
+    # Parse the rule string (e.g., 'A>65 G, A<50 R')
     rules = [r.strip() for r in rule_str.split(',')]
     
+    # Function to check a single rule segment
     def check_rule(rule_segment, value, is_time):
+        # Matches patterns like 'A>2 BR', 'A<-2K R', 'A<4.5M G'
         m = re.match(r"A([<>])(-?[\d.]+)([KMB%]?|[M])?\s*(R|G|O|BR)", rule_segment, re.I)
         if m:
             op, str_val, unit, status = m.groups()
@@ -245,19 +247,23 @@ def get_status_formatting(key: str, value: str) -> Tuple[str, str]:
                     is_match = True
                 
                 if is_match:
-                    return status.upper()
+                    return status.upper() # Returns single letter code (G, R, O, BR)
         return None
 
+    # Process rules in a priority order: BOLD_RED > RED > ORANGE > GREEN
     priority_statuses = ["BR", "R", "O", "G"]
     
     for status_code_letter in priority_statuses:
         for rule in rules:
             status_letter = check_rule(rule, comp_value, is_time)
             if status_letter == status_code_letter:
+                # Look up the full status name from the code
                 full_status = STATUS_CODE_MAP.get(status_letter)
                 if full_status:
+                    # Return the formatting for the highest priority status matched
                     return STATUS_FORMAT[full_status]
 
+    # No rule match
     return STATUS_FORMAT["NONE"]
 
 def format_metric_value(key: str, value: str) -> str:
@@ -266,8 +272,59 @@ def format_metric_value(key: str, value: str) -> str:
     return f"{prefix}{value}{suffix}"
 
 
+# ──────────────────────────────────────────────────────────────────────────────
+# Helpers: Chat + file saves
+# ──────────────────────────────────────────────────────────────────────────────
+def _post_with_backoff(url: str, payload: dict) -> bool:
+    backoff, max_backoff = 2.0, 30.0
+    while True:
+        try:
+            r = requests.post(url, json=payload, timeout=25)
+            if r.status_code == 200:
+                return True
+            if r.status_code == 429:
+                delay = min(float(r.headers.get("Retry-After") or backoff), max_backoff)
+                log.error(f"429 from webhook — sleeping {delay:.1f}s")
+                time.sleep(delay)
+                backoff = min(backoff * 1.7, max_backoff)
+                continue
+            log.error(f"Webhook error {r.status_code}: {r.text[:300]}")
+            return False
+        except Exception as e:
+            log.error(f"Webhook exception: {e}")
+            time.sleep(backoff)
+            backoff = min(backoff * 1.7, max_backoff)
+
+def alert(lines: List[str]):
+    if not ALERT_WEBHOOK or "chat.googleapis.com" not in ALERT_WEBHOOK:
+        log.warning("No valid ALERT_WEBHOOK configured.")
+        return
+    if CI_RUN_URL:
+        lines.append(f"• CI run: {CI_RUN_URL}")
+    _post_with_backoff(ALERT_WEBHOOK, {"text": "\n".join(lines)})
+
+def save_bytes(path: Path, data: bytes):
+    try:
+        SCREENS_DIR.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(data)
+        log.info(f"Saved {path.name}")
+    except Exception:
+        pass
+
+def save_text(path: Path, text: str):
+    try:
+        SCREENS_DIR.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
+        log.info(f"Saved {path.name}")
+    except Exception:
+        pass
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Card + CSV (Logic for metric filtering implemented here)
+# ──────────────────────────────────────────────────────────────────────────────
 def kv(label: str, val: str, key: Optional[str] = None) -> dict:
     """Creates a decoratedText widget, optionally applying target-based formatting."""
+    # Apply color/bolding if the metric key is provided and a rule is matched
     formatted_val = format_metric_value(key, val) if key else (val or "—")
     return {"decoratedText": {"topLabel": label, "text": formatted_val}}
 
@@ -277,6 +334,12 @@ def title_widget(text: str) -> dict:
 def _create_metric_widget(metrics: Dict[str, str], label: str, key: str, custom_val: Optional[str] = None) -> Optional[dict]:
     """
     Creates a decoratedText widget if the metric's value is not blank.
+    
+    :param metrics: The dictionary of all metrics.
+    :param label: The label for the widget.
+    :param key: The key in the metrics dict (and in METRIC_TARGETS).
+    :param custom_val: Optional pre-formatted value (used for Scan Rate/Interventions with vs Target).
+    :return: The widget dictionary or None if the value is blank/missing.
     """
     val = metrics.get(key)
     
@@ -285,9 +348,11 @@ def _create_metric_widget(metrics: Dict[str, str], label: str, key: str, custom_
     
     # Special handling for FES metrics when they are compounded with "vs Target"
     if custom_val:
+        # We need the base metric's value AND the vs_target's value to not be blank to show the complex widget
         vs_target_key = f"{key}_vs_target"
         val_vs = metrics.get(vs_target_key)
         
+        # Check both the main value and the vs_target value
         is_vs_blank = (val_vs is None or val_vs.strip() == "" or val_vs.strip() == "—" or val_vs.strip() == "-")
         is_complex_blank = is_blank or is_vs_blank
 
@@ -305,153 +370,6 @@ def _create_metric_widget(metrics: Dict[str, str], label: str, key: str, custom_
     # Create the standard widget using the kv helper
     return kv(label, val, key=key)
 
-# ... (omitted save_bytes, save_text, _post_with_backoff, alert functions) ...
-
-# ──────────────────────────────────────────────────────────────────────────────
-# NEW GEMINI EXTRACTOR FOR NAVIGATION-BASED DASHBOARD
-# ──────────────────────────────────────────────────────────────────────────────
-
-def _extract_gemini_vision(image_path: Path, prompt_map: Dict[str, str], system_instruction: str) -> Dict[str, str]:
-    """Generic function to call Gemini Vision for a set of fields."""
-    if not GEMINI_AVAILABLE or not GEMINI_API_KEY:
-        log.warning("Gemini API not available or key missing. Skipping AI extraction.")
-        return {}
-
-    if not image_path.exists():
-        log.error(f"Image not found at {image_path}. Cannot perform vision extraction.")
-        return {}
-
-    client = genai.Client(api_key=GEMINI_API_KEY)
-    img = Image.open(image_path)
-    
-    user_prompt = (
-        f"{system_instruction.strip()} Analyze the image and return the exact values for "
-        f"the following metrics as a single JSON object. For percentages, include '%'. "
-        f"Metrics to extract: {list(prompt_map.keys())}"
-    )
-
-    try:
-        response = client.models.generate_content(
-            model='gemini-2.5-flash',
-            contents=[img, user_prompt],
-            config=types.GenerateContentConfig(
-                response_mime_type="application/json",
-                response_schema=types.Schema(
-                    type=types.Type.OBJECT,
-                    properties={v: types.Schema(type=types.Type.STRING) for v in prompt_map.keys()}
-                )
-            )
-        )
-        
-        ai_data = json.loads(response.text)
-        
-        extracted = {}
-        for ai_key, ai_val in ai_data.items():
-            python_key = prompt_map.get(ai_key)
-            if python_key and ai_val is not None:
-                extracted[python_key] = str(ai_val).strip()
-                log.info(f"Gemini Success: {python_key} -> {extracted[python_key]}")
-        
-        return extracted
-
-    except Exception as e:
-        log.error(f"Gemini Vision API Error for {list(prompt_map.keys())}: {e}")
-        return {}
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Browser automation (UPDATED: Added navigation steps)
-# ──────────────────────────────────────────────────────────────────────────────
-
-# ... (click_this_week, click_proceed_overlays functions remain the same) ...
-def click_this_week(page):
-    try:
-        el = page.get_by_role("button", name=re.compile(r"^This Week$", re.I))
-        if el.count():
-            el.first.click(timeout=2000)
-            page.wait_for_timeout(600)
-            return True
-    except Exception:
-        pass
-    try:
-        el = page.get_by_text(re.compile(r"^\s*This Week\s*$", re.I))
-        if el.count():
-            el.first.click(timeout=2000)
-            page.wait_for_timeout(600)
-            return True
-    except Exception:
-        pass
-    return False
-
-def click_proceed_overlays(page) -> int:
-    clicked = 0
-    for fr in page.frames:
-        try:
-            btn = fr.get_by_text("PROCEED", exact=True)
-            for i in range(btn.count()):
-                try{
-                    btn.nth(i).click(timeout=1200)
-                    clicked += 1
-                    fr.wait_for_timeout(300)
-                except Exception:
-                    continue
-        except Exception:
-            continue
-    if clicked:
-        log.info(f"Clicked {clicked} 'PROCEED' overlay(s). Waiting for render…")
-        page.wait_for_timeout(1200)
-    return clicked
-
-def open_and_prepare(page) -> bool:
-    log.info("Opening Retail Performance Dashboard…")
-    try:
-        page.goto(DASHBOARD_URL, wait_until="domcontentloaded", timeout=120_000)
-    except PlaywrightTimeoutError:
-        log.error("Timeout loading dashboard.")
-        return False
-
-    if "accounts.google.com" in page.url:
-        log.warning("Redirected to login — auth state missing/invalid.")
-        return False
-
-    # INCREASED WAIT: Gave 12s, now giving 20s for general content load
-    log.info("Waiting 20s for dynamic content…")
-    page.wait_for_timeout(20_000)
-
-    click_this_week(page)
-    click_proceed_overlays(page)
-
-    try:
-        body = page.inner_text("body")
-    except Exception:
-        body = ""
-    if "You are about to interact with a community visualisation" in body:
-        log.info("Community visualisation placeholders detected — retrying PROCEED and waiting longer.")
-        click_proceed_overlays(page)
-        page.wait_for_timeout(1500)
-
-    return True
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Main Parser (Drastically simplified to only handle context)
-# ──────────────────────────────────────────────────────────────────────────────
-# (Keeping only required helper regex for context data)
-EMAILLOC = re.compile(r"([A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}).*?\|\s*([^\|]+?)\s*\|\s*(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})", re.S)
-PERIOD_RE= re.compile(r"The data on this report is from:\s*([^\n]+)")
-STAMP_RE = re.compile(r"\b(\d{1,2}\s+[A-Za-z]{3}\s+\d{4},\s*\d{2}:\d{2}:\d{2})\b")
-
-def parse_context_from_lines(lines: List[str]) -> Dict[str, str]:
-    m: Dict[str, str] = {}
-    joined = "\n".join(lines)
-    z = EMAILLOC.search(joined); m["store_line"]    = z.group(0).strip() if z else ""
-    y = PERIOD_RE.search(joined); m["period_range"] = y.group(1).strip() if y else "—"
-    x = STAMP_RE.search(joined);  m["page_timestamp"]= x.group(1) if x else "—"
-    return m
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Card + CSV (Retained from previous steps, relies on final metrics dict)
-# ──────────────────────────────────────────────────────────────────────────────
-
 def build_chat_card(metrics: Dict[str, str]) -> dict:
     header = {
         "title": "📊 Retail Daily Summary",
@@ -461,7 +379,7 @@ def build_chat_card(metrics: Dict[str, str]) -> dict:
     # Define the structure and metric keys for each section
     section_data = [
         {"title": None, "metrics": [
-            ("Report Time", "page_timestamp"), 
+            ("Report Time", "page_timestamp"), # Keeping Report Time here as a static context metric
             ("Period", "period_range")
         ]},
         {"title": "Sales", "metrics": [
@@ -549,6 +467,28 @@ def build_chat_card(metrics: Dict[str, str]) -> dict:
 
     return {"cardsV2": [{"cardId": f"daily_{int(time.time())}", "card": {"header": header, "sections": final_sections}}]}
 
+CSV_HEADERS = [
+    "page_timestamp","period_range","store_line",
+    "sales_total","sales_lfl","sales_vs_target",
+    "supermarket_nps","colleague_happiness","home_delivery_nps","cafe_nps","click_collect_nps","customer_toilet_nps",
+    "sco_utilisation","efficiency","scan_rate","scan_vs_target","interventions","interventions_vs_target",
+    "mainbank_closed","mainbank_vs_target",
+    "availability_pct","despatched_on_time","delivered_on_time","cc_avg_wait",
+    "waste_total","markdowns_total","wm_total","wm_delta","wm_delta_pct",
+    "moa","waste_validation","unrecorded_waste_pct","shrink_vs_budget_pct",
+    "payroll_outturn","absence_outturn","productive_outturn","holiday_outturn","current_base_cost",
+    "swipe_rate","swipes_wow_pct","new_customers","swipes_yoy_pct",
+    "complaints_key","data_provided","trusted_data","my_reports","weekly_activity",
+]
+
+def write_csv(metrics: Dict[str,str]):
+    write_header = not DAILY_LOG_CSV.exists() or DAILY_LOG_CSV.stat().st_size == 0
+    with open(DAILY_LOG_CSV, "a", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        if write_header:
+            w.writerow(CSV_HEADERS)
+        w.writerow([metrics.get(h, "—") for h in CSV_HEADERS])
+    log.info(f"Appended daily metrics row to {DAILY_LOG_CSV.name}")
 
 def send_card(metrics: Dict[str, str]) -> bool:
     if not MAIN_WEBHOOK or "chat.googleapis.com" not in MAIN_WEBHOOK:
@@ -556,13 +496,189 @@ def send_card(metrics: Dict[str, str]) -> bool:
         return False
     return _post_with_backoff(MAIN_WEBHOOK, build_chat_card(metrics))
 
-# ... (omitted CSV_HEADERS, write_csv function) ...
+# ──────────────────────────────────────────────────────────────────────────────
+# Browser automation
+# ──────────────────────────────────────────────────────────────────────────────
+def click_this_week(page):
+    try:
+        el = page.get_by_role("button", name=re.compile(r"^This Week$", re.I))
+        if el.count():
+            el.first.click(timeout=2000)
+            page.wait_for_timeout(600)
+            return True
+    except Exception:
+        pass
+    try:
+        el = page.get_by_text(re.compile(r"^\s*This Week\s*$", re.I))
+        if el.count():
+            el.first.click(timeout=2000)
+            page.wait_for_timeout(600)
+            return True
+    except Exception:
+        pass
+    return False
+
+def click_proceed_overlays(page) -> int:
+    clicked = 0
+    for fr in page.frames:
+        try:
+            btn = fr.get_by_text("PROCEED", exact=True)
+            for i in range(btn.count()):
+                try:
+                    btn.nth(i).click(timeout=1200)
+                    clicked += 1
+                    fr.wait_for_timeout(300)
+                except Exception:
+                    continue
+        except Exception:
+            continue
+    if clicked:
+        log.info(f"Clicked {clicked} 'PROCEED' overlay(s). Waiting for render…")
+        page.wait_for_timeout(1200)
+    return clicked
+
+def open_and_prepare(page) -> bool:
+    log.info("Opening Retail Performance Dashboard…")
+    try:
+        page.goto(DASHBOARD_URL, wait_until="domcontentloaded", timeout=120_000)
+    except PlaywrightTimeoutError:
+        log.error("Timeout loading dashboard.")
+        return False
+
+    if "accounts.google.com" in page.url:
+        log.warning("Redirected to login — auth state missing/invalid.")
+        return False
+
+    # INCREASED WAIT: Gave 12s, now giving 20s for general content load
+    log.info("Waiting 20s for dynamic content…")
+    page.wait_for_timeout(20_000)
+
+    click_this_week(page)
+    click_proceed_overlays(page)
+
+    try:
+        body = page.inner_text("body")
+    except Exception:
+        body = ""
+    if "You are about to interact with a community visualisation" in body:
+        log.info("Community visualisation placeholders detected — retrying PROCEED and waiting longer.")
+        click_proceed_overlays(page)
+        page.wait_for_timeout(1500)
+
+    return True
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Text parsing (Unmodified)
+# ──────────────────────────────────────────────────────────────────────────────
+NUM_ANY_RE   = re.compile(r"[£]?-?\d+(?:\.\d+)?(?:[KMB]|%)?", re.I)
+NUM_INT_RE   = re.compile(r"\b-?\d+\b")
+NUM_PCT_RE   = re.compile(r"-?\d+(?:\.\d+)?%")
+# allow both "£-8K" and "-£8K"
+NUM_MONEY_RE = re.compile(r"(?:-?\s*£|£\s*-?)\s*\d+(?:\.\d+)?[KMB]?", re.I)
+TIME_RE      = re.compile(r"\b\d{1,2}:\d{2}\b")
+
+# ... (omitted helper functions for old text parsing which is no longer used for metrics) ...
+
+def get_body_text(page) -> str:
+    best, best_len = "", 0
+    try:
+        t = page.inner_text("body")
+        if t and len(t) > best_len:
+            best, best_len = t, len(t)
+    except Exception:
+        pass
+    for fr in page.frames:
+        try:
+            fr.wait_for_selector("body", timeout=3000)
+            t = fr.locator("body").inner_text(timeout=5000)
+            if t and len(t) > best_len:
+                best, best_len = t, len(t)
+        except Exception:
+            continue
+    return best
+
+def dump_numbered_lines(txt: str) -> List[str]:
+    lines = [ln.rstrip() for ln in txt.splitlines()]
+    ts = int(time.time())
+    numbered = "\n".join(f"{i:04d} | {ln}" for i, ln in enumerate(lines))
+    save_text(SCREENS_DIR / f"{ts}_lines.txt", numbered)
+    return lines
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Gemini Vision Extraction (Combined Logic)
+# ──────────────────────────────────────────────────────────────────────────────
+def _extract_gemini_vision(image_path: Path, prompt_map: Dict[str, str], system_instruction: str) -> Dict[str, str]:
+    """Generic function to call Gemini Vision for a set of fields."""
+    if not GEMINI_AVAILABLE or not GEMINI_API_KEY:
+        log.warning("Gemini API not available or key missing. Skipping AI extraction.")
+        return {}
+
+    if not image_path.exists():
+        log.error(f"Image not found at {image_path}. Cannot perform vision extraction.")
+        return {}
+
+    client = genai.Client(api_key=GEMINI_API_KEY)
+    img = Image.open(image_path)
+    
+    user_prompt = (
+        f"{system_instruction.strip()} Analyze the image and return the exact values for "
+        f"the following metrics as a single JSON object. For percentages, include '%'. "
+        f"Metrics to extract: {list(prompt_map.keys())}"
+    )
+
+    try:
+        response = client.models.generate_content(
+            model='gemini-2.5-flash',
+            contents=[img, user_prompt],
+            config=types.GenerateContentConfig(
+                response_mime_type="application/json",
+                response_schema=types.Schema(
+                    type=types.Type.OBJECT,
+                    properties={v: types.Schema(type=types.Type.STRING) for v in prompt_map.keys()}
+                )
+            )
+        )
+        
+        ai_data = json.loads(response.text)
+        
+        extracted = {}
+        for ai_key, ai_val in ai_data.items():
+            python_key = prompt_map.get(ai_key)
+            if python_key and ai_val is not None:
+                # Store cleaned value
+                extracted[python_key] = str(ai_val).strip()
+                log.info(f"Gemini Success: {python_key} -> {extracted[python_key]}")
+        
+        return extracted
+
+    except Exception as e:
+        log.error(f"Gemini Vision API Error for {list(prompt_map.keys())}: {e}")
+        return {}
+
+def parse_context_from_lines(lines: List[str]) -> Dict[str, str]:
+    m: Dict[str, str] = {}
+    joined = "\n".join(lines)
+    
+    # Store Line (Niki Cooke | 218 Thornton Cleveleys)
+    z = re.search(r"([A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}).*?\|\s*([^\|]+?)\s*\|\s*(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})", joined, re.S)
+    m["store_line"] = z.group(0).strip() if z else "—"
+
+    # Report Time/Page Timestamp (From the footer)
+    ts_match = re.search(r"\b(\d{1,2}\s+[A-Za-z]{3}\s+\d{4},\s*\d{2}:\d{2}:\d{2})\b", joined)
+    m["page_timestamp"] = ts_match.group(1) if ts_match else "—"
+    
+    # Period Range (Likely only visible on the NPS page after filter application)
+    period_match = re.search(r"Dates included:\s*([^\n]+)", joined, re.I)
+    m["period_range"] = period_match.group(1).strip() if period_match else "—"
+
+    # NOTE: These manual extraction methods are highly brittle but are the
+    # most reliable for grabbing context strings like 'store_line' or 'period_range'.
+    return m
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Main (UPDATED NAVIGATION)
 # ──────────────────────────────────────────────────────────────────────────────
 def run_daily_scrape():
-    # ... (omitted initial setup and config checks) ...
     if not AUTH_STATE.exists():
         alert(["⚠️ Daily dashboard scrape needs login. Run `python scrape.py now` once to save auth_state.json."])
         log.error("auth_state.json not found.")
@@ -595,28 +711,26 @@ def run_daily_scrape():
             page.wait_for_timeout(5_000)
             
             # 1a. Screenshot Wheel
-            img_bytes_wheel = page.screenshot(full_page=True, type="png")
             ts = int(time.time())
             SCREENS_DIR.mkdir(parents=True, exist_ok=True)
             screenshot_path_wheel = SCREENS_DIR / f"{ts}_wheel_page.png"
-            save_bytes(screenshot_path_wheel, img_bytes_wheel)
+            save_bytes(screenshot_path_wheel, page.screenshot(full_page=True, type="png"))
             
             # 1b. Extract Context (Time/Store)
             body_text = page.inner_text("body")
             lines = [ln.rstrip() for ln in body_text.splitlines()]
             all_metrics.update(parse_context_from_lines(lines))
             
-            # 1c. Extract Wheel Metrics (using a simplified map for wheel items)
-            # Keys are mapped to standard metric names where possible
+            # 1c. Extract Wheel Metrics 
             prompt_map_wheel = {
-                "Shrink": "shrink_wheel", "Retail Expenses": "retail_expenses", "Payroll (2.3K)": "payroll_wheel", 
+                "Shrink": "shrink_wheel", "Retail Expenses": "retail_expenses", "Payroll": "payroll_outturn", 
                 "ISP": "isp", "Ambient WMD": "ambient_wmd", "Fresh WMD": "fresh_wmd", 
-                "Complaints": "complaints_wheel", "Safe & Legal": "safe_legal", 
+                "Complaints": "complaints_key", "Safe & Legal": "safe_legal", 
                 "Taking to Plan": "taking_to_plan", "Take-up LFL": "sales_lfl", 
                 "NPS": "supermarket_nps", "Stock Record NPS": "stock_record"
             }
 
-            system_inst_wheel = "You are a hyper-accurate retail dashboard data extractor. Extract the value next to each label on the 'Retail Steering Wheel' and other key components (e.g., '3.5%', '42.8K', '(2.3K)', '11', '0.0%'). For items like 'Retail Wheel Guide', return the content text."
+            system_inst_wheel = "You are a hyper-accurate retail dashboard data extractor. Extract the main metric (number + unit/K/%) next to each label on the 'Retail Steering Wheel' and other key components (e.g., '42.8K', '(2.3K)', '11', '0.0%'). For items in parentheses like (2.3K) return the value as -2.3K. For items like 'Retail Wheel Guide', return the content text."
 
             wheel_metrics = _extract_gemini_vision(screenshot_path_wheel, prompt_map_wheel, system_inst_wheel)
             all_metrics.update(wheel_metrics)
@@ -626,9 +740,9 @@ def run_daily_scrape():
             
             # 2a. Click the NPS navigation button/tab
             try:
-                # Assuming the button/tab is labelled 'NPS'
-                page.get_by_role("button", name="NPS", exact=True).first.click(timeout=5000)
-                page.wait_for_timeout(4000) # Wait for content transition
+                # Find the button/tab with text 'NPS'
+                page.get_by_role("button", name="NPS").last.click(timeout=5000) # Use .last to target the tab button
+                page.wait_for_timeout(6000) # Wait for content transition and loading
             except Exception as e:
                 log.warning(f"Failed to click NPS tab. Skipping NPS detail extraction: {e}")
                 pass
@@ -641,43 +755,32 @@ def run_daily_scrape():
             save_bytes(screenshot_path_nps, img_bytes_nps)
             
             # 2c. Extract NPS Metrics (using a map for the NPS page)
-            # Note: Using the NPS keys from METRIC_TARGETS where possible
             prompt_map_nps = {
-                "Supermarket NPS": "supermarket_nps", "Cafe NPS": "cafe_nps", 
-                "Click & Collect NPS": "click_collect_nps", "Internal Factors NPS": "internal_factors_nps",
-                "External Factors NPS": "external_factors_nps", "Store Cleanliness": "store_cleanliness",
-                "Value for Money": "value_for_money", "Store Organised": "store_organised",
-                "Promotions": "promotions", "Time to Queue": "time_to_queue", 
-                "Product Range": "product_range", "Staff Friendliness": "staff_friendliness",
-                "Quality of Food": "quality_of_food"
+                "Supermarket NPS": "supermarket_nps_detail", "Cafe NPS": "cafe_nps", 
+                "Click & Collect NPS": "click_collect_nps", "Internal Factors NPS": "colleague_happiness",
+                "External Factors NPS": "external_factors_nps", "Home Delivery NPS": "home_delivery_nps"
             }
 
-            system_inst_nps = "You are a specialist retail data extractor. Extract the main numeric score or text for the titled metrics (e.g. 'NPS 40', 'Total Responses: 5', '14:46'). For NPS values, extract the main large number. For Internal/External factors, extract the main number."
+            system_inst_nps = "You are a specialist retail data extractor. Extract the main numeric score (number only, ignore targets) for the titled NPS metrics. For NPS values, extract the main large number (e.g., '40', '73', '80')."
 
             nps_metrics = _extract_gemini_vision(screenshot_path_nps, prompt_map_nps, system_inst_nps)
             
-            # Merge NPS metrics, overwriting the wheel NPS if successful
+            # Merge NPS metrics, prioritizing detail page data
             all_metrics.update(nps_metrics)
             
-            # --- STEP 3: Fallback extraction for Sales/FES (not visible on wheel/NPS page) ---
-            # NOTE: Sales and FES buttons are visible at the top, but since we cannot
-            # guarantee the exact content/labels on those subsequent screens,
-            # this remains a known gap unless additional navigation/extraction steps are added.
-            # For now, manually set a 'missing' state for the un-extracted core metrics.
-            
-            # For this MVP, let's assume the required data for Sales/FES/Payroll/Shrink
-            # that was not on the wheel needs to be manually extracted if you choose to.
-            # Setting them to '-' now, as the old text parsing is gone.
-            
+            # --- STEP 3: Combine with default values for unextracted metrics ---
+            # NOTE: Scan Rate/Interventions/Mainbank Closed/Payroll detail will be MISSING until
+            # more navigation steps are added, so they are initialized as '—' now.
             metrics_to_default = ["sales_total", "sales_vs_target", "scan_rate", "interventions", 
                                   "mainbank_closed", "payroll_outturn", "absence_outturn", 
                                   "productive_outturn", "holiday_outturn", "current_base_cost",
                                   "sco_utilisation", "efficiency", "moa", "waste_validation",
-                                  "unrecorded_waste_pct", "shrink_vs_budget_pct", "weekly_activity"]
+                                  "unrecorded_waste_pct", "shrink_vs_budget_pct", "weekly_activity",
+                                  "scan_vs_target", "interventions_vs_target", "mainbank_vs_target"]
             
             for key in metrics_to_default:
                 if key not in all_metrics:
-                     all_metrics[key] = "—"
+                     all_metrics[key] = "—" # Initialize if not found by parsers
 
         finally:
             try:
