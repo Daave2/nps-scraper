@@ -9,8 +9,8 @@ Key points in this build:
 - Strategy: Capture initial wheel, click through relevant detail pages, run targeted
   Gemini Vision extraction on each page, and combine results.
 - FIX: Improved robustness of navigation by adding explicit wait-for-selector and increasing click timeout.
-- FINAL FIX: Corrected iframe locators in `open_and_prepare` to match the current dashboard
-  structure and added a robust check for the dashboard layout.
+- FINAL FIX: Corrected iframe locators and replaced unreliable networkidle check with a robust
+  wait for the visible dashboard layout.
 """
 
 import os
@@ -405,21 +405,23 @@ def open_and_prepare(page) -> bool:
         iframe_locator = page.frame_locator('iframe[title="Retail Wheel"]').frame_locator('iframe[title="Retail Wheel"]')
 
         # To confirm the content is truly ready, we wait for the main layout container of the dashboard.
-        # This is a more robust check than waiting for a specific chart.
-        # Timeout is set to 60 seconds for robustness on slow-loading connections.
+        # This is a robust check that confirms the dashboard is loaded and ready.
         iframe_locator.locator("#dashboard-layout").wait_for(state="visible", timeout=60000)
         
-        log.info("Dashboard iframe content is visible. Waiting for network to settle.")
-        # Final wait for the main page to ensure all dynamic content and scripts are finished.
-        page.wait_for_load_state("networkidle", timeout=45000)
+        log.info("Dashboard iframe content is visible.")
+        
+        # REMOVED: The unreliable networkidle check. Dashboards are rarely network idle due to
+        # background data fetching and telemetry, which was causing a false timeout. The visible
+        # check above is sufficient.
 
     except PlaywrightTimeoutError as e:
         log.error(f"Timeout waiting for iframe content to load. The page's iframe structure may have changed. Error: {e}")
         return False
 
-    log.info("Dashboard iframe content loaded/idle.")
+    log.info("Dashboard successfully loaded.")
 
-    # Now we operate on the stable page. This wait can be reduced or removed now that the above check is more robust.
+    # A short, static wait is still useful to ensure any final chart animations or
+    # late-loading elements have finished rendering before we take a screenshot.
     log.info("Waiting 10s for dynamic content to finish rendering…")
     page.wait_for_timeout(10_000)
 
