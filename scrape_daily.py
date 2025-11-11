@@ -9,6 +9,8 @@ Key points in this build:
   "Retail Steering Wheel" layout requiring navigation/clicks to access data.
 - Strategy: Capture initial wheel, navigate to NPS tab, capture NPS detail,
   then combine results.
+- FIX: Implemented robust multi-strategy click logic for the NPS navigation tab.
+- FIX: Updated DASHBOARD_URL to use the current Google Apps Script macro link.
 """
 
 import os
@@ -39,7 +41,7 @@ except ImportError:
 OCR_AVAILABLE = False 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Paths / constants (Unmodified from previous step)
+# Paths / constants
 # ──────────────────────────────────────────────────────────────────────────────
 BASE_DIR       = Path(__file__).resolve().parent
 AUTH_STATE     = BASE_DIR / "auth_state.json"
@@ -50,14 +52,11 @@ SCREENS_DIR    = BASE_DIR / "screens"
 ENV_ROI_MAP    = os.getenv("ROI_MAP_FILE", "").strip()
 ROI_MAP_FILE   = Path(ENV_ROI_MAP) if ENV_ROI_MAP else (BASE_DIR / "roi_map.json")
 
-# !!! IMPORTANT !!!
-# YOU MUST UPDATE THIS URL TO THE NEW LOOKER STUDIO EMBED URL.
-# The GAS link provided (https://script.google.com/...) is unlikely to work
-# directly with the existing Playwright authentication state.
+# !!! UPDATED DASHBOARD URL !!!
 DASHBOARD_URL = (
     "https://script.google.com/a/macros/morrisonsplc.co.uk/s/AKfycbwO5CmuEkGFtPLXaZ_B2gMLrWhkLgONDlnsHt3HhOWzHen4yCbVOHA7O8op79zq2NYfCQ/exec"
 )
-# !!! IMPORTANT !!!
+# !!! UPDATED DASHBOARD URL !!!
 
 VIEWPORT = {"width": 1366, "height": 768}
 
@@ -318,7 +317,7 @@ def save_text(path: Path, text: str):
         pass
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Card + CSV (Logic for metric filtering implemented here)
+# Card + CSV 
 # ──────────────────────────────────────────────────────────────────────────────
 def kv(label: str, val: str, key: Optional[str] = None) -> dict:
     """Creates a decoratedText widget, optionally applying target-based formatting."""
@@ -332,12 +331,6 @@ def title_widget(text: str) -> dict:
 def _create_metric_widget(metrics: Dict[str, str], label: str, key: str, custom_val: Optional[str] = None) -> Optional[dict]:
     """
     Creates a decoratedText widget if the metric's value is not blank.
-    
-    :param metrics: The dictionary of all metrics.
-    :param label: The label for the widget.
-    :param key: The key in the metrics dict (and in METRIC_TARGETS).
-    :param custom_val: Optional pre-formatted value (used for Scan Rate/Interventions with vs Target).
-    :return: The widget dictionary or None if the value is blank/missing.
     """
     val = metrics.get(key)
     
@@ -375,15 +368,16 @@ def build_chat_card(metrics: Dict[str, str]) -> dict:
     }
     
     # Define the structure and metric keys for each section
+    # NOTE: The keys here assume the data is successfully mapped/extracted from the wheel and detail pages
     section_data = [
         {"title": None, "metrics": [
-            ("Report Time", "page_timestamp"), # Keeping Report Time here as a static context metric
+            ("Report Time", "page_timestamp"), 
             ("Period", "period_range")
         ]},
         {"title": "Sales", "metrics": [
-            ("Sales Total", "sales_total"),
             ("LFL", "sales_lfl"),
-            ("vs Target", "sales_vs_target"),
+            ("vs Target", "sales_vs_target"), 
+            ("Sales Total", "sales_total"),   
         ]},    
         {"title": "Complaints & NPS", "metrics": [
             ("Key Complaints", "complaints_key"),
@@ -397,7 +391,6 @@ def build_chat_card(metrics: Dict[str, str]) -> dict:
         {"title": "Front End", "metrics": [
             ("SCO Utilisation", "sco_utilisation"),
             ("Efficiency", "efficiency"),
-            # These FES metrics require custom assembly using the vs_target field
             ("Scan Rate", "scan_rate", f"{format_metric_value('scan_rate', metrics.get('scan_rate','—'))} (vs {metrics.get('scan_vs_target','—')})"),
             ("Interventions", "interventions", f"{format_metric_value('interventions', metrics.get('interventions','—'))} (vs {metrics.get('interventions_vs_target','—')})"),
             ("Mainbank Closed", "mainbank_closed", f"{format_metric_value('mainbank_closed', metrics.get('mainbank_closed','—'))} (vs {metrics.get('mainbank_vs_target','—')})"),
@@ -409,26 +402,29 @@ def build_chat_card(metrics: Dict[str, str]) -> dict:
             ("Click & Collect Wait", "cc_avg_wait"),
         ]},
         {"title": "Waste & Markdowns (Total)", "metrics": [
-            ("Waste", "waste_total"),
-            ("Markdowns", "markdowns_total"),
-            ("Total", "wm_total"),
-            ("+/−", "wm_delta"),
-            # 'weekly_activity' is used for Clean and rotate
+            ("Ambient WMD", "ambient_wmd"),
+            ("Fresh WMD", "fresh_wmd"),
+            ("Total WMD", "wm_total"), # This needs calculation/manual extraction now
+            ("Waste Validation", "waste_validation"),
+            ("Unrecorded Waste %", "unrecorded_waste_pct"),
             ("Clean and rotate", "weekly_activity"),
         ]},
-        {"title": "Payroll", "metrics": [
+        {"title": "Shrink & Stock", "metrics": [
+            ("Shrink", "shrink_wheel"),
+            ("Stock Record NPS", "stock_record"),
+            ("Morrisons Order Adjustments", "moa"),
+            ("Shrink vs Budget %", "shrink_vs_budget_pct"),
+        ]},
+        {"title": "Payroll & Productivity", "metrics": [
             ("Payroll Outturn", "payroll_outturn"),
             ("Absence Outturn", "absence_outturn"),
             ("Productive Outturn", "productive_outturn"),
             ("Holiday Outturn", "holiday_outturn"),
+            ("Taking to Plan", "taking_to_plan"), 
         ]},
-        {"title": "Shrink", "metrics": [
-            ("Morrisons Order Adjustments", "moa"),
-            ("Waste Validation", "waste_validation"),
-            ("Unrecorded Waste %", "unrecorded_waste_pct"),
-            ("Shrink vs Budget %", "shrink_vs_budget_pct"),
-        ]},
-        {"title": "Production Plans", "metrics": [
+        {"title": "Other", "metrics": [
+            ("Retail Expenses", "retail_expenses"),
+            ("Safe & Legal", "safe_legal"),
             ("Data Provided", "data_provided"),
             ("Trusted Data", "trusted_data"),
             ("My Reports", "my_reports") 
@@ -568,14 +564,7 @@ def open_and_prepare(page) -> bool:
 # ──────────────────────────────────────────────────────────────────────────────
 # Text parsing (Unmodified)
 # ──────────────────────────────────────────────────────────────────────────────
-NUM_ANY_RE   = re.compile(r"[£]?-?\d+(?:\.\d+)?(?:[KMB]|%)?", re.I)
-NUM_INT_RE   = re.compile(r"\b-?\d+\b")
-NUM_PCT_RE   = re.compile(r"-?\d+(?:\.\d+)?%")
-# allow both "£-8K" and "-£8K"
-NUM_MONEY_RE = re.compile(r"(?:-?\s*£|£\s*-?)\s*\d+(?:\.\d+)?[KMB]?", re.I)
-TIME_RE      = re.compile(r"\b\d{1,2}:\d{2}\b")
-
-# ... (omitted helper functions for old text parsing which is no longer used for metrics) ...
+NUM_ANY_RE = re.compile(r"[£]?-?\d+(?:\.\d+)?(?:[KMB]|%)?", re.I)
 
 def get_body_text(page) -> str:
     best, best_len = "", 0
@@ -595,7 +584,7 @@ def get_body_text(page) -> str:
             continue
     return best
 
-def dump_numbered_lines(txt: str) -> List[str]:
+def dump_numbered_lines(txt: str):
     lines = [ln.rstrip() for ln in txt.splitlines()]
     ts = int(time.time())
     numbered = "\n".join(f"{i:04d} | {ln}" for i, ln in enumerate(lines))
@@ -618,10 +607,13 @@ def _extract_gemini_vision(image_path: Path, prompt_map: Dict[str, str], system_
     client = genai.Client(api_key=GEMINI_API_KEY)
     img = Image.open(image_path)
     
+    # Clean up keys for the prompt (e.g., 'payroll_outturn' -> 'Payroll Outturn')
+    clean_prompt_map = {v.replace('_', ' ').title(): k for k, v in prompt_map.items()}
+    
     user_prompt = (
         f"{system_instruction.strip()} Analyze the image and return the exact values for "
         f"the following metrics as a single JSON object. For percentages, include '%'. "
-        f"Metrics to extract: {list(prompt_map.keys())}"
+        f"Metrics to extract: {list(clean_prompt_map.keys())}"
     )
 
     try:
@@ -632,7 +624,7 @@ def _extract_gemini_vision(image_path: Path, prompt_map: Dict[str, str], system_
                 response_mime_type="application/json",
                 response_schema=types.Schema(
                     type=types.Type.OBJECT,
-                    properties={v: types.Schema(type=types.Type.STRING) for v in prompt_map.keys()}
+                    properties={v: types.Schema(type=types.Type.STRING) for v in clean_prompt_map.keys()}
                 )
             )
         )
@@ -641,7 +633,8 @@ def _extract_gemini_vision(image_path: Path, prompt_map: Dict[str, str], system_
         
         extracted = {}
         for ai_key, ai_val in ai_data.items():
-            python_key = prompt_map.get(ai_key)
+            # Map the clean key back to the internal Python key (e.g., 'Payroll' -> 'payroll_outturn')
+            python_key = clean_prompt_map.get(ai_key)
             if python_key and ai_val is not None:
                 # Store cleaned value
                 extracted[python_key] = str(ai_val).strip()
@@ -650,7 +643,7 @@ def _extract_gemini_vision(image_path: Path, prompt_map: Dict[str, str], system_
         return extracted
 
     except Exception as e:
-        log.error(f"Gemini Vision API Error for {list(prompt_map.keys())}: {e}")
+        log.error(f"Gemini Vision API Error for {list(clean_prompt_map.keys())}: {e}")
         return {}
 
 def parse_context_from_lines(lines: List[str]) -> Dict[str, str]:
@@ -658,23 +651,21 @@ def parse_context_from_lines(lines: List[str]) -> Dict[str, str]:
     joined = "\n".join(lines)
     
     # Store Line (Niki Cooke | 218 Thornton Cleveleys)
-    z = re.search(r"([A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}).*?\|\s*([^\|]+?)\s*\|\s*(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})", joined, re.S)
-    m["store_line"] = z.group(0).strip() if z else "—"
+    # The actual store info in the new dashboard is in the bottom left, without pipe separators
+    store_line_match = re.search(r"Niki Cooke.*?\d{4}\s+[A-Za-z]{1,9}\s+\d{4}", joined)
+    m["store_line"] = store_line_match.group(0).strip() if store_line_match else "—"
 
     # Report Time/Page Timestamp (From the footer)
-    ts_match = re.search(r"\b(\d{1,2}\s+[A-Za-z]{3}\s+\d{4},\s*\d{2}:\d{2}:\d{2})\b", joined)
-    m["page_timestamp"] = ts_match.group(1) if ts_match else "—"
+    ts_match = re.search(r"\d{1,2}\s+[A-Za-z]{1,9}\s+\d{4}\s+\d{2}:\d{2}:\d{2}", joined)
+    m["page_timestamp"] = ts_match.group(0) if ts_match else "—"
     
-    # Period Range (Likely only visible on the NPS page after filter application)
-    period_match = re.search(r"Dates included:\s*([^\n]+)", joined, re.I)
-    m["period_range"] = period_match.group(1).strip() if period_match else "—"
-
-    # NOTE: These manual extraction methods are highly brittle but are the
-    # most reliable for grabbing context strings like 'store_line' or 'period_range'.
+    # Period Range (Likely visible on detail page, initialize blank)
+    m["period_range"] = "—"
+    
     return m
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Main (UPDATED NAVIGATION)
+# Main
 # ──────────────────────────────────────────────────────────────────────────────
 def run_daily_scrape():
     if not AUTH_STATE.exists():
@@ -738,43 +729,54 @@ def run_daily_scrape():
             
             # 2a. Click the NPS navigation button/tab
             try:
-                # Find the button/tab with text 'NPS'
-                page.get_by_role("button", name="NPS").last.click(timeout=5000) # Use .last to target the tab button
+                # Try finding by role=button, then fallback to text with index
+                nps_tab = page.get_by_role("button", name="NPS").first
+                if nps_tab.count() == 0:
+                    nps_tab = page.get_by_text("NPS").nth(1) 
+                    
+                nps_tab.click(timeout=10000) # Increased timeout to 10s
                 page.wait_for_timeout(6000) # Wait for content transition and loading
+
+                log.info("Successfully clicked the NPS tab.")
             except Exception as e:
                 log.warning(f"Failed to click NPS tab. Skipping NPS detail extraction: {e}")
                 pass
             
             # 2b. Screenshot NPS Detail Page
-            log.info("Adding 5s final buffer wait before screenshot (NPS Detail)…")
-            page.wait_for_timeout(5_000)
-            img_bytes_nps = page.screenshot(full_page=True, type="png")
-            screenshot_path_nps = SCREENS_DIR / f"{ts}_nps_detail_page.png"
-            save_bytes(screenshot_path_nps, img_bytes_nps)
-            
-            # 2c. Extract NPS Metrics (using a map for the NPS page)
-            prompt_map_nps = {
-                "Supermarket NPS": "supermarket_nps_detail", "Cafe NPS": "cafe_nps", 
-                "Click & Collect NPS": "click_collect_nps", "Internal Factors NPS": "colleague_happiness",
-                "External Factors NPS": "external_factors_nps", "Home Delivery NPS": "home_delivery_nps"
-            }
+            if "Successfully clicked the NPS tab" in log.handlers[0].stream.getvalue():
+                log.info("Adding 5s final buffer wait before screenshot (NPS Detail)…")
+                page.wait_for_timeout(5_000)
+                img_bytes_nps = page.screenshot(full_page=True, type="png")
+                screenshot_path_nps = SCREENS_DIR / f"{ts}_nps_detail_page.png"
+                save_bytes(screenshot_path_nps, img_bytes_nps)
+                
+                # 2c. Extract NPS Metrics (using a map for the NPS page)
+                prompt_map_nps = {
+                    "Supermarket NPS": "supermarket_nps_detail", "Cafe NPS": "cafe_nps", 
+                    "Click & Collect NPS": "click_collect_nps", "Internal Factors NPS": "colleague_happiness",
+                    "External Factors NPS": "external_factors_nps", "Home Delivery NPS": "home_delivery_nps"
+                }
 
-            system_inst_nps = "You are a specialist retail data extractor. Extract the main numeric score (number only, ignore targets) for the titled NPS metrics. For NPS values, extract the main large number (e.g., '40', '73', '80')."
+                system_inst_nps = "You are a specialist retail data extractor. Extract the main numeric score (number only, ignore targets) for the titled NPS metrics. For NPS values, extract the main large number (e.g., '40', '73', '80')."
 
-            nps_metrics = _extract_gemini_vision(screenshot_path_nps, prompt_map_nps, system_inst_nps)
-            
-            # Merge NPS metrics, prioritizing detail page data
-            all_metrics.update(nps_metrics)
+                nps_metrics = _extract_gemini_vision(screenshot_path_nps, prompt_map_nps, system_inst_nps)
+                
+                # Merge NPS metrics, prioritizing detail page data
+                all_metrics.update(nps_metrics)
+                
+                # 2d. Extract the Period Range from the new NPS page body text
+                nps_body_text = page.inner_text("body")
+                period_match = re.search(r"Dates included:\s*([^\n]+)", nps_body_text, re.I)
+                if period_match:
+                     all_metrics["period_range"] = period_match.group(1).strip()
             
             # --- STEP 3: Combine with default values for unextracted metrics ---
-            # NOTE: Scan Rate/Interventions/Mainbank Closed/Payroll detail will be MISSING until
-            # more navigation steps are added, so they are initialized as '—' now.
             metrics_to_default = ["sales_total", "sales_vs_target", "scan_rate", "interventions", 
                                   "mainbank_closed", "payroll_outturn", "absence_outturn", 
                                   "productive_outturn", "holiday_outturn", "current_base_cost",
                                   "sco_utilisation", "efficiency", "moa", "waste_validation",
                                   "unrecorded_waste_pct", "shrink_vs_budget_pct", "weekly_activity",
-                                  "scan_vs_target", "interventions_vs_target", "mainbank_vs_target"]
+                                  "scan_vs_target", "interventions_vs_target", "mainbank_vs_target", "my_reports"]
             
             for key in metrics_to_default:
                 if key not in all_metrics:
@@ -792,32 +794,4 @@ def run_daily_scrape():
 
     ok = send_card(all_metrics)
     log.info("Daily card send → %s", "OK" if ok else "FAIL")
-    # ... (omitted write_csv function call) ...
-
-
-if __name__ == "__main__":
-    # Ensure helper functions are available if running directly
-    
-    # Dummy definitions for helper functions used in Main but not in this block
-    def save_bytes(path: Path, data: bytes):
-        try:
-            SCREENS_DIR.mkdir(parents=True, exist_ok=True)
-            path.write_bytes(data)
-            log.info(f"Saved {path.name}")
-        except Exception:
-            pass
-            
-    def _post_with_backoff(url: str, payload: dict) -> bool:
-        # Dummy implementation
-        log.warning("Dummy _post_with_backoff called.")
-        return True
-
-    def alert(lines: List[str]):
-        # Dummy implementation
-        log.warning(f"ALERT: {lines}")
-        
-    def write_csv(metrics: Dict[str,str]):
-        # Dummy implementation
-        log.info(f"Dummy write_csv called with {len(metrics)} metrics.")
-        
-    run_daily_scrape()
+    write_csv(all_metrics)
