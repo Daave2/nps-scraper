@@ -8,7 +8,7 @@ Key points in this build:
 - CRITICAL UPDATE: Multi-page navigation (Wheel, NPS, Sales, Front End, Payroll) implemented.
 - Strategy: Capture initial wheel, click through relevant detail pages, run targeted 
   Gemini Vision extraction on each page, and combine results.
-- FIX: Added explicit wait for a static element (nav bar) and a mandatory screenshot on final failure.
+- FINAL FIX: Implemented robust loading logic using frame-agnostic text search on initial load.
 """
 
 import os
@@ -396,18 +396,17 @@ def open_and_prepare(page) -> bool:
         log.warning("Redirected to login — auth state missing/invalid.")
         return False
     
-    # --- FIX: Wait for the main content frame to load ---
-    log.info("Waiting for main dashboard content to load/stabilize inside any frame...")
+    # --- FINAL ROBUST WAIT: Use the unique, visible text element ---
+    log.info("Waiting for 'Retail Steering Wheel' text to appear (up to 45s)...")
     try:
-        # Wait for the main wheel SVG element or its wrapper to be visible/attached
-        # This element only exists once the inner dashboard has loaded.
-        wheel_locator = page.locator("#steering-wheel-svg-wrapper")
-        wheel_locator.wait_for(state="attached", timeout=45000) # Wait up to 45s for the wheel to appear
+        # Use get_by_text is the most robust, frame-agnostic way to find content in nested iframes
+        wheel_locator = page.get_by_text("Retail Steering Wheel", exact=True)
+        wheel_locator.wait_for(state="visible", timeout=45000) # Wait up to 45s for the wheel to appear
     except PlaywrightTimeoutError as e:
-        log.error(f"Timeout waiting for the main dashboard element (#steering-wheel-svg-wrapper) to appear: {e}")
+        log.error(f"Timeout waiting for 'Retail Steering Wheel' text to appear: {e}")
         return False
     
-    log.info("Main dashboard element (#steering-wheel-svg-wrapper) is attached.")
+    log.info("Dashboard content is visually stable.")
     
     # Now we operate on the stable page
     log.info("Waiting 20s for dynamic content…")
