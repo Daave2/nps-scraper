@@ -8,7 +8,7 @@ Key points in this build:
 - CRITICAL UPDATE: Multi-page navigation (Wheel, NPS, Sales, Front End, Payroll) implemented.
 - Strategy: Capture initial wheel, click through relevant detail pages, run targeted 
   Gemini Vision extraction on each page, and combine results.
-- FINAL FIX: Implemented robust loading logic using frame-agnostic text search on initial load.
+- FINAL FIX: Implemented ultimate robust loading logic: Wait for static nav bar element, then a long hard wait.
 """
 
 import os
@@ -399,17 +399,23 @@ def open_and_prepare(page) -> bool:
     # --- FINAL ROBUST WAIT: Use the unique, visible text element ---
     log.info("Waiting for 'Retail Steering Wheel' text to appear (up to 45s)...")
     try:
-        # Use get_by_text is the most robust, frame-agnostic way to find content in nested iframes
+        # Wait for the main navigation bar, which is a static element in the GAS wrapper
+        nav_locator = page.locator("#header-nav")
+        nav_locator.wait_for(state="attached", timeout=15000)
+        log.info("Header navigation bar is attached.")
+
+        # Wait for the main wheel SVG element or its wrapper to be visible/attached
+        # Using get_by_text is the most robust, frame-agnostic way to find content in nested iframes
         wheel_locator = page.get_by_text("Retail Steering Wheel", exact=True)
         wheel_locator.wait_for(state="visible", timeout=45000) # Wait up to 45s for the wheel to appear
     except PlaywrightTimeoutError as e:
         log.error(f"Timeout waiting for 'Retail Steering Wheel' text to appear: {e}")
         return False
     
-    log.info("Dashboard content is visually stable.")
+    log.info("'Retail Steering Wheel' element is attached and visible.")
     
     # Now we operate on the stable page
-    log.info("Waiting 20s for dynamic content…")
+    log.info("Waiting 20s for dynamic content to settle…")
     page.wait_for_timeout(20_000)
 
     click_this_week(page) 
