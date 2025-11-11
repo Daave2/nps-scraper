@@ -55,7 +55,7 @@ ROI_MAP_FILE   = Path(ENV_ROI_MAP) if ENV_ROI_MAP else (BASE_DIR / "roi_map.json
 # The GAS link provided (https://script.google.com/...) is unlikely to work
 # directly with the existing Playwright authentication state.
 DASHBOARD_URL = (
-    "https://script.google.com/a/macros/morrisonsplc.co.uk/s/AKfycbwO5CmuEkGFtPLXaZ_B2gMLrWhkLgONDlnsHt3HhOWzHen4yCbVOHA7O8op79zq2NYfCQ/exec"
+    "https://script.google.com/a/macros/morrisonsplc.co.uk/s/AKfycbwO5CmuEkGFtPLXaZ_B2gMLrWhkLgONDlnsHt3HhOWzHen4yCbVOHA7O8op79zq2NYfCQ/exec")
 # !!! IMPORTANT !!!
 
 VIEWPORT = {"width": 1366, "height": 768}
