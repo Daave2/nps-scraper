@@ -10,8 +10,7 @@ Key points in this build:
 - Strategy: Capture initial wheel, navigate to NPS tab, capture NPS detail,
   then combine results.
 - FIX: Implemented robust multi-strategy click logic for the NPS navigation tab.
-- FIX: Updated DASHBOARD_URL to use the current Google Apps Script macro link.
-- FIX: Metric filtering handles "-", "—", "", and "NPS" correctly.
+- URL UPDATE: Using the new Google Apps Script macro URL as the entry point.
 """
 
 import os
@@ -53,11 +52,11 @@ SCREENS_DIR    = BASE_DIR / "screens"
 ENV_ROI_MAP    = os.getenv("ROI_MAP_FILE", "").strip()
 ROI_MAP_FILE   = Path(ENV_ROI_MAP) if ENV_ROI_MAP else (BASE_DIR / "roi_map.json")
 
-# !!! UPDATED DASHBOARD URL (VERIFIED) !!!
+# !!! IMPORTANT: UPDATED DASHBOARD URL !!!
 DASHBOARD_URL = (
-    "https://script.google.com/a/macros/morrisonsplc.co.uk/s/AKfycbwO5CmuEkGFtPLXaZ_B2gMLWfRhQLgONDlnsHt3HhOWzHen4yCbVOHA7O8op79zq2NYfCQ/exec"
+    "https://script.google.com/a/macros/morrisonsplc.co.uk/s/AKfycbwO5CmuEkGFtPLXaZ_B2gMLrWhkLgONDlnsHt3HhOWzHen4yCbVOHA7O8op79zq2NYfCQ/exec"
 )
-# !!! UPDATED DASHBOARD URL !!!
+# !!! IMPORTANT !!!
 
 VIEWPORT = {"width": 1366, "height": 768}
 
@@ -350,7 +349,6 @@ def _create_metric_widget(metrics: Dict[str, str], label: str, key: str, custom_
         vs_target_key = f"{key}_vs_target"
         val_vs = metrics.get(vs_target_key)
         
-        # Check both the main value and the vs_target value
         is_vs_blank = (val_vs is None or val_vs.strip() == "" or val_vs.strip() == "—" or val_vs.strip() == "-")
         is_complex_blank = is_blank or is_vs_blank
 
@@ -382,9 +380,10 @@ def build_chat_card(metrics: Dict[str, str]) -> dict:
             ("Period", "period_range")
         ]},
         {"title": "Sales", "metrics": [
+            # Sales is sparse in this new structure - LFL is on the wheel
             ("LFL", "sales_lfl"),
-            ("vs Target", "sales_vs_target"), 
-            ("Sales Total", "sales_total"),   
+            ("vs Target", "sales_vs_target"), # This needs manual extraction now
+            ("Sales Total", "sales_total"),   # This needs manual extraction now
         ]},    
         {"title": "Complaints & NPS", "metrics": [
             ("Key Complaints", "complaints_key"),
@@ -396,6 +395,7 @@ def build_chat_card(metrics: Dict[str, str]) -> dict:
             ("Home Delivery NPS", "home_delivery_nps"), 
         ]},
         {"title": "Front End", "metrics": [
+            # These FES metrics require manual extraction now
             ("SCO Utilisation", "sco_utilisation"),
             ("Efficiency", "efficiency"),
             ("Scan Rate", "scan_rate", f"{format_metric_value('scan_rate', metrics.get('scan_rate','—'))} (vs {metrics.get('scan_vs_target','—')})"),
@@ -405,15 +405,15 @@ def build_chat_card(metrics: Dict[str, str]) -> dict:
             ("More card Swipes WOW %", "swipes_wow_pct"),
         ]},
         {"title": "Online", "metrics": [
-            ("C&C Availability", "availability_pct"),
+            ("C&C Availability", "availability_pct"), # Still needs manual extraction now
             ("Click & Collect Wait", "cc_avg_wait"),
         ]},
         {"title": "Waste & Markdowns (Total)", "metrics": [
             ("Ambient WMD", "ambient_wmd"),
             ("Fresh WMD", "fresh_wmd"),
-            ("Total WMD", "wm_total"), 
-            ("+/−", "wm_delta"),
-            # 'weekly_activity' is used for Clean and rotate
+            ("Total WMD", "wm_total"), # This needs calculation/manual extraction now
+            ("Waste Validation", "waste_validation"),
+            ("Unrecorded Waste %", "unrecorded_waste_pct"),
             ("Clean and rotate", "weekly_activity"),
         ]},
         {"title": "Shrink & Stock", "metrics": [
@@ -498,6 +498,146 @@ def send_card(metrics: Dict[str, str]) -> bool:
     return _post_with_backoff(MAIN_WEBHOOK, build_chat_card(metrics))
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Browser automation
+# ──────────────────────────────────────────────────────────────────────────────
+def click_this_week(page):
+    try:
+        el = page.get_by_role("button", name=re.compile(r"^This Week$", re.I))
+        if el.count():
+            el.first.click(timeout=2000)
+            page.wait_for_timeout(600)
+            return True
+    except Exception:
+        pass
+    try:
+        el = page.get_by_text(re.compile(r"^\s*This Week\s*$", re.I))
+        if el.count():
+            el.first.click(timeout=2000)
+            page.wait_for_timeout(600)
+            return True
+    except Exception:
+        pass
+    return False
+
+def click_proceed_overlays(page) -> int:
+    clicked = 0
+    for fr in page.frames:
+        try:
+            btn = fr.get_by_text("PROCEED", exact=True)
+            for i in range(btn.count()):
+                try:
+                    btn.nth(i).click(timeout=1200)
+                    clicked += 1
+                    fr.wait_for_timeout(300)
+                except Exception:
+                    continue
+        except Exception:
+            continue
+    if clicked:
+        log.info(f"Clicked {clicked} 'PROCEED' overlay(s). Waiting for render…")
+        page.wait_for_timeout(1200)
+    return clicked
+
+def open_and_prepare(page) -> bool:
+    log.info("Opening Retail Performance Dashboard…")
+    try:
+        page.goto(DASHBOARD_URL, wait_until="domcontentloaded", timeout=120_000)
+    except PlaywrightTimeoutError:
+        log.error("Timeout loading dashboard.")
+        return False
+
+    if "accounts.google.com" in page.url:
+        log.warning("Redirected to login — auth state missing/invalid.")
+        return False
+
+    # INCREASED WAIT: Gave 12s, now giving 20s for general content load
+    log.info("Waiting 20s for dynamic content…")
+    page.wait_for_timeout(20_000)
+
+    click_this_week(page)
+    click_proceed_overlays(page)
+
+    try:
+        body = page.inner_text("body")
+    except Exception:
+        body = ""
+    if "You are about to interact with a community visualisation" in body:
+        log.info("Community visualisation placeholders detected — retrying PROCEED and waiting longer.")
+        click_proceed_overlays(page)
+        page.wait_for_timeout(1500)
+
+    return True
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Gemini Vision Extraction (Combined Logic)
+# ──────────────────────────────────────────────────────────────────────────────
+def _extract_gemini_vision(image_path: Path, prompt_map: Dict[str, str], system_instruction: str) -> Dict[str, str]:
+    """Generic function to call Gemini Vision for a set of fields."""
+    if not GEMINI_AVAILABLE or not GEMINI_API_KEY:
+        log.warning("Gemini API not available or key missing. Skipping AI extraction.")
+        return {}
+
+    if not image_path.exists():
+        log.error(f"Image not found at {image_path}. Cannot perform vision extraction.")
+        return {}
+
+    client = genai.Client(api_key=GEMINI_API_KEY)
+    img = Image.open(image_path)
+    
+    user_prompt = (
+        f"{system_instruction.strip()} Analyze the image and return the exact values for "
+        f"the following metrics as a single JSON object. For percentages, include '%'. "
+        f"Metrics to extract: {list(prompt_map.keys())}"
+    )
+
+    try:
+        response = client.models.generate_content(
+            model='gemini-2.5-flash',
+            contents=[img, user_prompt],
+            config=types.GenerateContentConfig(
+                response_mime_type="application/json",
+                response_schema=types.Schema(
+                    type=types.Type.OBJECT,
+                    properties={v: types.Schema(type=types.Type.STRING) for v in prompt_map.keys()}
+                )
+            )
+        )
+        
+        ai_data = json.loads(response.text)
+        
+        extracted = {}
+        for ai_key, ai_val in ai_data.items():
+            python_key = prompt_map.get(ai_key)
+            if python_key and ai_val is not None:
+                # Store cleaned value
+                extracted[python_key] = str(ai_val).strip()
+                log.info(f"Gemini Success: {python_key} -> {extracted[python_key]}")
+        
+        return extracted
+
+    except Exception as e:
+        log.error(f"Gemini Vision API Error for {list(prompt_map.keys())}: {e}")
+        return {}
+
+def parse_context_from_lines(lines: List[str]) -> Dict[str, str]:
+    m: Dict[str, str] = {}
+    joined = "\n".join(lines)
+    
+    # Store Line (Niki Cooke | 218 Thornton Cleveleys)
+    z = re.search(r"([A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}).*?\|\s*([^\|]+?)\s*\|\s*(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})", joined, re.S)
+    m["store_line"] = z.group(0).strip() if z else "—"
+
+    # Report Time/Page Timestamp (From the footer)
+    ts_match = re.search(r"\b(\d{1,2}\s+[A-Za-z]{3}\s+\d{4},\s*\d{2}:\d{2}:\d{2})\b", joined)
+    m["page_timestamp"] = ts_match.group(1) if ts_match else "—"
+    
+    # Period Range (Likely only visible on the NPS page after filter application)
+    period_match = re.search(r"Dates included:\s*([^\n]+)", joined, re.I)
+    m["period_range"] = period_match.group(1).strip() if period_match else "—"
+
+    return m
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Main
 # ──────────────────────────────────────────────────────────────────────────────
 def run_daily_scrape():
@@ -561,20 +701,29 @@ def run_daily_scrape():
             log.info("Navigating to NPS Detail page…")
             
             # 2a. Click the NPS navigation button/tab
+            clicked_nps_tab = False
             try:
-                # 1. Try finding by role=button (most robust method)
-                nps_tab = page.get_by_role("button", name="NPS").first
+                # Try finding by role=button (most reliable method for tabs)
+                nps_tab = page.get_by_role("button", name="NPS")
+                if nps_tab.count() > 0:
+                    nps_tab.last.click(timeout=10000) 
+                    clicked_nps_tab = True
                 
-                if nps_tab.count() == 0:
-                    # 2. Fallback to finding by literal text, assuming it's the second instance on the page (first is the chart NPS)
+                # Fallback to finding by text, assuming it's the second instance of 'NPS' text
+                if not clicked_nps_tab:
                     nps_tab = page.get_by_text("NPS").nth(1) 
-                    
-                nps_tab.click(timeout=10000) # Increased timeout to 10s
-                page.wait_for_timeout(6000) # Wait for content transition and loading
+                    nps_tab.click(timeout=10000)
+                    clicked_nps_tab = True
 
-                log.info("Successfully clicked the NPS tab.")
-                
-                # 2b. Screenshot NPS Detail Page
+                if clicked_nps_tab:
+                    page.wait_for_timeout(6000) # Wait for content transition and loading
+                    log.info("Successfully clicked the NPS tab.")
+            except Exception as e:
+                log.warning(f"Failed to click NPS tab. Skipping NPS detail extraction: {e}")
+                pass
+            
+            # 2b. Screenshot NPS Detail Page (Only proceed if click was successful)
+            if clicked_nps_tab:
                 log.info("Adding 5s final buffer wait before screenshot (NPS Detail)…")
                 page.wait_for_timeout(5_000)
                 img_bytes_nps = page.screenshot(full_page=True, type="png")
@@ -594,16 +743,6 @@ def run_daily_scrape():
                 
                 # Merge NPS metrics, prioritizing detail page data
                 all_metrics.update(nps_metrics)
-                
-                # 2d. Extract the Period Range from the new NPS page body text
-                nps_body_text = page.inner_text("body")
-                period_match = re.search(r"Dates included:\s*([^\n]+)", nps_body_text, re.I)
-                if period_match:
-                     all_metrics["period_range"] = period_match.group(1).strip()
-            
-            except Exception as e:
-                log.warning(f"Failed to click NPS tab. Skipping NPS detail extraction: {e}")
-                pass
             
             # --- STEP 3: Combine with default values for unextracted metrics ---
             metrics_to_default = ["sales_total", "sales_vs_target", "scan_rate", "interventions", 
@@ -611,7 +750,7 @@ def run_daily_scrape():
                                   "productive_outturn", "holiday_outturn", "current_base_cost",
                                   "sco_utilisation", "efficiency", "moa", "waste_validation",
                                   "unrecorded_waste_pct", "shrink_vs_budget_pct", "weekly_activity",
-                                  "scan_vs_target", "interventions_vs_target", "mainbank_vs_target", "my_reports"]
+                                  "scan_vs_target", "interventions_vs_target", "mainbank_vs_target"]
             
             for key in metrics_to_default:
                 if key not in all_metrics:
