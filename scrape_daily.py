@@ -6,9 +6,10 @@ Retail Performance Dashboard → Daily Summary (layout-by-lines + GEMINI VISION)
 
 Key points in this build:
 - CRITICAL UPDATE: Multi-page navigation (Wheel, NPS, Sales, Front End, Payroll) implemented.
-- Strategy: Capture initial wheel, click through relevant detail pages, run targeted 
+- Strategy: Capture initial wheel, click through relevant detail pages, run targeted
   Gemini Vision extraction on each page, and combine results.
 - FIX: Improved robustness of navigation by adding explicit wait-for-selector and increasing click timeout.
+- FIX (IMPORTANT): Updated iframe locators in `open_and_prepare` to match the current dashboard structure.
 """
 
 import os
@@ -36,7 +37,7 @@ except ImportError:
     class Image: pass # Placeholder for type hints
 
 # --- Placeholder for compatibility/simplicity of the final script structure ---
-OCR_AVAILABLE = False 
+OCR_AVAILABLE = False
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Paths / constants
@@ -83,7 +84,7 @@ ALERT_WEBHOOK = config["DEFAULT"].get("ALERT_WEBHOOK",  os.getenv("ALERT_WEBHOOK
 CI_RUN_URL    = os.getenv("CI_RUN_URL", "")
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Targets / Formatting 
+# Targets / Formatting
 # ──────────────────────────────────────────────────────────────────────────────
 # Target values and comparison rules for Google Chat Card formatting.
 METRIC_TARGETS = {
@@ -94,9 +95,9 @@ METRIC_TARGETS = {
     "supermarket_nps":     ("65",    "A>65 G, A<50 R"),
     "colleague_happiness": ("40",    "A>40 G, A<0 R"),
     "home_delivery_nps":   ("75",    "A>75 G, A<65 R"),
-    "cafe_nps":            ("65",    "A>65 G, A<50 R"), 
+    "cafe_nps":            ("65",    "A>65 G, A<50 R"),
     "click_collect_nps":   ("40",    "A>40 G, A<30 R"),
-    "customer_toilet_nps": ("40",    "A>40 G, A<30 R"), 
+    "customer_toilet_nps": ("40",    "A>40 G, A<30 R"),
     # FES
     "sco_utilisation":     ("67%",   "A>67% G, A<65% R"),
     "efficiency":          ("100%",  "A>99% G, A<90% R"),
@@ -106,7 +107,7 @@ METRIC_TARGETS = {
     # Online
     "availability_pct":    ("96%",   "A>96% G, A<92% R"),
     "cc_avg_wait":         ("4:30",  "A<4.5M G, A>5M R"), # M = Minutes
-    # Waste/Shrink 
+    # Waste/Shrink
     "shrink_vs_budget_pct":("0%",    "A>6% R, A<-0% G"),
     # Payroll (Outturn metrics)
     "payroll_outturn":     ("0",     "A<0 R"),
@@ -121,23 +122,23 @@ METRIC_TARGETS = {
 }
 
 # --- Color Definitions for Unofficial <font> Tag ---
-COLOR_RED = "#FF0000"   # Critical/Bad 
+COLOR_RED = "#FF0000"   # Critical/Bad
 COLOR_AMBER = "#FFA500" # Warning/Orange
 
 # Mapping status to HTML tags (using font color for poor performance, plain for good)
 STATUS_FORMAT = {
-    "GREEN":  ("", ""),                                 
-    "RED":    (f"<font color='{COLOR_RED}'>", "</font>"),      
-    "ORANGE": (f"<font color='{COLOR_AMBER}'>", "</font>"),    
-    "BOLD_RED": (f"<font color='{COLOR_RED}'><b>", "</b></font>"), 
-    "NONE":   ("", ""),                                 
+    "GREEN":  ("", ""),
+    "RED":    (f"<font color='{COLOR_RED}'>", "</font>"),
+    "ORANGE": (f"<font color='{COLOR_AMBER}'>", "</font>"),
+    "BOLD_RED": (f"<font color='{COLOR_RED}'><b>", "</b></font>"),
+    "NONE":   ("", ""),
 }
 
 # Mapping single-letter rule codes to full status keys for lookup
 STATUS_CODE_MAP = {
-    "G": "GREEN", 
-    "R": "RED", 
-    "O": "ORANGE", 
+    "G": "GREEN",
+    "R": "RED",
+    "O": "ORANGE",
     "BR": "BOLD_RED"
 }
 
@@ -203,7 +204,7 @@ def title_widget(text: str) -> dict:
 def _create_metric_widget(metrics: Dict[str, str], label: str, key: str, custom_val: Optional[str] = None) -> Optional[dict]:
     val = metrics.get(key)
     is_blank = (val is None or val.strip() == "" or val.strip() == "—" or val.strip() == "-")
-    
+
     if custom_val:
         vs_target_key = f"{key}_vs_target"
         val_vs = metrics.get(vs_target_key)
@@ -211,7 +212,7 @@ def _create_metric_widget(metrics: Dict[str, str], label: str, key: str, custom_
         is_complex_blank = is_blank or is_vs_blank
         if is_complex_blank: return None
         return {"decoratedText": {"topLabel": label, "text": custom_val}}
-        
+
     if is_blank: return None
     if val.upper() == "NPS": return None
     return kv(label, val, key=key)
@@ -221,17 +222,17 @@ def build_chat_card(metrics: Dict[str, str]) -> dict:
         "title": "📊 Retail Daily Summary",
         "subtitle": (metrics.get("store_line") or "").replace("\n", "  "),
     }
-    
+
     section_data = [
         {"title": None, "metrics": [
-            ("Report Time", "page_timestamp"), 
+            ("Report Time", "page_timestamp"),
             ("Period", "period_range")
         ]},
         {"title": "Sales", "metrics": [
             ("Sales Total", "sales_total"),
             ("LFL", "sales_lfl"),
             ("vs Target", "sales_vs_target"),
-        ]},    
+        ]},
         {"title": "Complaints & NPS", "metrics": [
             ("Key Complaints", "complaints_key"),
             ("Supermarket NPS", "supermarket_nps"),
@@ -239,7 +240,7 @@ def build_chat_card(metrics: Dict[str, str]) -> dict:
             ("Cafe NPS", "cafe_nps"),
             ("Click & Collect NPS", "click_collect_nps"),
             ("Customer Toilet NPS", "customer_toilet_nps"),
-            ("Home Delivery NPS", "home_delivery_nps"), 
+            ("Home Delivery NPS", "home_delivery_nps"),
         ]},
         {"title": "Front End", "metrics": [
             ("SCO Utilisation", "sco_utilisation"),
@@ -276,12 +277,12 @@ def build_chat_card(metrics: Dict[str, str]) -> dict:
         {"title": "Production Plans", "metrics": [
             ("Data Provided", "data_provided"),
             ("Trusted Data", "trusted_data"),
-            ("My Reports", "my_reports") 
+            ("My Reports", "my_reports")
         ]},
     ]
 
     final_sections = []
-    
+
     for section in section_data:
         widgets = []
         for metric_data in section["metrics"]:
@@ -289,7 +290,7 @@ def build_chat_card(metrics: Dict[str, str]) -> dict:
             custom_val = metric_data[2] if len(metric_data) > 2 else None
             widget = _create_metric_widget(metrics, label, key, custom_val)
             if widget: widgets.append(widget)
-        
+
         if widgets:
             section_dict = {"widgets": []}
             if section["title"]: section_dict["widgets"].append(title_widget(section["title"]))
@@ -395,28 +396,34 @@ def open_and_prepare(page) -> bool:
     if "accounts.google.com" in page.url:
         log.warning("Redirected to login — auth state missing/invalid.")
         return False
-    
-    # --- FIX: Wait for the main content frame to load ---
-    log.info("Waiting for main sandboxFrame iframe to load...")
+
+    # --- FIX: Wait for the correct nested iframe that contains the dashboard ---
+    log.info("Waiting for dashboard iframe to load...")
     try:
-        # Wait for the main iframe to appear and load state to settle
-        # Using a direct locator for the frame's content to check load state
-        iframe_locator = page.frame_locator("#sandboxFrame").frame_locator("#content-frame") # Target the innermost dashboard iframe
-        iframe_locator.locator("body").wait_for(state="attached", timeout=30000)
-        log.info("Dashboard iframe content attached. Waiting for its 'networkidle' state.")
-        # This will wait for the content inside the iframe (the dashboard) to load
-        iframe_locator.wait_for_load_state("networkidle", timeout=45000) 
+        # As discovered from manual testing, the dashboard is inside two nested iframes
+        # both titled "Retail Wheel". We target this specific structure.
+        iframe_locator = page.frame_locator('iframe[title="Retail Wheel"]').frame_locator('iframe[title="Retail Wheel"]')
+
+        # To confirm the content is ready, we wait for a reliable element inside the
+        # final iframe to become visible. The steering wheel SVG is a perfect candidate.
+        # Increased timeout to 60s for robustness on slow loads.
+        iframe_locator.locator("#steering-wheel-svg").wait_for(state="visible", timeout=60000)
+        
+        log.info("Dashboard iframe content is visible. Waiting for network to settle.")
+        # A final wait for the main page to ensure all dynamic content and scripts are done.
+        page.wait_for_load_state("networkidle", timeout=45000)
+
     except PlaywrightTimeoutError as e:
-        log.error(f"Timeout waiting for iframe content to load: {e}")
+        log.error(f"Timeout waiting for iframe content to load. The page's iframe structure may have changed. Error: {e}")
         return False
-    
+
     log.info("Dashboard iframe content loaded/idle.")
-    
+
     # Now we operate on the stable page
     log.info("Waiting 20s for dynamic content…")
     page.wait_for_timeout(20_000)
 
-    click_this_week(page) 
+    click_this_week(page)
     click_proceed_overlays(page)
 
     try:
@@ -441,28 +448,24 @@ def _extract_gemini_vision(image_path: Path, prompt_map: Dict[str, str], system_
         log.error(f"Image not found at {image_path}. Cannot perform vision extraction.")
         return {}
 
-    client = genai.Client(api_key=GEMINI_API_KEY)
+    genai.configure(api_key=GEMINI_API_KEY)
+    model = genai.GenerativeModel('gemini-1.5-flash')
     img = Image.open(image_path)
+
+    generation_config = genai.types.GenerationConfig(
+        response_mime_type="application/json",
+        response_schema={v: genai.types.Schema(type=genai.types.Type.STRING) for v in prompt_map.keys()}
+    )
     
-    user_prompt = (
+    prompt_parts = [
+        img,
         f"{system_instruction.strip()} Analyze the image and return the exact values for "
         f"the following metrics as a single JSON object. For percentages, include '%'. "
         f"Metrics to extract: {list(prompt_map.keys())}"
-    )
+    ]
 
     try:
-        response = client.models.generate_content(
-            model='gemini-2.5-flash',
-            contents=[img, user_prompt],
-            config=types.GenerateContentConfig(
-                response_mime_type="application/json",
-                response_schema=types.Schema(
-                    type=types.Type.OBJECT,
-                    properties={v: types.Schema(type=types.Type.STRING) for v in prompt_map.keys()}
-                )
-            )
-        )
-        
+        response = model.generate_content(prompt_parts, generation_config=generation_config)
         ai_data = json.loads(response.text)
         
         extracted = {}
@@ -478,16 +481,17 @@ def _extract_gemini_vision(image_path: Path, prompt_map: Dict[str, str], system_
         log.error(f"Gemini Vision API Error for {list(prompt_map.keys())}: {e}")
         return {}
 
+
 def parse_context_from_lines(lines: List[str]) -> Dict[str, str]:
     m: Dict[str, str] = {}
     joined = "\n".join(lines)
-    
+
     z = re.search(r"([A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}).*?\|\s*([^\|]+?)\s*\|\s*(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})", joined, re.S)
     m["store_line"] = z.group(0).strip() if z else "—"
 
     ts_match = re.search(r"\b(\d{1,2}\s+[A-Za-z]{3}\s+\d{4},\s*\d{2}:\d{2}:\d{2})\b", joined)
     m["page_timestamp"] = ts_match.group(1) if ts_match else "—"
-    
+
     period_match = re.search(r"Dates included:\s*([^\n]+)", joined, re.I)
     m["period_range"] = period_match.group(1).strip() if period_match else "—"
 
@@ -501,15 +505,15 @@ def run_daily_scrape():
         alert(["⚠️ Daily dashboard scrape needs login. Run `python scrape.py now` once to save auth_state.json."])
         log.error("auth_state.json not found.")
         return
-    
+
     if not GEMINI_AVAILABLE:
         alert(["⚠️ Gemini library (google-genai) is not installed. Please install it to use the AI features."])
-    
+
     if not GEMINI_API_KEY:
         alert(["⚠️ Gemini API Key is missing. Check your GitHub Secrets/Environment variables."])
 
     all_metrics: Dict[str,str] = {}
-    
+
     with sync_playwright() as p:
         browser = context = page = None
         try:
@@ -521,7 +525,7 @@ def run_daily_scrape():
             )
             page = context.new_page()
             if not open_and_prepare(page):
-                alert(["⚠️ Daily scrape blocked by login or load failure — please re-login."])
+                alert(["⚠️ Daily scrape blocked by login or load failure — please re-login or check iframe locators."])
                 return
 
             # Capture timestamp once for file naming
@@ -533,7 +537,7 @@ def run_daily_scrape():
             pages_to_extract = [
                 # NPS Detail Page
                 ("NPS", "nps_detail", {
-                    "Supermarket NPS": "supermarket_nps", "Cafe NPS": "cafe_nps", 
+                    "Supermarket NPS": "supermarket_nps", "Cafe NPS": "cafe_nps",
                     "Click & Collect NPS": "click_collect_nps", "Internal Factors NPS": "colleague_happiness",
                     "External Factors NPS": "external_factors_nps", "Home Delivery NPS": "home_delivery_nps",
                     "Click & Collect Avg Wait": "cc_avg_wait"
@@ -541,7 +545,7 @@ def run_daily_scrape():
 
                 # Sales Detail Page
                 ("Sales", "sales_detail", {
-                    "Sales Total": "sales_total", "vs Target": "sales_vs_target", 
+                    "Sales Total": "sales_total", "vs Target": "sales_vs_target",
                     "LFL": "sales_lfl_detail"
                 }, "Extract the total Sales figure, the LFL percentage, and the vs Target figure. Include K or % in the output."),
 
@@ -566,18 +570,18 @@ def run_daily_scrape():
             log.info("Capturing screenshot of the initial Wheel page...")
             screenshot_path_wheel = SCREENS_DIR / f"{ts}_wheel_page.png"
             save_bytes(screenshot_path_wheel, page.screenshot(full_page=True, type="png"))
-            
+
             # Extract Context (Time/Store) from the whole page body
             body_text = page.inner_text("body")
             lines = [ln.rstrip() for ln in body_text.splitlines()]
             all_metrics.update(parse_context_from_lines(lines))
-            
+
             # Extract Wheel Metrics (Initial Pass - only keys on the wheel)
             prompt_map_wheel = {
-                "Shrink": "shrink_wheel", "Retail Expenses": "retail_expenses", "Payroll": "payroll_outturn", 
-                "ISP": "isp", "Ambient WMD": "ambient_wmd", "Fresh WMD": "fresh_wmd", 
-                "Complaints": "complaints_key", "Safe & Legal": "safe_legal", 
-                "Taking to Plan": "taking_to_plan", "Take-up LFL": "sales_lfl", 
+                "Shrink": "shrink_wheel", "Retail Expenses": "retail_expenses", "Payroll": "payroll_outturn",
+                "ISP": "isp", "Ambient WMD": "ambient_wmd", "Fresh WMD": "fresh_wmd",
+                "Complaints": "complaints_key", "Safe & Legal": "safe_legal",
+                "Taking to Plan": "taking_to_plan", "Take-up LFL": "sales_lfl",
                 "NPS": "supermarket_nps", "Stock Record NPS": "stock_record"
             }
             system_inst_wheel = "You are a hyper-accurate retail dashboard data extractor. Extract the main metric (number + unit/K/%) next to each label on the 'Retail Steering Wheel'. For items in parentheses like (2.3K) return the value as -2.3K."
@@ -587,7 +591,7 @@ def run_daily_scrape():
             # --- STEP 2: Iterate through detail pages ---
             for tab_name, suffix, prompt_map, system_inst in pages_to_extract:
                 log.info(f"Navigating to {tab_name} Detail page…")
-                
+
                 # 2a. Click the tab - Now using robust wait-for and increased click timeout
                 try:
                     # Wait for the element to be visible before clicking
@@ -597,14 +601,14 @@ def run_daily_scrape():
                     page.wait_for_timeout(6000) # Wait for content transition and loading
                 except Exception as e:
                     log.warning(f"Failed to click {tab_name} tab. Skipping detail extraction for this page: {e}")
-                    continue 
+                    continue
 
                 # 2b. Screenshot Detail Page
                 log.info(f"Capturing screenshot for {tab_name} Detail…")
                 page.wait_for_timeout(3000) # Small buffer for stability
                 screenshot_path = SCREENS_DIR / f"{ts}_{suffix}.png"
                 save_bytes(screenshot_path, page.screenshot(full_page=True, type="png"))
-                
+
                 # 2c. Extract Metrics and Merge
                 page_metrics = _extract_gemini_vision(screenshot_path, prompt_map, system_inst)
                 all_metrics.update(page_metrics)
@@ -612,7 +616,7 @@ def run_daily_scrape():
 
             # --- STEP 3: Combine with default values for unextracted metrics ---
             metrics_to_default = [key for key in CSV_HEADERS if key not in all_metrics]
-            
+
             for key in metrics_to_default:
                 all_metrics[key] = "—"
 
@@ -631,24 +635,44 @@ def run_daily_scrape():
     write_csv(all_metrics)
 
 
-if __name__ == "__main__":
-    # Dummy definitions for helper functions used in Main but not in this block
-    def save_bytes(path: Path, data: bytes):
-        try:
-            SCREENS_DIR.mkdir(parents=True, exist_ok=True)
-            path.write_bytes(data)
-            log.info(f"Saved {path.name}")
-        except Exception:
-            pass
-            
-    def _post_with_backoff(url: str, payload: dict) -> bool:
-        log.warning("Dummy _post_with_backoff called.")
-        return True
+def save_bytes(path: Path, data: bytes):
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(data)
+        log.info(f"Saved {path.name}")
+    except Exception as e:
+        log.error(f"Failed to save screenshot {path.name}: {e}")
 
-    def alert(lines: List[str]):
-        log.warning(f"ALERT: {lines}")
+def _post_with_backoff(url: str, payload: dict) -> bool:
+    """Posts a payload to a URL with exponential backoff for retries."""
+    for i in range(4):
+        try:
+            resp = requests.post(url, json=payload, timeout=20)
+            if 200 <= resp.status_code < 300:
+                log.info(f"Successfully posted to {url.split('?')[0]}...")
+                return True
+            log.warning(f"POST to webhook failed with status {resp.status_code}: {resp.text}")
+        except requests.exceptions.RequestException as e:
+            log.error(f"POST to webhook failed with exception: {e}")
         
-    def write_csv(metrics: Dict[str,str]):
-        log.info(f"Dummy write_csv called with {len(metrics)} metrics.")
+        wait_time = (2 ** i)
+        log.info(f"Retrying in {wait_time}s...")
+        time.sleep(wait_time)
+    return False
+
+def alert(lines: List[str]):
+    """Sends a simple text alert to a separate webhook."""
+    if not ALERT_WEBHOOK or "chat.googleapis.com" not in ALERT_WEBHOOK:
+        log.warning("ALERT_WEBHOOK not set, cannot send alert.")
+        return False
+    
+    message = "\n".join(lines)
+    if CI_RUN_URL:
+        message += f"\n<{CI_RUN_URL}|View Run>"
         
+    log.info("Sending alert...")
+    return _post_with_backoff(ALERT_WEBHOOK, {"text": message})
+
+
+if __name__ == "__main__":
     run_daily_scrape()
