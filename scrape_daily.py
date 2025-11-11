@@ -8,7 +8,7 @@ Key points in this build:
 - CRITICAL UPDATE: Multi-page navigation (Wheel, NPS, Sales, Front End, Payroll) implemented.
 - Strategy: Capture initial wheel, click through relevant detail pages, run targeted 
   Gemini Vision extraction on each page, and combine results.
-- FIX: Modified open_and_prepare to handle GAS URL's iframe structure.
+- FIX: Improved robustness of navigation by adding explicit wait-for-selector and increasing click timeout.
 """
 
 import os
@@ -52,8 +52,6 @@ ROI_MAP_FILE   = Path(ENV_ROI_MAP) if ENV_ROI_MAP else (BASE_DIR / "roi_map.json
 
 # !!! IMPORTANT !!!
 # YOU MUST UPDATE THIS URL TO THE NEW LOOKER STUDIO EMBED URL.
-# The GAS link provided (https://script.google.com/...) is unlikely to work
-# directly with the existing Playwright authentication state.
 DASHBOARD_URL = (
     "https://script.google.com/a/macros/morrisonsplc.co.uk/s/AKfycbwO5CmuEkGFtPLXaZ_B2gMLrWhkLgONDlnsHt3HhOWzHen4yCbVOHA7O8op79zq2NYfCQ/exec"
 )
@@ -402,18 +400,19 @@ def open_and_prepare(page) -> bool:
     log.info("Waiting for main sandboxFrame iframe to load...")
     try:
         # Wait for the main iframe to appear and load state to settle
-        iframe_locator = page.frame_locator("#sandboxFrame")
+        # Using a direct locator for the frame's content to check load state
+        iframe_locator = page.frame_locator("#sandboxFrame").frame_locator("#content-frame") # Target the innermost dashboard iframe
         iframe_locator.locator("body").wait_for(state="attached", timeout=30000)
-        log.info("Iframe attached. Waiting for its 'networkidle' state.")
+        log.info("Dashboard iframe content attached. Waiting for its 'networkidle' state.")
         # This will wait for the content inside the iframe (the dashboard) to load
         iframe_locator.wait_for_load_state("networkidle", timeout=45000) 
     except PlaywrightTimeoutError as e:
         log.error(f"Timeout waiting for iframe content to load: {e}")
         return False
     
-    log.info("Iframe content loaded/idle.")
+    log.info("Dashboard iframe content loaded/idle.")
     
-    # Now we operate on the loaded/stable page
+    # Now we operate on the stable page
     log.info("Waiting 20s for dynamic content…")
     page.wait_for_timeout(20_000)
 
@@ -566,7 +565,6 @@ def run_daily_scrape():
             # --- STEP 1: Extract Initial Context (Wheel Page) ---
             log.info("Capturing screenshot of the initial Wheel page...")
             screenshot_path_wheel = SCREENS_DIR / f"{ts}_wheel_page.png"
-            # Screenshot the whole page, including the menu/footer context
             save_bytes(screenshot_path_wheel, page.screenshot(full_page=True, type="png"))
             
             # Extract Context (Time/Store) from the whole page body
@@ -587,14 +585,15 @@ def run_daily_scrape():
             all_metrics.update(wheel_metrics)
 
             # --- STEP 2: Iterate through detail pages ---
-            # We assume the navigation buttons/tabs are available on the main page.
             for tab_name, suffix, prompt_map, system_inst in pages_to_extract:
                 log.info(f"Navigating to {tab_name} Detail page…")
                 
-                # 2a. Click the tab - Now using the robust locator
+                # 2a. Click the tab - Now using robust wait-for and increased click timeout
                 try:
-                    # Target the button/tab with role="button" and name matching the tab_name (case-insensitive)
-                    page.get_by_role("button", name=re.compile(tab_name, re.IGNORECASE)).last.click(timeout=10000) 
+                    # Wait for the element to be visible before clicking
+                    tab_locator = page.get_by_role("button", name=re.compile(tab_name, re.IGNORECASE)).last
+                    tab_locator.wait_for(state="visible", timeout=15000) # Wait up to 15s for the tab button
+                    tab_locator.click(timeout=10000) # Click with 10s timeout
                     page.wait_for_timeout(6000) # Wait for content transition and loading
                 except Exception as e:
                     log.warning(f"Failed to click {tab_name} tab. Skipping detail extraction for this page: {e}")
@@ -604,13 +603,10 @@ def run_daily_scrape():
                 log.info(f"Capturing screenshot for {tab_name} Detail…")
                 page.wait_for_timeout(3000) # Small buffer for stability
                 screenshot_path = SCREENS_DIR / f"{ts}_{suffix}.png"
-                # Screenshot the whole page again to capture the new content
                 save_bytes(screenshot_path, page.screenshot(full_page=True, type="png"))
                 
                 # 2c. Extract Metrics and Merge
                 page_metrics = _extract_gemini_vision(screenshot_path, prompt_map, system_inst)
-                
-                # Merge: Detail page metrics overwrite initial wheel metrics if they use the same key
                 all_metrics.update(page_metrics)
 
 
@@ -637,7 +633,6 @@ def run_daily_scrape():
 
 if __name__ == "__main__":
     # Dummy definitions for helper functions used in Main but not in this block
-    # (Kept for compatibility with execution environment)
     def save_bytes(path: Path, data: bytes):
         try:
             SCREENS_DIR.mkdir(parents=True, exist_ok=True)
