@@ -9,7 +9,8 @@ Key points in this build:
 - Strategy: Capture initial wheel, click through relevant detail pages, run targeted
   Gemini Vision extraction on each page, and combine results.
 - FIX: Improved robustness of navigation by adding explicit wait-for-selector and increasing click timeout.
-- FIX (IMPORTANT): Updated iframe locators in `open_and_prepare` to match the current dashboard structure.
+- FINAL FIX: Corrected iframe locators in `open_and_prepare` to match the current dashboard
+  structure and added a robust check for the dashboard layout.
 """
 
 import os
@@ -397,20 +398,19 @@ def open_and_prepare(page) -> bool:
         log.warning("Redirected to login — auth state missing/invalid.")
         return False
 
-    # --- FIX: Wait for the correct nested iframe that contains the dashboard ---
+    # --- FINAL FIX: Wait for the correct nested iframe and then for the dashboard layout to be visible ---
     log.info("Waiting for dashboard iframe to load...")
     try:
-        # As discovered from manual testing, the dashboard is inside two nested iframes
-        # both titled "Retail Wheel". We target this specific structure.
+        # As discovered, the dashboard is inside two nested iframes both titled "Retail Wheel".
         iframe_locator = page.frame_locator('iframe[title="Retail Wheel"]').frame_locator('iframe[title="Retail Wheel"]')
 
-        # To confirm the content is ready, we wait for a reliable element inside the
-        # final iframe to become visible. The steering wheel SVG is a perfect candidate.
-        # Increased timeout to 60s for robustness on slow loads.
-        iframe_locator.locator("#steering-wheel-svg").wait_for(state="visible", timeout=60000)
+        # To confirm the content is truly ready, we wait for the main layout container of the dashboard.
+        # This is a more robust check than waiting for a specific chart.
+        # Timeout is set to 60 seconds for robustness on slow-loading connections.
+        iframe_locator.locator("#dashboard-layout").wait_for(state="visible", timeout=60000)
         
         log.info("Dashboard iframe content is visible. Waiting for network to settle.")
-        # A final wait for the main page to ensure all dynamic content and scripts are done.
+        # Final wait for the main page to ensure all dynamic content and scripts are finished.
         page.wait_for_load_state("networkidle", timeout=45000)
 
     except PlaywrightTimeoutError as e:
@@ -419,9 +419,9 @@ def open_and_prepare(page) -> bool:
 
     log.info("Dashboard iframe content loaded/idle.")
 
-    # Now we operate on the stable page
-    log.info("Waiting 20s for dynamic content…")
-    page.wait_for_timeout(20_000)
+    # Now we operate on the stable page. This wait can be reduced or removed now that the above check is more robust.
+    log.info("Waiting 10s for dynamic content to finish rendering…")
+    page.wait_for_timeout(10_000)
 
     click_this_week(page)
     click_proceed_overlays(page)
@@ -447,11 +447,11 @@ def _extract_gemini_vision(image_path: Path, prompt_map: Dict[str, str], system_
     if not image_path.exists():
         log.error(f"Image not found at {image_path}. Cannot perform vision extraction.")
         return {}
-
+    
     genai.configure(api_key=GEMINI_API_KEY)
     model = genai.GenerativeModel('gemini-1.5-flash')
     img = Image.open(image_path)
-
+    
     generation_config = genai.types.GenerationConfig(
         response_mime_type="application/json",
         response_schema={v: genai.types.Schema(type=genai.types.Type.STRING) for v in prompt_map.keys()}
@@ -463,7 +463,7 @@ def _extract_gemini_vision(image_path: Path, prompt_map: Dict[str, str], system_
         f"the following metrics as a single JSON object. For percentages, include '%'. "
         f"Metrics to extract: {list(prompt_map.keys())}"
     ]
-
+    
     try:
         response = model.generate_content(prompt_parts, generation_config=generation_config)
         ai_data = json.loads(response.text)
@@ -525,13 +525,13 @@ def run_daily_scrape():
             )
             page = context.new_page()
             if not open_and_prepare(page):
-                alert(["⚠️ Daily scrape blocked by login or load failure — please re-login or check iframe locators."])
+                alert(["⚠️ Daily scrape blocked by load failure. Please check iframe locators in the script."])
                 return
 
             # Capture timestamp once for file naming
             ts = int(time.time())
             SCREENS_DIR.mkdir(parents=True, exist_ok=True)
-            page_context = page # Start with the main page context (which now contains the iframe)
+            page_context = page # Start with the main page context
 
             # --- Multi-Page Extraction Setup ---
             pages_to_extract = [
@@ -596,16 +596,16 @@ def run_daily_scrape():
                 try:
                     # Wait for the element to be visible before clicking
                     tab_locator = page.get_by_role("button", name=re.compile(tab_name, re.IGNORECASE)).last
-                    tab_locator.wait_for(state="visible", timeout=15000) # Wait up to 15s for the tab button
-                    tab_locator.click(timeout=10000) # Click with 10s timeout
-                    page.wait_for_timeout(6000) # Wait for content transition and loading
+                    tab_locator.wait_for(state="visible", timeout=15000)
+                    tab_locator.click(timeout=10000)
+                    page.wait_for_timeout(6000)
                 except Exception as e:
                     log.warning(f"Failed to click {tab_name} tab. Skipping detail extraction for this page: {e}")
                     continue
 
                 # 2b. Screenshot Detail Page
                 log.info(f"Capturing screenshot for {tab_name} Detail…")
-                page.wait_for_timeout(3000) # Small buffer for stability
+                page.wait_for_timeout(3000)
                 screenshot_path = SCREENS_DIR / f"{ts}_{suffix}.png"
                 save_bytes(screenshot_path, page.screenshot(full_page=True, type="png"))
 
@@ -613,22 +613,14 @@ def run_daily_scrape():
                 page_metrics = _extract_gemini_vision(screenshot_path, prompt_map, system_inst)
                 all_metrics.update(page_metrics)
 
-
             # --- STEP 3: Combine with default values for unextracted metrics ---
             metrics_to_default = [key for key in CSV_HEADERS if key not in all_metrics]
-
             for key in metrics_to_default:
                 all_metrics[key] = "—"
 
         finally:
-            try:
-                if context: context.close()
-            except Exception:
-                pass
-            try:
-                if browser: browser.close()
-            except Exception:
-                pass
+            if context: context.close()
+            if browser: browser.close()
 
     ok = send_card(all_metrics)
     log.info("Daily card send → %s", "OK" if ok else "FAIL")
@@ -644,7 +636,6 @@ def save_bytes(path: Path, data: bytes):
         log.error(f"Failed to save screenshot {path.name}: {e}")
 
 def _post_with_backoff(url: str, payload: dict) -> bool:
-    """Posts a payload to a URL with exponential backoff for retries."""
     for i in range(4):
         try:
             resp = requests.post(url, json=payload, timeout=20)
@@ -661,7 +652,6 @@ def _post_with_backoff(url: str, payload: dict) -> bool:
     return False
 
 def alert(lines: List[str]):
-    """Sends a simple text alert to a separate webhook."""
     if not ALERT_WEBHOOK or "chat.googleapis.com" not in ALERT_WEBHOOK:
         log.warning("ALERT_WEBHOOK not set, cannot send alert.")
         return False
