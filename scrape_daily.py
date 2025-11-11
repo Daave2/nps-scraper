@@ -8,7 +8,7 @@ Key points in this build:
 - CRITICAL UPDATE: Multi-page navigation (Wheel, NPS, Sales, Front End, Payroll) implemented.
 - Strategy: Capture initial wheel, click through relevant detail pages, run targeted 
   Gemini Vision extraction on each page, and combine results.
-- FIX: Modified open_and_prepare to handle GAS URL's iframe structure and ensure stability.
+- FIX: Added explicit wait for a static element (nav bar) and a mandatory screenshot on final failure.
 """
 
 import os
@@ -396,7 +396,7 @@ def open_and_prepare(page) -> bool:
         log.warning("Redirected to login — auth state missing/invalid.")
         return False
     
-    # --- FIX: Generalized wait for the main dashboard content element ---
+    # --- FIX: Wait for the main content frame to load ---
     log.info("Waiting for main dashboard content to load/stabilize inside any frame...")
     try:
         # Wait for the main wheel SVG element or its wrapper to be visible/attached
@@ -518,7 +518,11 @@ def run_daily_scrape():
             )
             page = context.new_page()
             if not open_and_prepare(page):
-                alert(["⚠️ Daily scrape blocked by login or load failure — please re-login."])
+                # --- FINAL FAILURE SCREENSHOT ---
+                final_error_path = SCREENS_DIR / f"FINAL_FAILURE_{int(time.time())}.png"
+                log.error(f"Final content load failed. Taking final screenshot at {final_error_path.name}")
+                save_bytes(final_error_path, page.screenshot(full_page=True, type="png"))
+                alert(["⚠️ Daily scrape blocked by login or load failure — please re-login. Check logs/screenshot for details."])
                 return
 
             # Capture timestamp once for file naming
@@ -584,7 +588,7 @@ def run_daily_scrape():
             for tab_name, suffix, prompt_map, system_inst in pages_to_extract:
                 log.info(f"Navigating to {tab_name} Detail page…")
                 
-                # 2a. Click the tab - Now using the robust locator and increased timeout
+                # 2a. Click the tab - Now using the robust locator
                 try:
                     tab_locator = page.get_by_role("button", name=re.compile(tab_name, re.IGNORECASE)).last
                     tab_locator.wait_for(state="visible", timeout=15000) 
