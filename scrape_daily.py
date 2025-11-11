@@ -5,10 +5,10 @@
 Retail Performance Dashboard → Daily Summary (layout-by-lines + GEMINI VISION) → Google Chat
 
 Key points in this build:
-- CRITICAL UPDATE: Multi-page navigation (Wheel, NPS, Sales, Front End, Payroll) implemented.
+- CRITICAL UPDATE: Multi-page navigation implemented.
 - Strategy: Capture initial wheel, click through relevant detail pages, run targeted 
   Gemini Vision extraction on each page, and combine results.
-- FINAL FIX: Simplified and relied on robust Playwright text visibility check for 'Retail Wheel' button.
+- FINAL FIX: Implemented robust loading logic by waiting for the unique, visible user/store context in the footer.
 """
 
 import os
@@ -68,7 +68,7 @@ logging.basicConfig(
     handlers=[logging.FileHandler(LOG_FILE)],
 )
 log = logging.getLogger("daily")
-log.addHandler(logging.StreamHandler())
+log.addHandler(log.StreamHandler())
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Config
