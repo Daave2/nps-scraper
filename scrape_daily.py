@@ -55,9 +55,7 @@ ROI_MAP_FILE   = Path(ENV_ROI_MAP) if ENV_ROI_MAP else (BASE_DIR / "roi_map.json
 # The GAS link provided (https://script.google.com/...) is unlikely to work
 # directly with the existing Playwright authentication state.
 DASHBOARD_URL = (
-    "https://lookerstudio.google.com/embed/u/0/reporting/"
-    "d93a03c7-25dc-439d-abaa-dd2f3780daa5/page/BLfDE"
-    "?params=%7B%22f20f0n9kld%22:%22include%25EE%2580%25803%25EE%2580%2580T%2522%7D"
+    "https://script.google.com/a/macros/morrisonsplc.co.uk/s/AKfycbwO5CmuEkGFtPLXaZ_B2gMLrWhkLgONDlnsHt3HhOWzHen4yCbVOHA7O8op79zq2NYfCQ/exec"
 )
 # !!! IMPORTANT !!!
 
